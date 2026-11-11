@@ -1,0 +1,4 @@
+token.txt
+*.log
+.dev.vars
+node_modules/
