@@ -930,7 +930,23 @@ async function ownerApi(req, env, path, url) {
     const m = JSON.parse(r.data), pb = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("pb:" + S).first();
     const look = new Map(); if (pb) { try { for (const it of JSON.parse(pb.text).items || []) if (!look.has(it[0])) look.set(it[0], it); } catch {} }
     const rows = (m.rows || []).map(x => { const it = look.get(x[0]); return [x[0], it ? it[1] : (x[4] || x[0]), String(x[1]), x[2], x[3], it ? Number(it[4]) || 0 : 0]; });
-    return json({ cur: m.cur, prev: m.prev, source: m.source || "", updated: r.updated, rows });
+    return json({ cur: m.cur, prev: m.prev, source: m.source || "", depts: m.depts || null, updated: r.updated, rows });
+  }
+  if (path === "/api/movers" && req.method === "POST") {
+    // Saves a fresh snapshot pulled from the SSCS website: { cur, prev, source, depts:{num:name}, rows:[[plu, dept, unitsNow, unitsBefore, name]] }.
+    const b = await readBody(req, 2e6), str = (v, n) => String(v == null ? "" : v).slice(0, n);
+    if (!Array.isArray(b.rows) || !b.rows.length || b.rows.length > 20000) return json({ error: "rows" }, 400);
+    const rows = [];
+    for (const x of b.rows) {
+      if (!Array.isArray(x) || !/^[0-9]{1,20}$/.test(String(x[0]))) continue;
+      const u = v => { const n = Math.round(Number(v)); return isFinite(n) ? Math.max(-99999, Math.min(999999, n)) : 0; };
+      rows.push([String(x[0]), str(x[1], 6), u(x[2]), u(x[3]), str(x[4], 60).trim()]);
+    }
+    const depts = {};
+    if (b.depts && typeof b.depts === "object") for (const k of Object.keys(b.depts).slice(0, 500)) if (/^[0-9]{1,6}$/.test(k)) depts[k] = str(b.depts[k], 40).trim();
+    const d = { cur: str(b.cur, 40), prev: str(b.prev, 40), source: str(b.source, 80), depts, rows };
+    await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'movers', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(d), Date.now()).run();
+    return json({ ok: true, rows: rows.length });
   }
   if (path === "/api/daily-preview" && req.method === "GET") {
     if (req.headers.get("x-partner")) return json({ error: "Owner only." }, 403);
@@ -2124,7 +2140,7 @@ document.querySelector(".tabs").addEventListener("click",function(e){var b=e.tar
 /* ---------- sales movers ---------- */
 var MV_DEPT={"2":"Cigarettes","3":"Other tobacco","4":"Beer","5":"Wine","6":"Liquor","7":"Packaged beverages","8":"Candy","9":"Fluid milk","10":"Other dairy & deli","11":"Sandwiches & meat snacks","12":"Ice cream","15":"Salty snacks","16":"Sweet snacks","17":"Alternative snacks","18":"Refrigerated snacks","19":"Edible grocery","20":"Non-edible grocery","21":"Health & beauty","22":"General merchandise","24":"Automotive","29":"Boiled peanuts","31":"Store brand drinks","32":"Frozen dispensed","67":"Vapor","79":"KKC"};
 var MV={d:null,store:"",metric:"u",dept:"",all:{up:false,dn:false},min:5,q:""};
-function mvName(k){return MV_DEPT[k]||("Department "+k)}
+function mvName(k){var D=MV.d&&MV.d.depts;if(D&&D[k])return D[k].charAt(0)+D[k].slice(1).toLowerCase();return MV_DEPT[k]||("Department "+k)}
 function loadMV(){if(MV.store!==STORE){MV.d=null;MV.store=STORE;MV.dept=""}$("mvsub").textContent="Loading…";
   api("/api/movers").then(function(j){MV.d=j;renderMV()}).catch(function(x){if(x.message!=="signin")$("mvsub").textContent="Couldn't load: "+x.message})}
 function mvVal(r,i){return MV.metric==="u"?r[i]:r[i]*r[5]}
@@ -2133,7 +2149,7 @@ function mvSgn(n){return (n>0?"+":n<0?"−":"")+mvFmt(Math.abs(n))}
 function mvPct(c,p){return p?((c-p)/p*100).toFixed(1)+"%":"–"}
 function renderMV(){var j=MV.d,sel=$("store"),sn=sel&&sel.selectedIndex>=0?sel.options[sel.selectedIndex].text:"this store";
   if(!j||j.none||!j.rows||!j.rows.length){$("mvsub").textContent="";$("mvbody").innerHTML='<div class="empty">No sales movers for '+esc(sn)+' yet. Ask Claude to pull this store\\'s item movement from Sunray (the last 14 days and the 14 before), and it will show here.</div>';return}
-  $("mvsub").textContent=sn+" · "+j.cur+" compared with "+j.prev+". Units sold per item from Sunray. Sales $ is units times the current shelf price, so it is an estimate.";
+  $("mvsub").textContent=sn+" · "+j.cur+" compared with "+j.prev+(j.updated?" · updated "+new Date(j.updated).toLocaleDateString(undefined,{month:"short",day:"numeric"}):"")+". Units sold per item"+(/SSCS/.test(j.source||"")?" from SSCS":" from Sunray")+". Sales $ is units times the current shelf price, so it is an estimate.";
   var R=j.rows,inD=MV.dept?R.filter(function(r){return r[2]===MV.dept}):R;
   var tc=0,tp=0;inD.forEach(function(r){tc+=mvVal(r,3);tp+=mvVal(r,4)});
   var agg={};R.forEach(function(r){var a=agg[r[2]]=agg[r[2]]||[0,0];a[0]+=mvVal(r,3);a[1]+=mvVal(r,4)});
