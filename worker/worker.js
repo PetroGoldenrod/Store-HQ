@@ -1771,7 +1771,7 @@ ul.probs{margin:6px 0 0;padding-left:20px}
    <div><label for="date">Date</label><input type="date" id="date"></div>
    <div><label for="shift">Shift</label><select id="shift"><option value="1">Shift 1 (overnight)</option><option value="2">Shift 2</option><option value="3">Shift 3</option><option value="1+2">Double: 1 and 2</option><option value="2+3">Double: 2 and 3</option></select></div>
   </div>
-  <div class="mute" style="font-size:.85rem;margin-top:6px">Filled in from the time. Change it if it's wrong.</div>
+  <div class="mute" style="font-size:.85rem;margin-top:6px">Filled in from the time. Change it if it's wrong. Shift 2 is the morning shift.</div>
  </div>
  <div class="card">
   <h2>My hours</h2>
@@ -1815,9 +1815,18 @@ fetch("/api/c/"+token+"/me").then(function(r){return r.json().then(function(j){r
   $("hello").textContent="Hi "+x.j.name+". Send your reports here at the end of each shift.";$("app").hidden=false;
   var co=x.j.coworkers||[],o='<option value="">Choose…</option>';co.forEach(function(c){o+='<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>'});$("covWho").innerHTML=o;$("covBox").hidden=!co.length;checkSent();
 }).catch(function(){$("hello").textContent="No connection. Check your internet and reload."});
-(function(){var d=new Date(),h=d.getHours(),s;
+var TOUCHED=false;
+function setDefaults(){var d=new Date(),h=d.getHours(),s;
   if(h>=2&&h<10){s="1"}else if(h>=10&&h<18)s="2";else{s="3";if(h<2)d=new Date(d.getTime()-86400000)}
-  $("date").value=d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());$("shift").value=s;})();
+  $("date").value=d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());$("shift").value=s;goLabel()}
+function goLabel(){var o=$("shift").options[$("shift").selectedIndex],v=$("date").value,t="";
+  if(v){var p=v.split("-"),dd=new Date(+p[0],+p[1]-1,+p[2]);t=" · "+dd.toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"})}
+  $("go").textContent="Send for "+(o?o.text.replace(/ \(overnight\)/,""):"")+t}
+function refreshDefaults(){if(TOUCHED)return;var a=$("date").value+"|"+$("shift").value;setDefaults();if(a!==$("date").value+"|"+$("shift").value){checkSent();syncLot()}}
+setDefaults();
+["date","shift"].forEach(function(k){$(k).addEventListener("change",function(){TOUCHED=true;goLabel()})});
+document.addEventListener("visibilitychange",function(){if(document.visibilityState==="visible")refreshDefaults()});
+window.addEventListener("focus",refreshDefaults);
 function checkSent(){var d=$("date").value,s=$("shift").value;if(!d)return;
   fetch("/api/c/"+token+"/sent?date="+d+"&shift="+encodeURIComponent(s)).then(function(r){return r.json()}).then(function(j){var L=j.sent||[],by={};
     L.forEach(function(x){var b=by[x.staff]||(by[x.staff]={st:[],at:0});if(b.st.indexOf(x.stage)<0)b.st.push(x.stage);b.at=Math.max(b.at,x.at)});
@@ -1852,6 +1861,7 @@ function send(body){return fetch("/api/c/"+token+"/submit",{method:"POST",header
   .then(function(r){return r.json().catch(function(){return {ok:false,error:"The app didn't answer. Try again."}})})
   .catch(function(){return {ok:false,error:"No connection. Check your internet and try again."}})}
 $("go").addEventListener("click",function(){
+  refreshDefaults();
   var jobs=[],base={date:$("date").value,shift:$("shift").value};
   var cov=null,ext=null,cm=$("covMin").value.trim(),em=$("extMin").value.trim(),en=$("extNote").value.trim();
   if($("covWho").value||cm){var n=Math.round(Number(cm));if(!$("covWho").value){msg("err","Choose who you covered for.");return}if(!(n>=1&&n<=600)){msg("err","Enter how many minutes you covered.");return}cov={otherId:$("covWho").value,why:$("covWhy").value,minutes:n}}
