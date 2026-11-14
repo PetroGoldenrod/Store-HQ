@@ -140,7 +140,7 @@ async function partnerStore(req, env) {
   if (!pw) return "";
   return safeEqual(m[3], await hmac(pw, "partner|" + m[1] + "|" + m[2])) ? m[1] : "";
 }
-// Manager sign-in: MANAGER_PASSWORD_<store> opens one store with only close-outs, staff, payroll, invoices and gas prices.
+// Manager sign-in: MANAGER_PASSWORD_<store> opens one store with only close-outs, staff, payroll and gas prices.
 function managerStores(env) { return Object.keys(env).filter(k => /^MANAGER_PASSWORD_\d+$/.test(k) && env[k]).map(k => k.slice(17)); }
 async function managerStore(req, env) {
   const m = /(?:^|;\s*)manager=(\d+)\.([0-9]+)\.([0-9a-f]+)/.exec(req.headers.get("cookie") || "");
@@ -154,7 +154,7 @@ async function managerCookie(env, store) {
   return "manager=" + store + "." + exp + "." + (await hmac(env["MANAGER_PASSWORD_" + store], "manager|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
 }
 // Pages a manager may not open.
-const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|sales$|sales-extra$|daily-preview$)/;
+const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
 async function partnerCookie(env, store) {
   const exp = Date.now() + 30 * 86400000;
   return "partner=" + store + "." + exp + "." + (await hmac(env["PARTNER_PASSWORD_" + store], "partner|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
@@ -866,7 +866,7 @@ async function ownerApi(req, env, path, url) {
       const last = days.length ? days[days.length - 1].date : null;
       const cl = last ? await env.DB.prepare("SELECT COUNT(*) AS n FROM closes WHERE store = ? AND date = ?").bind(store, last).first() : null;
       let checks = null; try { checks = await storeChecks(env, store, c); } catch (e) { console.error("checks", e && e.message); }
-      out.push({ store, checks, name: info.name, invLink: info.mt ? "/i/" + info.mt : "", lastUpload: up && up.r ? up.r : 0, days: MGR ? days.map(d => ({ date: d.date })) : days, invoices: { n: inv ? inv.n : 0, total: inv && inv.t ? inv.t : 0, waiting: pend ? pend.n : 0, err: pend && pend.e ? pend.e : "" }, closesLast: cl ? cl.n : 0, pc });
+      out.push({ store, checks, name: info.name, invLink: info.mt && !MGR ? "/i/" + info.mt : "", lastUpload: up && up.r ? up.r : 0, days: MGR ? days.map(d => ({ date: d.date })) : days, invoices: { n: inv ? inv.n : 0, total: inv && inv.t ? inv.t : 0, waiting: pend ? pend.n : 0, err: pend && pend.e ? pend.e : "" }, closesLast: cl ? cl.n : 0, pc });
     }
     return json({ stores: out, month: cm.slice(0, 7), mailOn: !!env.GMAIL_APP_PASSWORD });
   }
@@ -1703,7 +1703,7 @@ export default {
       }
       if (path.startsWith("/api/")) {
         if (!owner && !importOk) return json({ error: "signin" }, 401);
-        if (path.startsWith("/api/inv/")) { const r = await invOwnerApi(req, env, path, url); if (r) return r; }
+        if (path.startsWith("/api/inv/")) { if (mgr && !/^\/api\/inv\/(outbox|sent)$/.test(path)) return json({ error: "Not available on a manager login." }, 403); const r = await invOwnerApi(req, env, path, url); if (r) return r; }
         return ownerApi(req, env, path, url);
       }
       return new Response("Not found", { status: 404 });
@@ -2423,7 +2423,7 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
   function S(X,k){return X.reduce(function(a,d){return a+(+d[k]||0)},0)}
   var age=st.lastUpload?(Date.now()-st.lastUpload)/36e5:1e9,up=st.lastUpload?new Date(st.lastUpload).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}):"never";
   function row(o){return '<a class="trow" '+(o.tab?'href="#" data-tab="'+o.tab+'"':'href="'+esc(o.href)+'"'+(o.same?'':' target="_blank" rel="noopener"'))+'><span class="tx"><span class="tn">'+o.name+'</span><span class="td">'+o.desc+'</span></span><span class="who'+(o.staff?' staff':'')+'">'+(o.staff?'Managers':'You')+'</span><span class="go">›</span></a>'}
-  var h='<p class="mute" style="margin:2px 0 12px">'+(MANAGER?'Close-outs, payroll, invoices and gas prices for your store.':'Every tool and report for your stations, in one place. Tap a store to switch.')+'</p><div class="stores">';
+  var h='<p class="mute" style="margin:2px 0 12px">'+(MANAGER?'Close-outs, payroll and gas prices for your store.':'Every tool and report for your stations, in one place. Tap a store to switch.')+'</p><div class="stores">';
   L.forEach(function(s){var i=HOME_INFO[s.store]||{};h+='<button class="store'+(s.store===STORE?' on':'')+'" data-store="'+esc(s.store)+'"><b>'+esc(s.name)+'</b><small>'+esc(i.addr||("#"+s.store))+'</small></button>'});
   h+='</div>';
   if(j.mailOn===false)h+='<div class="warn-line" style="margin-top:12px">Invoice emails to Sunray aren\\'t switched on yet: the Gmail app password still needs to be added in Cloudflare.</div>';
@@ -2434,12 +2434,12 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
   if(st.checks){var ch='';st.checks.forEach(function(d){d.list.forEach(function(x){if(x.level==="none")return;ch+='<a href="#" class="chkrow '+x.level+'" data-chkdate="'+d.date+'"><i></i><b>'+esc(fmtDay(d.date))+' · '+esc(x.label)+'</b><span>'+(x.items.length?esc(x.items.join(" · ")):"All good")+(x.worked&&x.worked.length?' · '+esc(x.worked.join(", ")):'')+'</span></a>'})});
     h+='<div class="sec">Shift check</div><div class="card chk">'+(ch||'<div class="mute" style="padding:8px 14px">Nothing to check yet today.</div>')+'</div>'}
   h+='<div class="sec">Every shift</div><div class="tlist">'+row({tab:"day",name:"Close-Outs",desc:"Shifts, safe drops, over/short, lottery checks, voids & no-sales."+(last?" "+st.closesLast+" sent for "+fmtDay(last.date)+".":"")})+row({tab:"staff",name:"Staff & links",desc:"Add cashiers and send them their own close-out link."})+row({tab:"pay",name:"Payroll",desc:"Shifts worked this pay week (Fri–Thu)."})+'</div>';
-  h+='<div class="sec">'+(MANAGER?'Invoices':'Sales, invoices &amp; profit')+'</div><div class="tlist">'+(MANAGER?'':row({tab:"sales",name:"Sales",desc:salesDesc}));
+  if(!MANAGER){h+='<div class="sec">Sales, invoices &amp; profit</div><div class="tlist">'+row({tab:"sales",name:"Sales",desc:salesDesc});
   if(st.invLink)h+=row({href:st.invLink,staff:1,name:"Invoices",desc:st.invoices.n+" this month · "+money(st.invoices.total)+". "+(st.invoices.waiting?"⚠ "+st.invoices.waiting+" waiting to email to Sunray"+(st.invoices.err?" ("+st.invoices.err+")":"")+". ":"")+"Managers take photos of a vendor invoice and tap Submit; the Sunray file is built automatically. No Claude account needed: send managers this link."});
   if(I.desk)h+=row({href:I.desk,same:1,name:"Invoice Desk",desc:"Do an invoice by hand, line by line, when the Invoices page can't settle one."});
-  if(!MANAGER){h+=row({tab:"pl",name:"P&L",desc:"Monthly gross profit, then your bills and rebates for net profit."});
-  h+=row({tab:"movers",name:"Sales Movers",desc:"Items and departments selling more or less than before."});}
-  h+='</div>';
+  h+=row({tab:"pl",name:"P&L",desc:"Monthly gross profit, then your bills and rebates for net profit."});
+  h+=row({tab:"movers",name:"Sales Movers",desc:"Items and departments selling more or less than before."});
+  h+='</div>';}
   h+='<div class="sec">Gas</div><div class="tlist">'+row({tab:"gas",name:"Gas Prices",desc:"Enter the jobber's new prices; get the cash/credit message for the WhatsApp groups."})+'</div>';
   if(!MANAGER){h+='<div class="sec">Runs on its own</div><div class="tlist">';
   h+='<div class="task"><div class="when"><b>2:05 am</b>Every night</div><div><div class="tn"><span class="dot'+(age>30?' off':'')+'"></span>Verifone upload</div><div class="td">The store PC sends the day\\'s Verifone totals to Sales. Last upload: '+esc(up)+'.</div><div class="need">Store PC on</div></div></div>';
