@@ -2426,7 +2426,6 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
   var h='<p class="mute" style="margin:2px 0 12px">'+(MANAGER?'Close-outs, payroll and gas prices for your store.':'Every tool and report for your stations, in one place. Tap a store to switch.')+'</p><div class="stores">';
   L.forEach(function(s){var i=HOME_INFO[s.store]||{};h+='<button class="store'+(s.store===STORE?' on':'')+'" data-store="'+esc(s.store)+'"><b>'+esc(s.name)+'</b><small>'+esc(i.addr||("#"+s.store))+'</small></button>'});
   h+='</div>';
-  if(j.mailOn===false)h+='<div class="warn-line" style="margin-top:12px">Invoice emails to Sunray aren\\'t switched on yet: the Gmail app password still needs to be added in Cloudflare.</div>';
   if(st.pc){var pa=(Date.now()-st.pc.at)/36e5,pt=new Date(st.pc.at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}),bad=pa>30||!st.pc.ok||(st.pc.errors||[]).length;
     h+='<div class="'+(bad?'warn-line':'mute')+'" style="margin-top:10px;font-size:13px">Store PC'+(st.pc.host?' '+esc(st.pc.host):'')+': '+(pa>30?'no report since '+esc(pt):'reported '+esc(pt)+(st.pc.ok?' \u2713':' with problems'))+' \u00b7 script v'+(st.pc.version||'?')+((st.pc.errors||[]).length?'<br>'+esc(st.pc.errors[0]):'')+'</div>'}
   if(age>30)h+='<div class="warn-line" style="margin-top:12px">'+(st.lastUpload?'No Verifone upload from this store PC since '+esc(up)+'. Check that the PC is on.':'This store PC isn\\'t sending Verifone days yet.')+'</div>';
@@ -2434,9 +2433,8 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
   if(st.checks){var ch='';st.checks.forEach(function(d){d.list.forEach(function(x){if(x.level==="none")return;ch+='<a href="#" class="chkrow '+x.level+'" data-chkdate="'+d.date+'"><i></i><b>'+esc(fmtDay(d.date))+' · '+esc(x.label)+'</b><span>'+(x.items.length?esc(x.items.join(" · ")):"All good")+(x.worked&&x.worked.length?' · '+esc(x.worked.join(", ")):'')+'</span></a>'})});
     h+='<div class="sec">Shift check</div><div class="card chk">'+(ch||'<div class="mute" style="padding:8px 14px">Nothing to check yet today.</div>')+'</div>'}
   h+='<div class="sec">Every shift</div><div class="tlist">'+row({tab:"day",name:"Close-Outs",desc:"Shifts, safe drops, over/short, lottery checks, voids & no-sales."+(last?" "+st.closesLast+" sent for "+fmtDay(last.date)+".":"")})+row({tab:"staff",name:"Staff & links",desc:"Add cashiers and send them their own close-out link."})+row({tab:"pay",name:"Payroll",desc:"Shifts worked this pay week (Fri–Thu)."})+'</div>';
-  if(!MANAGER){h+='<div class="sec">Sales, invoices &amp; profit</div><div class="tlist">'+row({tab:"sales",name:"Sales",desc:salesDesc});
-  if(st.invLink)h+=row({href:st.invLink,staff:1,name:"Invoices",desc:st.invoices.n+" this month · "+money(st.invoices.total)+". "+(st.invoices.waiting?"⚠ "+st.invoices.waiting+" waiting to email to Sunray"+(st.invoices.err?" ("+st.invoices.err+")":"")+". ":"")+"Managers take photos of a vendor invoice and tap Submit; the Sunray file is built automatically. No Claude account needed: send managers this link."});
-  if(I.desk)h+=row({href:I.desk,same:1,name:"Invoice Desk",desc:"Do an invoice by hand, line by line, when the Invoices page can't settle one."});
+  if(!MANAGER){h+='<div class="sec">Sales &amp; profit</div><div class="tlist">'+row({tab:"sales",name:"Sales",desc:salesDesc});
+  /* Invoices and Invoice Desk removed from Store HQ (Nov 2026): not accurate enough. */
   h+=row({tab:"pl",name:"P&L",desc:"Monthly gross profit, then your bills and rebates for net profit."});
   h+=row({tab:"movers",name:"Sales Movers",desc:"Items and departments selling more or less than before."});
   h+='</div>';}
