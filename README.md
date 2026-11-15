@@ -9,7 +9,8 @@ Runs as a Cloudflare Worker (`closeout`) with a D1 database (`DB`).
 - `tools/pollparse.mjs` – stand-alone copy of the Verifone transaction-log parser (also inlined in the worker) for testing.
 
 ## Deploying the worker
-Cloudflare dashboard → Workers & Pages → closeout → Edit code → replace all with `worker/worker.js` → Deploy.
+Cloudflare Workers Builds is connected to this repo: every push to `main` runs `npx wrangler deploy` using `wrangler.toml` (same settings as the dashboard: D1 `DB`, 5-minute cron, logs).
+Fallback if a build fails: Cloudflare dashboard → Workers & Pages → closeout → Edit code → replace all with `worker/worker.js` → Deploy.
 Secrets (OWNER_PASSWORD, PARTNER/MANAGER passwords, SSCS_TOKEN, GMAIL_APP_PASSWORD, ANTHROPIC_API_KEY) and the D1 binding live in Cloudflare, never in this repo.
 
 ## Never commit

@@ -1,0 +1,28 @@
+# Cloudflare settings for the `closeout` Worker (Store HQ).
+# Cloudflare Workers Builds deploys this repo on every push to main.
+# Matches the dashboard settings as of Nov 15 2026. Secrets live only in Cloudflare
+# (wrangler deploy keeps them); never put passwords or keys in this file.
+name = "closeout"
+main = "worker/worker.js"
+compatibility_date = "2026-10-22"
+workers_dev = true
+preview_urls = false
+keep_vars = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "closeout-db"
+database_id = "17853732-a320-4558-97c0-3df3afd000d1"
+
+# Every 5 minutes: sends waiting jobs and the daily email when it's due.
+[triggers]
+crons = ["*/5 * * * *"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
