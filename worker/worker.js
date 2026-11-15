@@ -1590,19 +1590,23 @@ async function dailySummaryText(env, date) {
   for (const S of stores) {
     const L = [];
     const d = await env.DB.prepare("SELECT SUM(json_extract(data,'$.sales.net')) AS net, SUM(json_extract(data,'$.sales.merch')) AS merch, SUM(json_extract(data,'$.sales.fuel')) AS fuel, " +
-      "SUM((SELECT SUM(json_extract(value,'$[1]')+json_extract(value,'$[3]')) FROM json_each(data,'$.fuel'))) AS gal, SUM(" + D + "='79')) AS kkc, SUM(json_extract(data,'$.sales.customers')) AS cust, SUM(json_extract(data,'$.sales.noSale')) AS noSale, SUM(json_extract(data,'$.sales.voidTicketCnt')) AS voids, SUM(json_extract(data,'$.sales.voidLineAmt')) AS voidAmt, SUM(json_extract(data,'$.sales.payOut')) AS payOut, json_group_array(json_extract(data,'$.cards')) AS cardsJ, COUNT(*) AS n " +
+      "SUM((SELECT SUM(json_extract(value,'$[1]')+json_extract(value,'$[3]')) FROM json_each(data,'$.fuel'))) AS gal, SUM(" + D + "='79')) AS kkc, SUM(" + D + " IN ('27','34'))) AS lot, SUM(" + D + " IN ('82','88'))) AS lotPaid, SUM(json_extract(data,'$.sales.customers')) AS cust, SUM(json_extract(data,'$.sales.noSale')) AS noSale, SUM(json_extract(data,'$.sales.voidTicketCnt')) AS voids, SUM(json_extract(data,'$.sales.voidLineAmt')) AS voidAmt, SUM(json_extract(data,'$.sales.payOut')) AS payOut, json_group_array(json_extract(data,'$.cards')) AS cardsJ, COUNT(*) AS n " +
       "FROM vs_day WHERE store = ? AND date = ?").bind(S, date).first();
     // Same day last week, for a quick comparison.
-    const lw = await env.DB.prepare("SELECT SUM(json_extract(data,'$.sales.net')) AS net FROM vs_day WHERE store = ? AND date = ?").bind(S, addDays(date, -7)).first();
+    // Lottery (online + scratch sales, minus lottery payouts) is left out of Sales and Inside.
+    const lw = await env.DB.prepare("SELECT SUM(json_extract(data,'$.sales.net')) - COALESCE(SUM(" + D + " IN ('27','34','82','88'))),0) AS net FROM vs_day WHERE store = ? AND date = ?").bind(S, addDays(date, -7)).first();
     if (!d || !d.n) {
       L.push("No Verifone numbers for " + fmtDate(date) + " yet (upload missing).");
       head.push(names[S] + " no upload");
     } else {
+      const lotNet = (Number(d.lot) || 0) + (Number(d.lotPaid) || 0);
+      d.net = (Number(d.net) || 0) - lotNet; d.merch = (Number(d.merch) || 0) - lotNet;
       const pct = lw && lw.net ? Math.round((d.net - lw.net) / lw.net * 100) : null;
-      L.push("Sales " + usd0(d.net) + (pct === null ? "" : " (" + (pct >= 0 ? "+" : "") + pct + "% vs last " + fmtDate(date).slice(0, 3) + ")"));
+      L.push("Sales " + usd0(d.net) + " without lottery" + (pct === null ? "" : " (" + (pct >= 0 ? "+" : "") + pct + "% vs last " + fmtDate(date).slice(0, 3) + ")"));
       let cardAmt = 0, fee = 0; try { for (const cl of JSON.parse(d.cardsJ || "[]")) { const arr = typeof cl === "string" ? JSON.parse(cl) : (cl || []); fee += cardFees(arr); arr.forEach(c => (cardAmt += Number(c[2]) || 0)); } } catch {}
       if (cardAmt) d.feeLine = "Card fees ≈ " + usd0(fee) + " (" + (fee / cardAmt * 100).toFixed(2) + "% of " + usd0(cardAmt) + " in cards, estimated)";
       L.push("Inside " + usd0(d.merch) + " · Gas " + usd0(d.fuel) + " (" + Math.round(d.gal || 0).toLocaleString("en-US") + " gal)" + (d.kkc ? " · KKC " + usd0(d.kkc) : ""));
+      if (d.lot || d.lotPaid) L.push("Lottery (not in Sales): sold " + usd0(d.lot || 0) + " · paid out " + usd0(-(Number(d.lotPaid) || 0)));
       if (d.cust) L.push("Customers " + Math.round(d.cust).toLocaleString("en-US") + " · Voids " + Math.round(d.voids || 0) + (d.voidAmt ? " (" + usd0(d.voidAmt) + ")" : "") + " · No-sales " + Math.round(d.noSale || 0) + (d.payOut ? " · Payouts " + usd0(d.payOut) : ""));
       if (d.feeLine) L.push(d.feeLine);
       try { const pr = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'pc'").bind(S).first(); if (pr) { const p = JSON.parse(pr.data); if (Date.now() - p.at > 30 * 3600e3) L.push("! Store PC has not reported since " + new Date(p.at).toLocaleString("en-US", { timeZone: env.TIMEZONE || "America/New_York", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })); else if (!p.ok || (p.errors || []).length) L.push("! Store PC problem: " + ((p.errors || [])[0] || "see the app")); } } catch {}
