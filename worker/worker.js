@@ -2438,7 +2438,8 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
     h+='<div class="sec">Shift check</div><div class="card chk">'+(ch||'<div class="mute" style="padding:8px 14px">Nothing to check yet today.</div>')+'</div>'}
   h+='<div class="sec">Every shift</div><div class="tlist">'+row({tab:"day",name:"Close-Outs",desc:"Shifts, safe drops, over/short, lottery checks, voids & no-sales."+(last?" "+st.closesLast+" sent for "+fmtDay(last.date)+".":"")})+row({tab:"staff",name:"Staff & links",desc:"Add cashiers and send them their own close-out link."})+row({tab:"pay",name:"Payroll",desc:"Shifts worked this pay week (Fri–Thu)."})+'</div>';
   if(!MANAGER){h+='<div class="sec">Sales &amp; profit</div><div class="tlist">'+row({tab:"sales",name:"Sales",desc:salesDesc});
-  /* Invoices and Invoice Desk removed from Store HQ (Nov 2026): not accurate enough. */
+  /* Manager invoice page removed (Nov 2026). Owner keeps the Invoice Desk. */
+  if(I.desk)h+=row({href:I.desk,same:1,name:"Invoice Desk",desc:"Do an invoice by hand, line by line."});
   h+=row({tab:"pl",name:"P&L",desc:"Monthly gross profit, then your bills and rebates for net profit."});
   h+=row({tab:"movers",name:"Sales Movers",desc:"Items and departments selling more or less than before."});
   h+='</div>';}
