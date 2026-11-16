@@ -553,7 +553,18 @@ async function handleSubmit(req, env, token) {
     console.error("submit failed", e && e.message, e && e.detail);
     return json({ ok: false, error: aiProblem(e).cashier }, 502);
   }
-  if (problems.length) return json({ ok: false, problems });
+  if (problems.length) {
+    // Keep a short log of rejected photos so the owner can see who tried and why (Shifts page).
+    try {
+      const SS = st.store || DEF_STORE, cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'rejects'").bind(SS).first();
+      let list = []; try { list = cur ? JSON.parse(cur.data) : []; } catch {}
+      list.push({ at: Date.now(), staff: st.name, date: b.date, shift: String(shift), kind: b.kind, stage, problems: problems.slice(0, 4) });
+      list = list.slice(-60);
+      await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'rejects', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(SS, JSON.stringify(list), Date.now()).run();
+    } catch (e) { console.error("reject log", e && e.message); }
+    console.log("photo rejected", st.name, b.kind, stage, problems.join(" | "));
+    return json({ ok: false, problems });
+  }
   const now = Date.now(), ids = images.map(() => rid(16)), id = rid(14);
   const stmts = images.map((b64, i) => env.DB.prepare("INSERT INTO photos (id, created, b64) VALUES (?, ?, ?)").bind(ids[i], now, b64));
   if (b.kind === "register") {
@@ -607,7 +618,11 @@ async function dayData(env, S, date, c) {
   Object.values(cashiers).forEach(l => l.sort((a, b) => String(a.open).localeCompare(String(b.open))));
   const groups = buildDay(date, rows, dropsMap, sscsMap, c.flag, countsMap, fixSet, cashiers);
   try { await addHandoff(env, S, date, rows, groups); } catch (e) { console.error("handoff", e && e.message); }
-  return { date, flag: c.flag, groups, voids, cashiers };
+  let rejects = [];
+  try { const rj = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'rejects'").bind(S).first(); rejects = (rj ? JSON.parse(rj.data) : []).filter(x => x.date === date); } catch {}
+  const sentOk = new Set(rows.filter(r => r.kind === "lottery").map(r => r.staff_name + "|" + r.stage));
+  rejects = rejects.map(x => ({ ...x, later: sentOk.has(x.staff + "|" + x.stage) }));
+  return { date, flag: c.flag, groups, voids, cashiers, rejects };
 }
 // Lottery handoff: a shift's start numbers should equal the previous shift's end numbers (same terminal day).
 const HANDOFF_F = [["online", "netSales", "Online lotto sales"], ["online", "pays", "Online lotto payouts"], ["scratch", "pays", "Scratch-off payouts"]];
@@ -2314,6 +2329,7 @@ $("recent").addEventListener("click",function(e){var b=e.target.closest("[data-d
 function pill(c){if(c.none)return '<span class="pill good">No sales</span>';if(c.missing)return '<span class="pill info">'+(c.key==="scratch"?"Enter SSCS":"Need report")+'</span>';return c.ok?'<span class="pill good">Match</span>':'<span class="pill bad">'+(c.diff>0?"Over ":"Short ")+money(Math.abs(c.diff))+'</span>'}
 function workedHtml(g){if(!g.worked||!g.worked.length)return "";return '<div class="mute" style="margin:2px 0 8px">Worked: '+g.worked.map(function(w){var t='<b>'+esc(w.staff)+'</b>';if(w.cover)t+=' (+'+w.cover.minutes+' min covering '+esc(w.cover.otherName)+')';if(w.extra)t+=' (+'+w.extra.minutes+' min extra: '+esc(w.extra.note)+')';return t}).join(", ")+'</div>'}
 function renderDay(){var j=DAY,h="";
+  if(j.rejects&&j.rejects.length)h+='<div class="card"><h2>Photos the app turned down</h2>'+j.rejects.map(function(x){var t=new Date(x.at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"});return '<div class="'+(x.later?"mute":"warn-line")+'" style="margin:6px 0"><b>'+esc(x.staff)+'</b> '+t+' · Shift '+esc(x.shift)+' '+esc(x.stage||x.kind)+(x.later?' (sent OK later)':'')+'<br>'+x.problems.map(esc).join("<br>")+'</div>'}).join("")+'</div>';
   j.groups.forEach(function(g){
     var cls=g.problems?"bad":(!g.empty&&!g.todo?"good":"");
     var st=g.empty?'<span class="pill info">Nothing sent</span>':g.problems?'<span class="pill bad">'+g.problems+' to look at</span>':g.todo?'<span class="pill warn">'+g.todo+' to finish</span>':'<span class="pill good">Balanced</span>';
