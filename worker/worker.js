@@ -406,8 +406,11 @@ function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet 
     const sscs = manual ?? (imported ? imported.sum : undefined);
     const checks = [];
     const add = (name, term, reg, key2) => {
-      const missing = term === null || term === undefined || reg === null;
-      checks.push({ key: key2, name, terminal: term ?? null, registers: reg, diff: missing ? null : r2(reg - term), ok: !missing && Math.abs(reg - term) < 0.01, missing,
+      // No terminal photo but the registers rang $0 (e.g. overnight, the lotto terminal is closed): nothing to check.
+      const none = !lotRows.length && key2 !== "scratch" && reg === 0;
+      const missing = !none && (term === null || term === undefined || reg === null);
+      if (none) term = 0;
+      checks.push({ key: key2, name, terminal: term ?? null, registers: reg, diff: missing ? null : r2(reg - term), ok: none || (!missing && Math.abs(reg - term) < 0.01), missing, none,
         photo: useVf && registers.length ? photoSum(key2) : null });
     };
     if (haveReg || lotRows.length) {
@@ -418,7 +421,8 @@ function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet 
     }
     const regIssues = registers.filter(r => r.flag).length + registers.filter(r => r.dropsDiff !== null && Math.abs(r.dropsDiff) >= 0.01 && !r.dropFixed).length + registers.filter(r => r.nameMismatch).length;
     const problems = regIssues + checks.filter(c => !c.ok && !c.missing).length;
-    const todo = ((haveReg || shiftRows.length) && !lotRows.length ? 1 : 0) + checks.filter(c => c.missing && (c.key !== "scratch" || haveReg)).length + registers.filter(r => !r.drops.length && (r.safeDrop || 0) > 0).length;
+    const lotNeeded = !checks.length || checks.some(c => c.key !== "scratch" && !c.none);
+    const todo = ((haveReg || shiftRows.length) && !lotRows.length && lotNeeded ? 1 : 0) + checks.filter(c => c.missing && (c.key !== "scratch" || haveReg)).length + registers.filter(r => !r.drops.length && (r.safeDrop || 0) > 0).length;
     return {
       key, shifts: g.shifts, worked: shiftRows.map(r => ({ staff: r.staff_name, cover: (r.data && r.data.cover) || null, extra: (r.data && r.data.extra) || null })), label: g.shifts.length > 1 ? "Shifts " + g.shifts.join(" & ") : "Shift " + g.shifts[0],
       empty: !g.rows.length && !useVf, registers, regSource: useVf ? "verifone" : "photos",
@@ -640,8 +644,9 @@ function dayChecks(day, nowMs, tz) {
     const bad = [], warn = [], who = x => x.cashier || ("Reg " + x.reg);
     g.lottery.checks.forEach(ch => { if (!ch.ok && !ch.missing) bad.push(ch.name.replace(" (SSCS)", "") + (ch.diff > 0 ? " over " : " short ") + usd2(Math.abs(ch.diff))); });
     vf.forEach(x => { if (x.overShort != null && Math.abs(x.overShort) >= day.flag) bad.push(who(x) + " register " + (x.overShort >= 0 ? "over " : "short ") + usd2(Math.abs(x.overShort))); });
-    if (overdue && !hasEnd) bad.push("No lottery photos sent");
-    else if (ended && !hasEnd) warn.push("Lottery photos not in yet");
+    const lotNeeded = !g.lottery.checks.length || g.lottery.checks.some(ch => ch.key !== "scratch" && !ch.none);
+    if (overdue && !hasEnd && lotNeeded) bad.push("No lottery photos sent");
+    else if (ended && !hasEnd && lotNeeded) warn.push("Lottery photos not in yet");
     if (hasEnd && g.lottery.checks.some(ch => ch.key === "scratch" && ch.missing)) warn.push("Waiting for the SSCS count");
     vf.forEach(x => { if ((x.drops || 0) > 0 && x.counted == null) warn.push(who(x) + " safe drops not counted yet"); });
     (g.lottery.warns || []).forEach(w => warn.push(w));
@@ -2306,7 +2311,7 @@ $("impgo").addEventListener("click",function(){var b=this,raw=$("impin").value.t
       .catch(function(e){b.disabled=false;$("impmsg").innerHTML='<div class="msg err">'+esc(e.message)+'</div>'})};
   if(raw)go(raw);else if(navigator.clipboard&&navigator.clipboard.readText)navigator.clipboard.readText().then(function(t){go((t||"").trim())},function(){go("")});else go("");});
 $("recent").addEventListener("click",function(e){var b=e.target.closest("[data-d]");if(b){$("date").value=b.dataset.d;loadDay()}});
-function pill(c){if(c.missing)return '<span class="pill info">'+(c.key==="scratch"?"Enter SSCS":"Need report")+'</span>';return c.ok?'<span class="pill good">Match</span>':'<span class="pill bad">'+(c.diff>0?"Over ":"Short ")+money(Math.abs(c.diff))+'</span>'}
+function pill(c){if(c.none)return '<span class="pill good">No sales</span>';if(c.missing)return '<span class="pill info">'+(c.key==="scratch"?"Enter SSCS":"Need report")+'</span>';return c.ok?'<span class="pill good">Match</span>':'<span class="pill bad">'+(c.diff>0?"Over ":"Short ")+money(Math.abs(c.diff))+'</span>'}
 function workedHtml(g){if(!g.worked||!g.worked.length)return "";return '<div class="mute" style="margin:2px 0 8px">Worked: '+g.worked.map(function(w){var t='<b>'+esc(w.staff)+'</b>';if(w.cover)t+=' (+'+w.cover.minutes+' min covering '+esc(w.cover.otherName)+')';if(w.extra)t+=' (+'+w.extra.minutes+' min extra: '+esc(w.extra.note)+')';return t}).join(", ")+'</div>'}
 function renderDay(){var j=DAY,h="";
   j.groups.forEach(function(g){
@@ -2317,7 +2322,7 @@ function renderDay(){var j=DAY,h="";
     h+='<div class="b">'+workedHtml(g)+vfHtml(g);
     g.lottery.warns.forEach(function(w){h+='<div class="warn-line">'+esc(w)+'</div>'});
     (g.handoff||[]).forEach(function(w){h+='<div class="warn-line"><b>Lottery handoff gap.</b> '+esc(w)+'. A shift’s start numbers should equal the previous shift’s end, so tickets or payouts may be missing.</div>'});
-    if((g.registers.length||g.regSource==="verifone"||(g.worked&&g.worked.length))&&!g.lottery.reports.length)h+='<div class="warn-line">No lottery slip photos for this shift yet.</div>';
+    if((g.registers.length||g.regSource==="verifone"||(g.worked&&g.worked.length))&&!g.lottery.reports.length&&(g.lottery.checks||[]).some(function(c){return c.missing&&c.key!=="scratch"}))h+='<div class="warn-line">No lottery slip photos for this shift yet.</div>';
     g.registers.forEach(function(r){
       if(r.nameMismatch)h+='<div class="warn-line">Register '+esc(r.reg)+' was sent from '+esc(r.staff)+'\\'s link but the report says '+esc(r.cashierName)+'.</div>';
       if(r.voids&&r.voids.amt>=50)h+='<div class="warn-line">Register '+esc(r.reg)+': '+r.voids.n+' voids and error corrects, '+money(r.voids.amt)+'.</div>';
