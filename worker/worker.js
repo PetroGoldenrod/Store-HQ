@@ -451,13 +451,15 @@ function shiftForCount(ms, tz) {
 function addDays(dateStr, n) { const d = new Date(dateStr + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
 function weekStartFor(dateStr, weekStart) { const d = new Date(dateStr + "T00:00:00Z"); const back = (d.getUTCDay() - weekStart + 7) % 7; return addDays(dateStr, -back); }
 function payroll(rows, staff, start, hours) {
-  const end = addDays(start, 6), seen = new Set(), by = {};
-  staff.forEach(s => (by[s.id] = { id: s.id, name: s.name, active: !!s.active, rate: s.rate || 0, perShift: s.hours > 0 ? Number(s.hours) : hours, shifts: 0, days: [], adj: 0, notes: [] }));
+  const end = addDays(start, 6), seen = new Set(), by = {}, fullKeys = new Set();
+  // A person with their own shorter hours (e.g. the cook) can mark a day as a full shift when they cover.
+  rows.forEach(r => { if (r.kind !== "shift") return; let d = {}; try { d = typeof r.data === "string" ? JSON.parse(r.data) : (r.data || {}); } catch {} if (d && d.full) covers(r.shift).forEach(k => fullKeys.add(r.staff_id + "|" + r.date + "|" + k)); });
+  staff.forEach(s => (by[s.id] = { id: s.id, name: s.name, active: !!s.active, rate: s.rate || 0, perShift: s.hours > 0 ? Number(s.hours) : hours, base: 0, shifts: 0, days: [], adj: 0, notes: [] }));
   rows.forEach(r => {
     if (r.date < start || r.date > end || !r.staff_id || !by[r.staff_id]) return;
     covers(r.shift).forEach(k => {
       const key = r.staff_id + "|" + r.date + "|" + k; if (seen.has(key)) return; seen.add(key);
-      by[r.staff_id].shifts++; by[r.staff_id].days.push(r.date + " S" + k);
+      const full = fullKeys.has(key); by[r.staff_id].shifts++; by[r.staff_id].base += full ? hours : by[r.staff_id].perShift; by[r.staff_id].days.push(r.date + " S" + k + (full && by[r.staff_id].perShift !== hours ? " (full shift)" : ""));
     });
   });
   // Cover time moves minutes from the cashier who came late / left early to the one who covered; extra work adds minutes.
@@ -473,7 +475,7 @@ function payroll(rows, staff, start, hours) {
     if (ex && ex.minutes > 0 && by[r.staff_id]) { by[r.staff_id].adj += ex.minutes; by[r.staff_id].notes.push({ id: r.id, part: "extra", min: ex.minutes, when, text: "Extra work: " + ex.note }); }
   });
   const list = Object.values(by).filter(e => e.shifts || e.active || e.adj).map(e => {
-    const h = Math.round((e.shifts * e.perShift + e.adj / 60) * 100) / 100;
+    const h = Math.round((e.base + e.adj / 60) * 100) / 100;
     return { ...e, days: e.days.sort(), notes: e.notes.sort((a, b) => a.when.localeCompare(b.when)), hours: h, pay: r2(h * e.rate) };
   });
   list.sort((a, b) => a.name.localeCompare(b.name));
@@ -524,7 +526,7 @@ async function handleSubmit(req, env, token) {
     const old = (await env.DB.prepare("SELECT id FROM closes WHERE store = ? AND date = ? AND shift = ? AND staff_id = ? AND kind = 'shift'").bind(SS, b.date, b.shift, st.id).all()).results || [];
     const stmts = old.map(o => env.DB.prepare("DELETE FROM closes WHERE id = ?").bind(o.id));
     stmts.push(env.DB.prepare("INSERT INTO closes (id, created, date, shift, staff_id, staff_name, kind, stage, data, photos, store) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .bind(rid(14), Date.now(), b.date, b.shift, st.id, st.name, "shift", null, JSON.stringify({ cover, extra }), "[]", SS));
+      .bind(rid(14), Date.now(), b.date, b.shift, st.id, st.name, "shift", null, JSON.stringify({ cover, extra, full: st.hours > 0 && !!b.fullShift }), "[]", SS));
     await env.DB.batch(stmts);
     return json({ ok: true });
   }
@@ -1667,7 +1669,7 @@ export default {
           const st = await staffByToken(env, m[1]);
           if (!st || !st.active) return json({ error: "off" }, 403);
           const co = (await env.DB.prepare("SELECT id, name FROM staff WHERE store = ? AND active = 1 AND id != ? ORDER BY name").bind(st.store || DEF_STORE, st.id).all()).results || [];
-          return json({ name: st.name, coworkers: co });
+          return json({ name: st.name, coworkers: co, myHours: st.hours > 0 ? Number(st.hours) : null, normalHours: cfg(env).hours });
         }
         if (req.method === "POST") return handleSubmit(req, env, m[1]);
       }
@@ -1784,6 +1786,7 @@ ul.probs{margin:6px 0 0;padding-left:20px}
  <div class="card">
   <h2>My hours</h2>
   <div class="mute">Everyone taps <b>Send</b> at the end of their shift. That is how your shift gets counted for payroll.</div>
+  <div id="hrsBox" hidden><label for="hrsPick">Today I worked</label><select id="hrsPick"><option value="">My usual hours</option><option value="full">A full shift</option></select></div>
   <details class="more" id="covBox"><summary>I covered for another cashier</summary>
    <div class="mute" style="font-size:.85rem;margin-top:6px">They came in late or left early, and you worked their time.</div>
    <label for="covWho">Who did you cover for?</label><select id="covWho"><option value="">Choose…</option></select>
@@ -1821,7 +1824,7 @@ function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp
 fetch("/api/c/"+token+"/me").then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})}).then(function(x){
   if(!x.ok){$("hello").textContent="";$("off").hidden=false;return}
   $("hello").textContent="Hi "+x.j.name+". Send your reports here at the end of each shift.";$("app").hidden=false;
-  var co=x.j.coworkers||[],o='<option value="">Choose…</option>';co.forEach(function(c){o+='<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>'});$("covWho").innerHTML=o;$("covBox").hidden=!co.length;checkSent();
+  var co=x.j.coworkers||[],o='<option value="">Choose…</option>';co.forEach(function(c){o+='<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>'});$("covWho").innerHTML=o;$("covBox").hidden=!co.length;if(x.j.myHours){$("hrsBox").hidden=false;$("hrsPick").options[0].text="My usual hours ("+x.j.myHours+" h)";$("hrsPick").options[1].text="A full shift ("+x.j.normalHours+" h), I covered";}checkSent();
 }).catch(function(){$("hello").textContent="No connection. Check your internet and reload."});
 var TOUCHED=false;
 function setDefaults(){var d=new Date(),h=d.getHours(),s;
@@ -1874,7 +1877,7 @@ $("go").addEventListener("click",function(){
   var cov=null,ext=null,cm=$("covMin").value.trim(),em=$("extMin").value.trim(),en=$("extNote").value.trim();
   if($("covWho").value||cm){var n=Math.round(Number(cm));if(!$("covWho").value){msg("err","Choose who you covered for.");return}if(!(n>=1&&n<=600)){msg("err","Enter how many minutes you covered.");return}cov={otherId:$("covWho").value,why:$("covWhy").value,minutes:n}}
   if(em||en){var n2=Math.round(Number(em));if(!(n2>=1&&n2<=600)){msg("err","Enter how many extra minutes you stayed.");return}if(!en){msg("err","Write what extra work you did.");return}ext={minutes:n2,note:en}}
-  jobs.push({name:"Your shift",ids:[],hours:1,body:Object.assign({kind:"shift",cover:cov,extra:ext},base)});
+  jobs.push({name:"Your shift",ids:[],hours:1,body:Object.assign({kind:"shift",cover:cov,extra:ext,fullShift:$("hrsPick").value==="full"},base)});
   var lotShift=$("lotShift").value;
   [["p_start","start","Lottery start of shift"],["p_prev","prev","Lottery previous day final"],["p_end","end","Lottery end of shift"]].forEach(function(x){
     if(shots[x[0]])jobs.push({name:x[2],ids:[x[0]],body:Object.assign({kind:"lottery",stage:x[1],lotShift:lotShift,images:[shots[x[0]]]},base)});});
