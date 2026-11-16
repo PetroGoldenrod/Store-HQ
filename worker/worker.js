@@ -72,6 +72,9 @@ async function ensureSchema(env) {
   const cols = (await env.DB.prepare("PRAGMA table_info(vf_cash)").all()).results || [];
   if (!cols.some(c => c.name === "store")) await env.DB.batch(MIGRATE_STORES.map(s => env.DB.prepare(s)));
   await env.DB.batch(AFTER_STORES.map(s => env.DB.prepare(s)));
+  // Per-person shift length (e.g. a cook who works 9 to 2). Empty = the store's normal shift hours.
+  const sc = (await env.DB.prepare("PRAGMA table_info(staff)").all()).results || [];
+  if (!sc.some(c => c.name === "hours")) await env.DB.prepare("ALTER TABLE staff ADD COLUMN hours REAL").run();
   schemaReady = true;
 }
 // Which store a request is about: the owner page sends x-store; nightly imports may add ?store=. Default: the first store.
@@ -449,7 +452,7 @@ function addDays(dateStr, n) { const d = new Date(dateStr + "T00:00:00Z"); d.set
 function weekStartFor(dateStr, weekStart) { const d = new Date(dateStr + "T00:00:00Z"); const back = (d.getUTCDay() - weekStart + 7) % 7; return addDays(dateStr, -back); }
 function payroll(rows, staff, start, hours) {
   const end = addDays(start, 6), seen = new Set(), by = {};
-  staff.forEach(s => (by[s.id] = { id: s.id, name: s.name, active: !!s.active, rate: s.rate || 0, shifts: 0, days: [], adj: 0, notes: [] }));
+  staff.forEach(s => (by[s.id] = { id: s.id, name: s.name, active: !!s.active, rate: s.rate || 0, perShift: s.hours > 0 ? Number(s.hours) : hours, shifts: 0, days: [], adj: 0, notes: [] }));
   rows.forEach(r => {
     if (r.date < start || r.date > end || !r.staff_id || !by[r.staff_id]) return;
     covers(r.shift).forEach(k => {
@@ -470,7 +473,7 @@ function payroll(rows, staff, start, hours) {
     if (ex && ex.minutes > 0 && by[r.staff_id]) { by[r.staff_id].adj += ex.minutes; by[r.staff_id].notes.push({ id: r.id, part: "extra", min: ex.minutes, when, text: "Extra work: " + ex.note }); }
   });
   const list = Object.values(by).filter(e => e.shifts || e.active || e.adj).map(e => {
-    const h = Math.round((e.shifts * hours + e.adj / 60) * 100) / 100;
+    const h = Math.round((e.shifts * e.perShift + e.adj / 60) * 100) / 100;
     return { ...e, days: e.days.sort(), notes: e.notes.sort((a, b) => a.when.localeCompare(b.when)), hours: h, pay: r2(h * e.rate) };
   });
   list.sort((a, b) => a.name.localeCompare(b.name));
@@ -1021,8 +1024,8 @@ async function ownerApi(req, env, path, url) {
     } catch (e) { return json({ ok: false, message: aiProblem(e).owner }); }
   }
   if (path === "/api/staff" && req.method === "GET") {
-    const r = await env.DB.prepare("SELECT id, name, token, active, rate FROM staff WHERE store = ? ORDER BY active DESC, name").bind(S).all();
-    return json({ staff: r.results || [] });
+    const r = await env.DB.prepare("SELECT id, name, token, active, rate, hours FROM staff WHERE store = ? ORDER BY active DESC, name").bind(S).all();
+    return json({ staff: r.results || [], hoursPerShift: c.hours });
   }
   if (path === "/api/staff" && req.method === "POST") {
     const b = await readBody(req, 1e5);
@@ -1042,7 +1045,8 @@ async function ownerApi(req, env, path, url) {
     const active = b.active !== undefined ? (b.active ? 1 : 0) : s.active;
     const rate = b.rate !== undefined ? Math.max(0, Number(b.rate) || 0) : s.rate;
     const token = b.newLink ? rid(24) : s.token;
-    await env.DB.prepare("UPDATE staff SET name = ?, active = ?, rate = ?, token = ? WHERE id = ?").bind(name, active, rate, token, s.id).run();
+    const hrs = b.hours !== undefined ? (Number(b.hours) > 0 && Number(b.hours) <= 24 ? Math.round(Number(b.hours) * 100) / 100 : null) : s.hours;
+    await env.DB.prepare("UPDATE staff SET name = ?, active = ?, rate = ?, token = ?, hours = ? WHERE id = ?").bind(name, active, rate, token, hrs, s.id).run();
     return json({ ok: true, token });
   }
   if (path === "/api/scorecard" && req.method === "GET") {
@@ -1089,7 +1093,7 @@ async function ownerApi(req, env, path, url) {
     const ref = validDate(url.searchParams.get("date")) ? url.searchParams.get("date") : new Date().toISOString().slice(0, 10);
     const start = weekStartFor(ref, c.weekStart);
     const rows = (await env.DB.prepare("SELECT id, date, shift, staff_id, staff_name, kind, data FROM closes WHERE store = ? AND date BETWEEN ? AND ?").bind(S, start, addDays(start, 6)).all()).results || [];
-    const staff = (await env.DB.prepare("SELECT id, name, active, rate FROM staff WHERE store = ?").bind(S).all()).results || [];
+    const staff = (await env.DB.prepare("SELECT id, name, active, rate, hours FROM staff WHERE store = ?").bind(S).all()).results || [];
     return json({ ...payroll(rows, staff, start, c.hours), hoursPerShift: c.hours });
   }
   return json({ error: "not found" }, 404);
@@ -2395,8 +2399,8 @@ $("day").addEventListener("click",function(e){var t=e.target;
 /* ---------- staff ---------- */
 function linkFor(tok){return location.origin+"/c/"+tok}
 function loadStaff(){api("/api/staff").then(function(j){
-  $("staff").innerHTML=j.staff.length?j.staff.map(function(s){return '<div class="st'+(s.active?"":" off")+'"><div><span class="n">'+esc(s.name)+'</span> <span class="mute">· $'+(+s.rate).toFixed(2)+'/hr</span>'+(s.active?"":' <span class="pill warn">Off</span>')+'</div>'+
-    '<div class="inline"><button class="alt sm" data-copy="'+esc(s.token)+'">Copy link</button><button class="alt sm" data-rate="'+s.id+'">Rate</button><button class="alt sm" data-tog="'+s.id+'" data-on="'+s.active+'">'+(s.active?"Turn off":"Turn on")+'</button><button class="alt sm" data-new="'+s.id+'">New link</button></div>'+
+  $("staff").innerHTML=j.staff.length?j.staff.map(function(s){return '<div class="st'+(s.active?"":" off")+'"><div><span class="n">'+esc(s.name)+'</span> <span class="mute">· $'+(+s.rate).toFixed(2)+'/hr · '+(s.hours>0?(+s.hours)+' h per shift':(j.hoursPerShift||8)+' h per shift')+'</span>'+(s.active?"":' <span class="pill warn">Off</span>')+'</div>'+
+    '<div class="inline"><button class="alt sm" data-copy="'+esc(s.token)+'">Copy link</button><button class="alt sm" data-rate="'+s.id+'">Rate</button><button class="alt sm" data-hrs="'+s.id+'">Hours</button><button class="alt sm" data-tog="'+s.id+'" data-on="'+s.active+'">'+(s.active?"Turn off":"Turn on")+'</button><button class="alt sm" data-new="'+s.id+'">New link</button></div>'+
     '<div class="lnk num">'+esc(linkFor(s.token))+'</div></div>'}).join(""):'<div class="mute">No cashiers yet. Add the first one above.</div>';}).catch(function(){})}
 $("add").addEventListener("click",function(){api("/api/staff",{method:"POST",body:{name:$("nn").value,rate:parseFloat($("nr").value)||0}})
   .then(function(j){$("smsg").innerHTML='<div class="msg ok">Added. Their link: <span class="num" style="word-break:break-all">'+esc(linkFor(j.token))+'</span></div>';$("nn").value="";$("nr").value="";loadStaff()})
@@ -2409,6 +2413,8 @@ $("staff").addEventListener("click",function(e){var b=e.target.closest("button")
   if(b.dataset.tog)api("/api/staff/"+b.dataset.tog,{method:"POST",body:{active:b.dataset.on!=="1"}}).then(loadStaff);
   if(b.dataset.new){if(b.textContent!=="Tap again"){b.textContent="Tap again";return}api("/api/staff/"+b.dataset.new,{method:"POST",body:{newLink:true}}).then(loadStaff)}
   if(b.dataset.rate){var row=b.closest(".st");if(row.querySelector(".rin"))return;row.insertAdjacentHTML("beforeend",'<div class="inline rin" style="flex-basis:100%"><input inputmode="decimal" placeholder="New hourly rate" aria-label="New hourly rate"><button class="sm" data-saverate="'+b.dataset.rate+'">Save</button></div>')}
+  if(b.dataset.hrs){var rw=b.closest(".st");if(rw.querySelector(".hin"))return;rw.insertAdjacentHTML("beforeend",'<div class="inline hin" style="flex-basis:100%"><input inputmode="decimal" placeholder="Hours per shift, e.g. 5 (empty = normal)" aria-label="Hours per shift"><button class="sm" data-savehrs="'+b.dataset.hrs+'">Save</button></div>')}
+  if(b.dataset.savehrs){var hv=b.previousSibling.value.trim();var hn=hv===""?0:parseFloat(hv);if(!(hn>=0&&hn<=24))return;api("/api/staff/"+b.dataset.savehrs,{method:"POST",body:{hours:hn}}).then(loadStaff)}
   if(b.dataset.saverate){var v=parseFloat(b.previousSibling.value);if(!(v>=0))return;api("/api/staff/"+b.dataset.saverate,{method:"POST",body:{rate:v}}).then(loadStaff)}});
 
 
@@ -2541,7 +2547,7 @@ function loadPay(){api("/api/payroll?date="+payRef).then(function(j){
   $("pweek").textContent=fmtDay(j.start)+" – "+fmtDay(j.end);
   var h='<div class="card tw"><table><thead><tr><th>Cashier</th><th class="r">Shifts</th><th class="r">Hours</th><th class="r">Rate</th><th class="r">Pay</th></tr></thead><tbody>';
   j.rows.forEach(function(r){h+='<tr><td><b>'+esc(r.name)+'</b><span class="s">'+esc(r.days.join(", "))+'</span>'+payNotes(r)+'</td><td class="r num">'+r.shifts+'</td><td class="r num">'+fmtH(r.hours)+'</td><td class="r num">'+money(r.rate)+'</td><td class="r num">'+money(r.pay)+'</td></tr>'});
-  h+='<tr><td><b>Total</b></td><td></td><td></td><td></td><td class="r num"><b>'+money(j.total)+'</b></td></tr></tbody></table></div><div class="mute">Each shift sent counts '+j.hoursPerShift+' hours. A double counts two shifts. Cover time moves minutes from the cashier who came in late or left early to the one who covered; extra work adds minutes. Tap remove on anything you don’t approve. Pay day is the Thursday after the week ends.</div>';
+  h+='<tr><td><b>Total</b></td><td></td><td></td><td></td><td class="r num"><b>'+money(j.total)+'</b></td></tr></tbody></table></div><div class="mute">Each shift sent counts '+j.hoursPerShift+' hours, or their own hours if set on the Staff tab. A double counts two shifts. Cover time moves minutes from the cashier who came in late or left early to the one who covered; extra work adds minutes. Tap remove on anything you don’t approve. Pay day is the Thursday after the week ends.</div>';
   $("pay").innerHTML=h;loadScore()}).catch(function(){})}
 function loadScore(){api("/api/scorecard?date="+payRef).then(function(j){
   var h='<div class="sec">Cashier scorecard</div>';
