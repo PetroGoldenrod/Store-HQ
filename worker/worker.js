@@ -426,7 +426,8 @@ function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet 
     return {
       key, shifts: g.shifts, worked: shiftRows.map(r => ({ staff: r.staff_name, cover: (r.data && r.data.cover) || null, extra: (r.data && r.data.extra) || null })), label: g.shifts.length > 1 ? "Shifts " + g.shifts.join(" & ") : "Shift " + g.shifts[0],
       empty: !g.rows.length && !useVf, registers, regSource: useVf ? "verifone" : "photos",
-      lottery: { reports: lotRows.map(r => ({ closeId: r.id, staff: r.staff_name, stage: r.stage, at: r.created, online: r.data.online, scratch: r.data.scratch, photos: JSON.parse(r.photos || "[]") })), checks, warns,
+      lottery: { reports: lotRows.map(r => ({ closeId: r.id, staff: r.staff_name, stage: r.stage, at: r.created, online: r.data.online, scratch: r.data.scratch, photos: JSON.parse(r.photos || "[]"), borrowed: r.borrowed || null })), checks, warns,
+        review: g.rows.filter(r => r.kind === "lotreview").map(r => ({ closeId: r.id, staff: r.staff_name, stage: r.stage, at: r.created, problems: (r.data && r.data.problems) || [], photos: JSON.parse(r.photos || "[]") })),
         payCountNote: (sC.value !== null && haveReg && sC.value !== sum("scratchPayCount")) ? { terminal: sC.value, registers: sum("scratchPayCount") } : null },
       netOverShort: r2(registers.reduce((a, r) => a + (r.overShort || 0), 0)),
       sscs: sscs ?? null, sscsSource: manual != null ? "manual" : imported ? "import" : null, problems, todo
@@ -562,7 +563,16 @@ async function handleSubmit(req, env, token) {
       list = list.slice(-60);
       await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'rejects', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(SS, JSON.stringify(list), Date.now()).run();
     } catch (e) { console.error("reject log", e && e.message); }
-    console.log("photo rejected", st.name, b.kind, stage, problems.join(" | "));
+    console.log("photo rejected", st.name, b.kind, stage, problems.join(" | "), b.force ? "(sent anyway)" : "");
+    if (b.kind === "lottery" && b.force === true) {
+      // Cashier tried twice and pressed "Send it anyway": keep the photo for the owner to check (not used in the lottery math).
+      const now = Date.now(), pid = rid(16);
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO photos (id, created, b64) VALUES (?, ?, ?)").bind(pid, now, images[0]),
+        env.DB.prepare("INSERT INTO closes (id, created, date, shift, staff_id, staff_name, kind, stage, data, photos, store) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .bind(rid(14), now, b.date, shift, st.id, st.name, "lotreview", stage, JSON.stringify({ problems: problems.slice(0, 4) }), JSON.stringify([pid]), st.store || DEF_STORE)]);
+      return json({ ok: true, review: true });
+    }
     return json({ ok: false, problems });
   }
   const now = Date.now(), ids = images.map(() => rid(16)), id = rid(14);
@@ -616,6 +626,33 @@ async function dayData(env, S, date, c) {
     try { const d = JSON.parse(x.data); d.cashier = canonName(d.cashier, ALIAS); (cashiers[x.shift] = cashiers[x.shift] || []).push({ ...d, sid: x.sid, pulled: x.pulled, counted: counted[x.sid] == null ? null : counted[x.sid] }); } catch {}
   });
   Object.values(cashiers).forEach(l => l.sort((a, b) => String(a.open).localeCompare(String(b.open))));
+  // A shift's end lottery report is the same receipt as the next shift's start. If a shift has no end photo, use the next start.
+  try {
+    const lotR = rows.filter(r => r.kind === "lottery"), worked = k => rows.some(r => (r.kind === "shift" || r.kind === "register") && covers(r.shift).includes(k)) || (cashiers[k] || []).length > 0;
+    let next = null;
+    for (const k of [1, 2, 3]) {
+      if (!worked(k) || lotR.some(r => r.stage === "end" && covers(r.shift).includes(k))) continue;
+      let st = null;
+      if (k < 3) st = lotR.filter(r => r.stage === "start" && covers(r.shift)[0] === k + 1)[0];
+      else {
+        if (!next) next = ((await env.DB.prepare("SELECT * FROM closes WHERE date = ? AND store = ? AND kind = 'lottery' AND stage = 'start' ORDER BY created").bind(addDays(date, 1), S).all()).results || []).map(r => ({ ...r, data: JSON.parse(r.data) }));
+        st = next.filter(r => covers(r.shift)[0] === 1)[0];
+      }
+      if (st) rows.push({ ...st, id: st.id + "~b", shift: String(k), stage: "end", borrowed: { staff: st.staff_name, shift: covers(st.shift)[0], date: st.date } });
+    }
+    // Same the other way: no start photo for a shift, use the previous shift's end.
+    let prevEnd = null;
+    for (const k of [1, 2, 3]) {
+      if (!worked(k) || lotR.some(r => r.stage === "start" && covers(r.shift).includes(k))) continue;
+      let pe = null;
+      if (k > 1) pe = lotR.filter(r => r.stage === "end" && covers(r.shift).slice(-1)[0] === k - 1).pop();
+      else {
+        if (!prevEnd) prevEnd = ((await env.DB.prepare("SELECT * FROM closes WHERE date = ? AND store = ? AND kind = 'lottery' AND stage = 'end' ORDER BY created").bind(addDays(date, -1), S).all()).results || []).map(r => ({ ...r, data: JSON.parse(r.data) }));
+        pe = prevEnd.filter(r => covers(r.shift).slice(-1)[0] === 3).pop();
+      }
+      if (pe) rows.push({ ...pe, id: pe.id + "~a", shift: String(k), stage: "start", borrowed: { staff: pe.staff_name, shift: covers(pe.shift).slice(-1)[0], date: pe.date, end: true } });
+    }
+  } catch (e) { console.error("borrow start", e && e.message); }
   const groups = buildDay(date, rows, dropsMap, sscsMap, c.flag, countsMap, fixSet, cashiers);
   try { await addHandoff(env, S, date, rows, groups); } catch (e) { console.error("handoff", e && e.message); }
   let rejects = [];
@@ -660,7 +697,9 @@ function dayChecks(day, nowMs, tz) {
     g.lottery.checks.forEach(ch => { if (!ch.ok && !ch.missing) bad.push(ch.name.replace(" (SSCS)", "") + (ch.diff > 0 ? " over " : " short ") + usd2(Math.abs(ch.diff))); });
     vf.forEach(x => { if (x.overShort != null && Math.abs(x.overShort) >= day.flag) bad.push(who(x) + " register " + (x.overShort >= 0 ? "over " : "short ") + usd2(Math.abs(x.overShort))); });
     const lotNeeded = !g.lottery.checks.length || g.lottery.checks.some(ch => ch.key !== "scratch" && !ch.none);
-    if (overdue && !hasEnd && lotNeeded) bad.push("No lottery photos sent");
+    const inReview = (g.lottery.review || []).length > 0;
+    if (inReview) warn.push("Lottery photo needs your check (the app couldn't read it)");
+    else if (overdue && !hasEnd && lotNeeded) bad.push("No lottery photos sent");
     else if (ended && !hasEnd && lotNeeded) warn.push("Lottery photos not in yet");
     if (hasEnd && g.lottery.checks.some(ch => ch.key === "scratch" && ch.missing)) warn.push("Waiting for the SSCS count");
     vf.forEach(x => { if ((x.drops || 0) > 0 && x.counted == null) warn.push(who(x) + " safe drops not counted yet"); });
@@ -687,6 +726,19 @@ async function ownerApi(req, env, path, url) {
     const pStore = req.headers.get("x-partner") || "";
     if (pStore) return json({ stores: [{ store: pStore, name: names[pStore] || pStore }], def: pStore, partner: true, manager: MGR });
     return json({ stores: Object.entries(names).map(([store, name]) => ({ store, name })).sort((a, b) => (a.store === DEF_STORE ? -1 : b.store === DEF_STORE ? 1 : a.name.localeCompare(b.name))), def: DEF_STORE });
+  }
+  if (path === "/api/lotreview" && req.method === "POST") {
+    // Owner taps "Read it again" on a photo a cashier sent anyway. If it reads fine now, it becomes a normal lottery report.
+    const b = await readBody(req, 1e4);
+    const r = await env.DB.prepare("SELECT id, photos FROM closes WHERE id = ? AND store = ? AND kind = 'lotreview'").bind(String(b.id || ""), S).first();
+    if (!r) return json({ error: "Not found." }, 404);
+    if (b.action === "dismiss") { await env.DB.prepare("UPDATE closes SET kind = 'lotreviewed' WHERE id = ?").bind(r.id).run(); return json({ ok: true }); }
+    const pid = (JSON.parse(r.photos || "[]"))[0], ph = pid && await env.DB.prepare("SELECT b64 FROM photos WHERE id = ?").bind(pid).first();
+    if (!ph) return json({ ok: false, problems: ["The photo is missing."] });
+    const res = await readLottery(env, [ph.b64]);
+    if (res.problems.length) return json({ ok: false, problems: res.problems });
+    await env.DB.prepare("UPDATE closes SET kind = 'lottery', data = ? WHERE id = ?").bind(JSON.stringify(res.data), r.id).run();
+    return json({ ok: true });
   }
   if (path === "/api/relot" && req.method === "POST") {
     // Re-read saved lottery photos for a date (fixes readings made before the math check).
@@ -1846,7 +1898,7 @@ fetch("/api/c/"+token+"/me").then(function(r){return r.json().then(function(j){r
   $("hello").textContent="Hi "+x.j.name+". Send your reports here at the end of each shift.";$("app").hidden=false;
   var co=x.j.coworkers||[],o='<option value="">Choose…</option>';co.forEach(function(c){o+='<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>'});$("covWho").innerHTML=o;$("covBox").hidden=!co.length;if(x.j.myHours){$("hrsBox").hidden=false;$("hrsPick").options[0].text="My usual hours ("+x.j.myHours+" h)";$("hrsPick").options[1].text="A full shift ("+x.j.normalHours+" h), I covered";}checkSent();
 }).catch(function(){$("hello").textContent="No connection. Check your internet and reload."});
-var TOUCHED=false;
+var TOUCHED=false,SENT_END=false,NOEND_OK=false,REJ={},FORCE=false;
 function setDefaults(){var d=new Date(),h=d.getHours(),s;
   if(h>=2&&h<10){s="1"}else if(h>=10&&h<18)s="2";else{s="3";if(h<2)d=new Date(d.getTime()-86400000)}
   $("date").value=d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());$("shift").value=s;goLabel()}
@@ -1859,7 +1911,7 @@ setDefaults();
 document.addEventListener("visibilitychange",function(){if(document.visibilityState==="visible")refreshDefaults()});
 window.addEventListener("focus",refreshDefaults);
 function checkSent(){var d=$("date").value,s=$("shift").value;if(!d)return;
-  fetch("/api/c/"+token+"/sent?date="+d+"&shift="+encodeURIComponent(s)).then(function(r){return r.json()}).then(function(j){var L=j.sent||[],by={};
+  fetch("/api/c/"+token+"/sent?date="+d+"&shift="+encodeURIComponent(s)).then(function(r){return r.json()}).then(function(j){var L=j.sent||[],by={};SENT_END=L.some(function(x){return x.stage==="end"});
     L.forEach(function(x){var b=by[x.staff]||(by[x.staff]={st:[],at:0});if(b.st.indexOf(x.stage)<0)b.st.push(x.stage);b.at=Math.max(b.at,x.at)});
     var names=Object.keys(by);if(!names.length){$("sentNote").hidden=true;return}
     var nm={start:"start",end:"end",prev:"previous day"};
@@ -1897,23 +1949,27 @@ $("go").addEventListener("click",function(){
   var cov=null,ext=null,cm=$("covMin").value.trim(),em=$("extMin").value.trim(),en=$("extNote").value.trim();
   if($("covWho").value||cm){var n=Math.round(Number(cm));if(!$("covWho").value){msg("err","Choose who you covered for.");return}if(!(n>=1&&n<=600)){msg("err","Enter how many minutes you covered.");return}cov={otherId:$("covWho").value,why:$("covWhy").value,minutes:n}}
   if(em||en){var n2=Math.round(Number(em));if(!(n2>=1&&n2<=600)){msg("err","Enter how many extra minutes you stayed.");return}if(!en){msg("err","Write what extra work you did.");return}ext={minutes:n2,note:en}}
-  jobs.push({name:"Your shift",ids:[],hours:1,body:Object.assign({kind:"shift",cover:cov,extra:ext,fullShift:$("hrsPick").value==="full"},base)});
-  var lotShift=$("lotShift").value;
+  var lotShift=$("lotShift").value,force=FORCE;FORCE=false;
   [["p_start","start","Lottery start of shift"],["p_prev","prev","Lottery previous day final"],["p_end","end","Lottery end of shift"]].forEach(function(x){
-    if(shots[x[0]])jobs.push({name:x[2],ids:[x[0]],body:Object.assign({kind:"lottery",stage:x[1],lotShift:lotShift,images:[shots[x[0]]]},base)});});
+    if(shots[x[0]])jobs.push({name:x[2],ids:[x[0]],stage:x[1],body:Object.assign({kind:"lottery",stage:x[1],lotShift:lotShift,images:[shots[x[0]]],force:force&&(REJ[x[1]]||0)>=2},base)});});
+  if(!shots.p_end&&!shots.p_start&&!shots.p_prev&&!SENT_END&&!NOEND_OK){NOEND_OK=true;msg("err","<b>No end-of-shift lottery photo.</b> Print the lottery report, take the photo above, then tap Send. (If the lottery machine is closed, tap Send again to send without it.)");return}
+  jobs.push({name:"Your shift",ids:[],hours:1,shift:1,body:Object.assign({kind:"shift",cover:cov,extra:ext,fullShift:$("hrsPick").value==="full"},base)});
   if(!jobs.length){msg("err","Take the lottery photos first.");return}
   if(!base.date){msg("err","Choose the date.");return}
   var btn=$("go");btn.disabled=true;msg("info",jobs.length>1?"Checking your photos… this takes about a minute. Keep this page open.":"Sending…");
-  var done=[],bad=[];
+  var done=[],bad=[],lotBad=false,held=false,review=false;
   (function next(i){
+    if(i<jobs.length&&jobs[i].shift&&lotBad){held=true;i=jobs.length}
     if(i>=jobs.length){btn.disabled=false;checkSent();
-      var h="";if(done.length)h+='<div class="msg ok"><b>Sent:</b> '+done.map(esc).join(", ")+'. Thank you!</div>';
-      if(bad.length)h+='<div class="msg err"><b>Please retake and send again:</b><ul class="probs">'+bad.map(function(b){return "<li>"+esc(b)+"</li>"}).join("")+"</ul></div>";
-      $("msg").innerHTML=h;return}
+      var h="";if(done.length)h+='<div class="msg ok"><b>Sent:</b> '+done.map(esc).join(", ")+'. Thank you!'+(review?' The owner will check the lottery photo.':'')+'</div>';
+      if(bad.length){var canForce=Object.keys(REJ).some(function(k){return REJ[k]>=2});
+        h+='<div class="msg err">'+(held?'<b>Your shift is NOT sent yet.</b> The lottery photo has to go through first.<br>':'')+'<b>Please retake the photo and tap Send again:</b><ul class="probs">'+bad.map(function(b){return "<li>"+esc(b)+"</li>"}).join("")+'</ul>Tip: lay both lottery receipts flat, side by side, in good light, and fit all of both in the photo.'+
+          (canForce?'<br><button type="button" class="alt" id="forceGo" style="margin-top:10px">Still not working? Send it anyway for the owner to check</button>':'')+'</div>'}
+      $("msg").innerHTML=h;if($("forceGo"))$("forceGo").addEventListener("click",function(){FORCE=true;$("go").click()});if(!bad.length)NOEND_OK=false;return}
     var j=jobs[i];send(j.body).then(function(r){
-      if(r.ok){done.push(j.name);j.ids.forEach(clearShot);if(j.hours){["covWho","covMin","extMin","extNote"].forEach(function(i){$(i).value=""});$("covBox").open=false;$("extBox").open=false}}
-      else if(r.problems)r.problems.forEach(function(p){bad.push(p)});
-      else bad.push(j.name+": "+(r.error||"could not be sent"));
+      if(r.ok){done.push(j.name);if(r.review)review=true;if(j.stage)REJ[j.stage]=0;j.ids.forEach(clearShot);if(j.hours){["covWho","covMin","extMin","extNote"].forEach(function(i){$(i).value=""});$("covBox").open=false;$("extBox").open=false}}
+      else{if(j.stage){lotBad=true;REJ[j.stage]=(REJ[j.stage]||0)+1}
+        if(r.problems)r.problems.forEach(function(p){bad.push(p)});else bad.push(j.name+": "+(r.error||"could not be sent"))}
       next(i+1);});
   })(0);
 });
@@ -2366,7 +2422,8 @@ function renderDay(){var j=DAY,h="";
     });
     h+='</tbody></table></div>';
     if(g.lottery.payCountNote)h+='<div class="mute" style="font-size:.88rem">Scratch payout count: terminal '+g.lottery.payCountNote.terminal+', registers '+g.lottery.payCountNote.registers+'. If the dollars match, a winner was probably rung as one line.</div>';
-    if(g.lottery.reports.length)h+='<div class="mute" style="font-size:.85rem">Lottery photos: '+g.lottery.reports.map(function(l){return '<a href="/photo/'+l.photos[0]+'" target="_blank" rel="noopener">'+esc({start:"start",end:"end",prev:"prev. day final"}[l.stage]||"report")+' '+esc(l.online.time||"")+'</a> (<a href="#" data-del="'+l.closeId+'">remove</a>)'}).join(" · ")+'</div>';
+    if(g.lottery.reports.length)h+='<div class="mute" style="font-size:.85rem">Lottery photos: '+g.lottery.reports.map(function(l){return '<a href="/photo/'+l.photos[0]+'" target="_blank" rel="noopener">'+esc({start:"start",end:"end",prev:"prev. day final"}[l.stage]||"report")+' '+esc(l.online.time||"")+'</a>'+(l.borrowed?' (from '+esc(l.borrowed.staff)+'\u2019s '+(l.borrowed.end?'end':'start')+' of Shift '+l.borrowed.shift+')':' (<a href="#" data-del="'+l.closeId+'">remove</a>)')}).join(" · ")+'</div>';
+    (g.lottery.review||[]).forEach(function(v){h+='<div class="warn-line" style="margin:6px 0"><b>'+esc(v.staff)+'</b> sent a lottery photo ('+esc(v.stage)+') the app couldn\u2019t read: '+v.problems.map(esc).join("; ")+'<br><a href="/photo/'+v.photos[0]+'" target="_blank" rel="noopener">See photo</a> · <a href="#" data-rv="'+v.closeId+'">Read it again</a> · <a href="#" data-rvx="'+v.closeId+'">Checked, hide</a></div>'});
     h+=voidsHtml(g);
     h+='</div></div>';
   });
@@ -2419,6 +2476,8 @@ $("day").addEventListener("change",function(e){var t=e.target;
   if(t.dataset.addrop){var v=parseFloat(t.value);if(!(v>0))return;var l=dropsOf(t.dataset.addrop);l.push(v);saveDrops(t.dataset.addrop,l)}});
 var pendingDel=null;
 $("day").addEventListener("click",function(e){var t=e.target;
+  if(t.dataset.rv||t.dataset.rvx){e.preventDefault();var x=!!t.dataset.rvx;t.textContent=x?"Hiding…":"Reading… (about 30 s)";
+    api("/api/lotreview",{method:"POST",body:{id:t.dataset.rv||t.dataset.rvx,action:x?"dismiss":"read"}}).then(function(j){if(j.ok)loadDay();else t.textContent="Still can\u2019t read it: "+(j.problems||[]).join("; ")}).catch(function(z){t.textContent=z.message});return}
   if(t.dataset.dropfix){e.preventDefault();api("/api/dropfix",{method:"POST",body:{closeId:t.dataset.dropfix,on:t.dataset.on==="1"}}).then(loadDay).catch(function(x){alertLine(x.message)});return}
   if(t.dataset.rmdrop){var l=dropsOf(t.dataset.rmdrop);l.splice(+t.dataset.i,1);saveDrops(t.dataset.rmdrop,l)}
   if(t.dataset.del){e.preventDefault();if(pendingDel!==t.dataset.del){pendingDel=t.dataset.del;t.textContent="Tap again to remove";return}
