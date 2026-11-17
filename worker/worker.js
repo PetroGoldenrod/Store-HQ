@@ -2131,7 +2131,9 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  <div class="gasp">
   <div class="card"><h2 id="gsT">Gas prices</h2>
    <div class="row"><div><label for="gsReg">Regular credit ($)</label><input id="gsReg" type="text" inputmode="decimal" placeholder="e.g. 3719"></div><div id="gsDslBox"><label for="gsDsl">Diesel credit ($)</label><input id="gsDsl" type="text" inputmode="decimal" placeholder="e.g. 5859"></div></div>
-   <div class="gslow"><span id="gsLwT">Lower both by</span><input id="gsC" type="number" inputmode="numeric" placeholder="cents"><span>¢</span><button class="alt sm" id="gsLw" type="button">Lower</button></div>
+   <div class="gslow"><span id="gsLwT">Lower gas by</span><input id="gsC" type="number" inputmode="decimal" placeholder="cents"><span>¢</span></div>
+   <div class="gslow" id="gsDCBox"><span>Lower diesel by</span><input id="gsDC" type="number" inputmode="decimal" placeholder="cents"><span>¢</span></div>
+   <div class="gslow"><button class="alt sm" id="gsLw" type="button">Lower</button><span class="mute" style="font-size:.85rem">Leave a box empty to keep that price.</span></div>
    <div class="mute" style="font-size:.85rem;margin-top:8px">Plus and Premium are 45¢ above the grade below. Cash is 12¢ under credit.</div></div>
   <div class="card"><pre id="gsOut" class="gsout"></pre><button id="gsGrp" type="button">Copy &amp; open store WhatsApp group</button><button class="alt" id="gsCopy" type="button">Copy message</button><a class="gsbtn" id="gsWa" target="_blank" rel="noopener">Open WhatsApp</a><div class="mute" id="gsNote" style="margin-top:8px"></div></div>
  </div>
@@ -2226,7 +2228,7 @@ function gsFmt(v){var n=Math.round(v*1000);return n%10===0?(n/1000).toFixed(2):(
 function gsLine(nm,cr){return nm+"\\nCash: $"+gsFmt(cr-0.12)+"\\nCredit: $"+gsFmt(cr)}
 function gsName(){var sel=$("store");return sel&&sel.selectedIndex>=0?sel.options[sel.selectedIndex].text:"Store"}
 function gsBuild(){var r=gsNum($("gsReg").value),hd=gsHasDsl(),d=hd?gsNum($("gsDsl").value):0;$("gsT").textContent="Gas prices · "+gsName();
-  $("gsDslBox").style.display=hd?"":"none";$("gsLwT").textContent=hd?"Lower both by":"Lower by";
+  $("gsDslBox").style.display=hd?"":"none";$("gsLwT").textContent=hd?"Lower gas by":"Lower by";$("gsDCBox").style.display=hd?"":"none";
   if(isNaN(r)||isNaN(d)){$("gsOut").textContent=hd?"Enter Regular and Diesel credit prices.":"Enter the Regular credit price.";$("gsWa").removeAttribute("href");return ""}
   var pl=r+0.45,pr=pl+0.45,m="PRICE CHANGE NOW\\n\\n"+gsLine("Regular",r)+"\\n\\n"+gsLine("Plus",pl)+"\\n\\n"+gsLine("Premium",pr)+(hd?"\\n\\n"+gsLine("Diesel",d):"");
   $("gsOut").textContent=m;$("gsWa").href="https://wa.me/?text="+encodeURIComponent(m);return m}
@@ -2235,9 +2237,11 @@ function loadGas(){$("gsGrp").hidden=!GS_GROUP[STORE];if(GS.store!==STORE){GS.st
   api("/api/gas").then(function(j){var a=document.activeElement;if(a&&(a.id==="gsReg"||a.id==="gsDsl"))return;$("gsReg").value=j.reg==null?"":j.reg;$("gsDsl").value=j.dsl==null?"":j.dsl;gsBuild()}).catch(function(){})}
 $("gsReg").addEventListener("input",function(){gsBuild();gsSave()});$("gsDsl").addEventListener("input",function(){gsBuild();gsSave()});
 $("gsReg").addEventListener("blur",function(){gsTidy("gsReg");gsBuild()});$("gsDsl").addEventListener("blur",function(){gsTidy("gsDsl");gsBuild()});
-$("gsLw").addEventListener("click",function(){var c=parseFloat($("gsC").value),r=gsNum($("gsReg").value),d=gsHasDsl()?gsNum($("gsDsl").value):0;
-  if(isNaN(c)||isNaN(r)||isNaN(d)){$("gsNote").textContent="Enter current prices and the cents to lower first.";return}
-  $("gsReg").value=String(Math.round((r-c/100)*1000)/1000);$("gsDsl").value=String(Math.round((d-c/100)*1000)/1000);$("gsC").value="";gsBuild();gsSave()});
+$("gsLw").addEventListener("click",function(){var hd=gsHasDsl(),c=parseFloat($("gsC").value),dc=hd?parseFloat($("gsDC").value):NaN,r=gsNum($("gsReg").value),d=hd?gsNum($("gsDsl").value):0;
+  if(isNaN(c)&&isNaN(dc)){$("gsNote").textContent="Enter the cents to lower gas, diesel, or both.";return}
+  if((!isNaN(c)&&isNaN(r))||(!isNaN(dc)&&isNaN(d))){$("gsNote").textContent="Enter the current price first.";return}
+  if(!isNaN(c))$("gsReg").value=String(Math.round((r-c/100)*1000)/1000);if(!isNaN(dc))$("gsDsl").value=String(Math.round((d-dc/100)*1000)/1000);
+  $("gsC").value="";$("gsDC").value="";$("gsNote").textContent="";gsBuild();gsSave()});
 $("gsGrp").addEventListener("click",function(){var m=gsBuild(),g=GS_GROUP[STORE];if(!g)return;if(!m){$("gsNote").textContent="Enter the prices first.";return}
   try{if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(m).catch(function(){})}catch(e){}
   $("gsNote").textContent="Message copied. In the group, press and hold the message box, tap Paste, then Send.";window.open(g,"_blank","noopener")});
