@@ -1992,7 +1992,7 @@ fetch("/api/c/"+token+"/me").then(function(r){return r.json().then(function(j){r
   $("hello").textContent="Hi "+x.j.name+". Send your reports here at the end of each shift.";$("app").hidden=false;
   var co=x.j.coworkers||[],o='<option value="">Choose…</option>';co.forEach(function(c){o+='<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>'});$("covWho").innerHTML=o;$("covBox").hidden=!co.length;if(x.j.myHours){$("hrsPick").options[0].text="My usual hours ("+x.j.myHours+" h)";$("hrsPick").options[1].text="A full shift ("+x.j.normalHours+" h), I covered";$("hrsPick").options[1].hidden=false;}checkSent();
 }).catch(function(){$("hello").textContent="No connection. Check your internet and reload."});
-var TOUCHED=false,SENT_END=false,NOEND_OK=false,REJ={},FORCE=false;
+var TOUCHED=false,SENT_END=false,SENT_PREV=false,NOLOT=false,REJ={},FORCE=false;
 function setDefaults(){var d=new Date(),h=d.getHours(),s;
   if(h>=2&&h<10){s="1"}else if(h>=10&&h<18)s="2";else{s="3";if(h<2)d=new Date(d.getTime()-86400000)}
   $("date").value=d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());$("shift").value=s;goLabel()}
@@ -2005,7 +2005,7 @@ setDefaults();
 document.addEventListener("visibilitychange",function(){if(document.visibilityState==="visible")refreshDefaults()});
 window.addEventListener("focus",refreshDefaults);
 function checkSent(){var d=$("date").value,s=$("shift").value;if(!d)return;
-  fetch("/api/c/"+token+"/sent?date="+d+"&shift="+encodeURIComponent(s)).then(function(r){return r.json()}).then(function(j){var L=j.sent||[],by={};SENT_END=L.some(function(x){return x.stage==="end"});
+  fetch("/api/c/"+token+"/sent?date="+d+"&shift="+encodeURIComponent(s)).then(function(r){return r.json()}).then(function(j){var L=j.sent||[],by={};SENT_END=L.some(function(x){return x.stage==="end"});SENT_PREV=L.some(function(x){return x.stage==="prev"});
     L.forEach(function(x){var b=by[x.staff]||(by[x.staff]={st:[],at:0});if(b.st.indexOf(x.stage)<0)b.st.push(x.stage);b.at=Math.max(b.at,x.at)});
     var names=Object.keys(by);if(!names.length){$("sentNote").hidden=true;return}
     var nm={start:"start",end:"end",prev:"previous day"};
@@ -2051,8 +2051,14 @@ $("go").addEventListener("click",function(){
   var lotShift=$("lotShift").value,force=FORCE;FORCE=false;
   [["p_start","start","Lottery start of shift"],["p_prev","prev","Lottery previous day final"],["p_end","end","Lottery end of shift"]].forEach(function(x){
     if(shots[x[0]])jobs.push({name:x[2],ids:[x[0]],stage:x[1],body:Object.assign({kind:"lottery",stage:x[1],lotShift:lotShift,images:[shots[x[0]]],force:force&&(REJ[x[1]]||0)>=2},base)});});
-  if(!shots.p_end&&!shots.p_start&&!shots.p_prev&&!SENT_END&&!NOEND_OK){NOEND_OK=true;LOG("Tapped Send with no lottery photo attached");msg("err","<b>No end-of-shift lottery photo.</b> Print the lottery report, take the photo above, then tap Send. (If the lottery machine is closed, tap Send again to send without it.)");return}
-  jobs.push({name:"Your shift",ids:[],hours:1,shift:1,body:Object.assign({kind:"shift",cover:cov,extra:ext,fullShift:$("hrsPick").value==="full",earlyMin:early},base)});
+  // The end-of-shift lottery photo is required (and the previous day report on the overnight shift), unless someone on this shift already sent it.
+  var startOnly=shots.p_start&&!shots.p_end&&!shots.p_prev&&!SENT_END;
+  var needEnd=!shots.p_end&&!SENT_END&&!startOnly, needPrev=!$("prevWrap").hidden&&!shots.p_prev&&!SENT_PREV&&!startOnly;
+  if((needEnd||needPrev)&&!NOLOT){var w=[];if(needEnd)w.push("the <b>End of shift</b> photo");if(needPrev)w.push("the <b>Previous day report</b> photo");
+    LOG("Tapped Send without "+w.join(" and ").split("<b>").join("").split("</b>").join(""));
+    msg("err","<b>Your shift is NOT sent yet.</b> Print the lottery reports, take "+w.join(" and ")+" above, then tap Send.<br><button type='button' class='alt' id='noLotGo' style='margin-top:10px'>The lottery machine is closed or broken</button>");
+    $("noLotGo").addEventListener("click",function(){NOLOT=true;LOG("Sent without the lottery photo: cashier says the lottery machine was closed or broken");$("go").click()});return}
+  if(!startOnly)jobs.push({name:"Your shift",ids:[],hours:1,shift:1,body:Object.assign({kind:"shift",cover:cov,extra:ext,fullShift:$("hrsPick").value==="full",earlyMin:early},base)});
   if(!jobs.length){msg("err","Take the lottery photos first.");return}
   if(!base.date){msg("err","Choose the date.");return}
   var btn=$("go");btn.disabled=true;msg("info",jobs.length>1?"Checking your photos… this takes about a minute. Keep this page open.":"Sending…");
@@ -2064,7 +2070,8 @@ $("go").addEventListener("click",function(){
       if(bad.length){var canForce=Object.keys(REJ).some(function(k){return REJ[k]>=2});
         h+='<div class="msg err">'+(held?'<b>Your shift is NOT sent yet.</b> The lottery photo has to go through first.<br>':'')+'<b>Please retake the photo and tap Send again:</b><ul class="probs">'+bad.map(function(b){return "<li>"+esc(b)+"</li>"}).join("")+'</ul>Tip: lay both lottery receipts flat, side by side, in good light, and fit all of both in the photo.'+
           (canForce?'<br><button type="button" class="alt" id="forceGo" style="margin-top:10px">Still not working? Send it anyway for the owner to check</button>':'')+'</div>'}
-      $("msg").innerHTML=h;if($("forceGo"))$("forceGo").addEventListener("click",function(){FORCE=true;$("go").click()});if(!bad.length)NOEND_OK=false;return}
+      if(startOnly&&!bad.length)h+='<div class="msg ok">At the end of your shift, take the <b>End of shift</b> photo and tap Send again.</div>';
+      NOLOT=false;$("msg").innerHTML=h;if($("forceGo"))$("forceGo").addEventListener("click",function(){FORCE=true;$("go").click()});return}
     var j=jobs[i];send(j.body).then(function(r){
       if(r.ok){done.push(j.name);if(r.review)review=true;if(j.stage)REJ[j.stage]=0;j.ids.forEach(clearShot);if(j.hours){["covWho","covMin","extMin","extNote","earlyMin","hrsPick"].forEach(function(i){$(i).value=""});$("earlyBox").hidden=true;$("covBox").open=false;$("extBox").open=false}}
       else{if(j.stage){lotBad=true;REJ[j.stage]=(REJ[j.stage]||0)+1}
