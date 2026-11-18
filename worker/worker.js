@@ -173,6 +173,13 @@ CASHIER REPORT: the header gives STORE#, REG # (register number), CASHIER # and 
 CASHIER TRACKING REPORT: DEPARTMENT TRACKING prints each department on two lines: DEPT# and DESCRIPTION with the item count at the right, then GROSS, REFUNDS, DISCOUNT and NET. Return every department. Payout departments print negative amounts; keep their sign. totalsNet is the NET figure on the TOTALS line of the department section.
 Set "readable" to false ONLY if that photo is not the named report, or a number you must return is blurry, cut off, covered by glare or illegible. If false, say briefly why in "problem" without repeating any numbers.`;
 
+const PROMPT_LOTINV = `This photo shows a Florida Lottery WEEKLY SETTLEMENT REPORT (Informe de Liquidacion) printed by the lottery terminal.
+Read it exactly as printed. Return ONLY JSON, no other text:
+{"found":true|false,"readable":true|false,"problem":"","printDate":"YYYY-MM-DD","weekFrom":"YYYY-MM-DD","weekTo":"YYYY-MM-DD","retailer":"",
+ "terminal":{"sales":0,"salesCount":0,"cancels":0,"netSales":0,"salesComm":0,"pays":0,"paysCount":0,"couponPays":0,"cashingComm":0,"discounts":0,"svcCharges":0,"adjustments":0,"due":0},
+ "scratch":{"booksSettled":0,"booksSettledAmt":0,"booksUnsettled":0,"partialReturn":0,"salesComm":0,"pays":0,"paysCount":0,"cashingComm":0,"adjustments":0,"due":0},
+ "prizeFreePlays":0,"promoFreePlays":0,"totalDue":0,"totalComm":0}
+Rules: dates on the receipt are MM/DD/YY, write them as YYYY-MM-DD. Money is a plain number; amounts printed with a minus sign (commissions, pays) are written as POSITIVE numbers. Counts are the small numbers in the middle column. If it is not this report or you can't read it, set found or readable to false and say why in problem.`;
 const PROMPT_LOT = `This ONE photo shows two Florida Lottery terminal receipts placed side by side: the DAILY TERMINAL GAMES SALES report (online lotto: PICK 3, POWERBALL... then GROSS SALES, CANCELS, NET SALES, DISCOUNTS, PAYS, CASH BALANCE) and the DAILY SCRATCH-OFF GAMES SALES report (BOOKS SETTLED, SALES COMM, PAYS, BOOKS ACTIVATED, NET TOTAL). They can be in either order.
 Return JSON only, no other text, in exactly this shape:
 {"online":{"found":true,"readable":true,"problem":"","printDate":"","time":"","forDate":"","grossSales":null,"cancels":null,"netSales":null,"tickets":null,"discounts":null,"pays":null,"couponPays":null,"cashBalance":null},"scratch":{"found":true,"readable":true,"problem":"","printDate":"","time":"","forDate":"","pays":null,"paysCount":null,"booksActivated":null}}
@@ -622,6 +629,38 @@ async function nameAliases(env) {
   try { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'aliases'").first(); return r ? JSON.parse(r.data) || {} : {}; } catch { return {}; }
 }
 function canonName(n, A) { const s = String(n || "").trim(); const k = s.split(/\s+/)[0].toLowerCase(); return (A && A[k]) || s; }
+// Weekly lottery invoice vs. what the registers rang that week (Verifone), with the shifts that explain any difference.
+async function lotInvoiceCheck(env, S, inv, c) {
+  const from = inv.weekFrom, to = inv.weekTo;
+  // Register shifts are filed by the date they end: Shift 1 of the first day started the night before, and the night after the
+  // last day is filed under the next day. The terminal is closed after midnight, so the overnight shift's lottery belongs to the evening it started.
+  const rows = (await env.DB.prepare("SELECT date, shift, data FROM vf_cash WHERE store = ? AND date BETWEEN ? AND ?").bind(S, from, addDays(to, 1)).all()).results || [];
+  const use = rows.filter(r => !(r.date === from && String(r.shift) === "1") && !(r.date === addDays(to, 1) && String(r.shift) !== "1"));
+  const sum = f => r2(use.reduce((a, r) => { let d = {}; try { d = JSON.parse(r.data); } catch {} return a + Math.abs(Number((d.lotto || {})[f]) || 0); }, 0));
+  const days = new Set(use.map(r => r.date)).size;
+  const reg = { online: sum("online"), onlinePay: sum("onlinePay"), scratchPay: sum("scratchPay"), scratch: sum("scratch") };
+  const T = inv.terminal || {}, X = inv.scratch || {};
+  const lines = [
+    { key: "online", name: "Online lotto sales", invoice: num(T.netSales), registers: reg.online },
+    { key: "onlinePay", name: "Online lotto winners paid", invoice: num(T.pays) + num(T.couponPays), registers: reg.onlinePay },
+    { key: "scratchPay", name: "Scratch-off winners paid", invoice: num(X.pays), registers: reg.scratchPay }
+  ].map(l => ({ ...l, diff: r2(l.registers - l.invoice), ok: Math.abs(l.registers - l.invoice) < 0.01 }));
+  // The shift checks that explain it.
+  const notes = [];
+  for (let d = from; d <= addDays(to, 1); d = addDays(d, 1)) {
+    try {
+      const day = await dayData(env, S, d, c);
+      day.groups.forEach(g => {
+        if (d === from && g.shifts[0] === 1) return; if (d === addDays(to, 1) && g.shifts[0] !== 1) return;
+        g.lottery.checks.forEach(ch => { if (ch.key === "scratch" || ch.diff === null || ch.diff === 0 || ch.missing || ch.na) return;
+          if (Math.abs(ch.diff) >= 0.01) notes.push({ date: d, shift: g.label, line: ch.name, diff: ch.diff, misrung: !!ch.misrung }); });
+        g.lottery.checks.forEach(ch => { if (ch.missing && ch.key !== "scratch" && ch.registers) notes.push({ date: d, shift: g.label, line: ch.name, diff: null, missing: true }); });
+      });
+    } catch {}
+  }
+  const sscs = sum("scratch");
+  return { days, lines, notes, cashDiff: r2(lines[0].diff - lines[1].diff - lines[2].diff), scratchSold: sscs, booksSettledAmt: num(X.booksSettledAmt) };
+}
 function pairScratch(ga, gb, note = "") {
   if (!ga || !gb) return;
   const a = ga.lottery.checks.find(x => x.key === "scratch"), b = gb.lottery.checks.find(x => x.key === "scratch");
@@ -817,6 +856,32 @@ async function ownerApi(req, env, path, url) {
       out.push({ id: r.id, time: res.data.online.time, before: { net: old.online && old.online.netSales, pays: old.online && old.online.pays }, after: { net: res.data.online.netSales, pays: res.data.online.pays, cash: res.data.online.cashBalance } });
     }
     return json({ ok: true, out });
+  }
+  if (path === "/api/lotinv" && req.method === "GET") {
+    const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'lotinv'").bind(S).first();
+    let list = []; try { list = k ? JSON.parse(k.data) : []; } catch {}
+    const out = [];
+    for (const inv of list.slice(-6).reverse()) out.push({ ...inv, check: await lotInvoiceCheck(env, S, inv, c) });
+    return json({ invoices: out });
+  }
+  if (path === "/api/lotinv" && req.method === "POST") {
+    // Weekly settlement report photo: read it, keep it, and check it against the registers for that week.
+    const b = await readBody(req);
+    if (!okImage(b.image)) return json({ error: "Add the photo of the weekly settlement report." }, 400);
+    let inv; try { inv = await askClaude(env, PROMPT_LOTINV, [b.image]); } catch (e) { return json({ error: "The photo reader didn't answer. Try again in a minute." }, 502); }
+    if (!inv || inv.found === false || inv.readable === false) return json({ error: "Couldn't read the weekly settlement report" + (inv && inv.problem ? ": " + inv.problem : "") + ". Take the photo again, flat and in good light." }, 400);
+    if (!validDate(inv.weekFrom) || !validDate(inv.weekTo)) return json({ error: "Couldn't read the week on the report. Take the photo again." }, 400);
+    const T = inv.terminal || {}, X = inv.scratch || {};
+    const dueT = r2(num(T.netSales) - num(T.salesComm) - num(T.pays) - num(T.couponPays) - num(T.cashingComm) - num(T.discounts) + num(T.svcCharges) + num(T.adjustments));
+    const dueX = r2(num(X.booksSettledAmt) - num(X.salesComm) - num(X.pays) - num(X.cashingComm) + num(X.adjustments));
+    const readOk = Math.abs(dueT - num(T.due)) < 0.02 && Math.abs(dueX - num(X.due)) < 0.02 && Math.abs(num(T.due) + num(X.due) - num(inv.totalDue)) < 0.02;
+    const pid = rid(16); await env.DB.prepare("INSERT INTO photos (id, created, b64) VALUES (?, ?, ?)").bind(pid, Date.now(), b.image).run();
+    const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'lotinv'").bind(S).first();
+    let list = []; try { list = k ? JSON.parse(k.data) : []; } catch {}
+    list = list.filter(x => x.weekFrom !== inv.weekFrom);
+    list.push({ ...inv, readOk, photo: pid, at: Date.now() }); list.sort((a, b2) => a.weekFrom.localeCompare(b2.weekFrom)); list = list.slice(-30);
+    await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'lotinv', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(list), Date.now()).run();
+    return json({ ok: true, readOk });
   }
   if (path === "/api/day" && req.method === "GET") {
     const date = url.searchParams.get("date");
@@ -2252,6 +2317,11 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
   <textarea id="impin" rows="3" placeholder="Paste here" style="width:100%;margin-top:8px;font:inherit;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink)"></textarea>
   <button id="impgo" style="margin-top:8px">Import</button><div id="impmsg"></div>
  </details>
+ <details class="card" id="invbox"><summary style="cursor:pointer;font-weight:700">Weekly lottery invoice</summary>
+  <div class="mute" style="margin-top:8px">Print the <b>Weekly Settlement Report</b> on the lottery machine and take a photo of it. The app checks it against what the registers rang that week.</div>
+  <label class="alt" style="display:inline-block;margin-top:10px;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Add the report photo<input type="file" id="invfile" accept="image/*" capture="environment" hidden></label>
+  <div id="invmsg" class="mute" style="margin-top:8px"></div><div id="invlist"></div>
+ </details>
  <div id="day"><div class="mute">Loading…</div></div>
 </section>
 <section id="v-staff" hidden>
@@ -2325,6 +2395,19 @@ var STORE="";try{STORE=localStorage.getItem("store")||""}catch(e){}
 function api(path,opt){opt=opt||{};opt.headers=opt.headers||{};if(opt.body&&typeof opt.body!=="string"){opt.body=JSON.stringify(opt.body);opt.headers["content-type"]="application/json"}
   if(STORE)opt.headers["x-store"]=STORE;
   return fetch(path,opt).then(function(r){if(r.status===401){show(false);throw new Error("signin")}return r.json().then(function(j){if(!r.ok)throw new Error(j.error||"error");return j})})}
+function invShrink(file){return new Promise(function(res,rej){var img=new Image(),u=URL.createObjectURL(file);img.onload=function(){var m=2000,w=img.width,h=img.height,k=Math.min(1,m/Math.max(w,h)),cv=document.createElement("canvas");cv.width=Math.round(w*k);cv.height=Math.round(h*k);cv.getContext("2d").drawImage(img,0,0,cv.width,cv.height);URL.revokeObjectURL(u);res(cv.toDataURL("image/jpeg",0.85).split(",")[1])};img.onerror=function(){rej(new Error("That photo couldn’t be opened."))};img.src=u})}
+function loadInv(){api("/api/lotinv").then(function(j){var h="";(j.invoices||[]).forEach(function(v){var k=v.check||{};
+  h+='<div style="border-top:1px solid var(--line);margin-top:12px;padding-top:10px"><b>Week of '+esc(fmtDay(v.weekFrom))+' – '+esc(fmtDay(v.weekTo))+'</b> · Lottery takes '+money(v.totalDue)+(v.readOk?'':' <span class="pill warn">Check the photo: the numbers didn’t add up when read</span>')+' · <a href="/photo/'+esc(v.photo)+'" target="_blank" rel="noopener">photo</a>';
+  h+='<table style="margin-top:6px"><thead><tr><th>Line</th><th class="r">Invoice</th><th class="r">Registers</th><th></th></tr></thead><tbody>';
+  (k.lines||[]).forEach(function(l){h+='<tr><td>'+esc(l.name)+'</td><td class="r num">'+money(l.invoice)+'</td><td class="r num">'+money(l.registers)+'</td><td class="r">'+(l.ok?'<span class="pill good">Match</span>':'<span class="pill '+(Math.abs(l.diff)<2?"warn":"bad")+'">'+(l.diff>0?"Over ":"Short ")+money(Math.abs(l.diff))+'</span>')+'</td></tr>'});
+  h+='</tbody></table>';
+  if((k.lines||[]).some(function(l){return !l.ok})){h+='<div class="mute" style="margin-top:6px">Money effect for the week: <b>'+(k.cashDiff>=0?"+":"−")+money(Math.abs(k.cashDiff))+'</b> (online sales minus winners paid, registers vs. invoice).</div>';
+    if((k.notes||[]).length)h+='<div style="margin-top:6px"><b>Shifts that explain it:</b>'+k.notes.map(function(n){return '<div class="s">'+esc(fmtDay(n.date))+' '+esc(n.shift)+' · '+esc(n.line)+': '+(n.missing?'no lottery report':(n.diff>0?"+":"−")+money(Math.abs(n.diff))+(n.misrung?' (rung on the wrong key)':''))+'</div>'}).join("")+'</div>'}
+  h+='<div class="mute" style="margin-top:6px">Scratch-offs: '+(v.scratch&&v.scratch.booksSettled||0)+' books settled ('+money(k.booksSettledAmt||0)+'). Scratch-offs sold that week: '+money(k.scratchSold||0)+'. Books settle when they sell out or time runs out, so these two only even out over several weeks.</div></div>'});
+  $("invlist").innerHTML=h||'<div class="mute" style="margin-top:8px">No invoices yet.</div>'}).catch(function(){})}
+$("invbox").addEventListener("toggle",function(){if(this.open)loadInv()});
+$("invfile").addEventListener("change",function(){var f=this.files[0];if(!f)return;$("invmsg").textContent="Reading the report… (about 30 seconds)";
+  invShrink(f).then(function(b){return api("/api/lotinv",{method:"POST",body:{image:b}})}).then(function(){$("invmsg").textContent="Saved.";$("invfile").value="";loadInv()}).catch(function(e){$("invmsg").textContent=e.message||"Didn’t save, try again."})});
 function today(){var d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function addDays(s,n){var d=new Date(s+"T12:00:00");d.setDate(d.getDate()+n);return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function fmtDay(s){var d=new Date(s+"T12:00:00");return d.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}
