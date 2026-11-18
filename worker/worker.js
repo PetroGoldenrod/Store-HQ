@@ -348,7 +348,7 @@ function nameMatch(a, b) {
 }
 // The terminal's day resets at midnight. Group receipts by business date:
 // first date = latest − earliest; each later date = latest − 0.
-function lotteryDelta(list, field) {
+function lotteryDelta(list, field, opts = {}) {
   const warns = []; let partial = false; if (!list.length) return { value: null, warns, partial };
   const stamp = r => (r.printDate || r.forDate || "") + "T" + String(r.time || "00:00").padStart(5, "0");
   // Same receipt sent twice: keep one per print time, preferring a reading whose numbers add up.
@@ -362,6 +362,10 @@ function lotteryDelta(list, field) {
     const rs = by[d].slice().sort((a, b) => (stamp(a) < stamp(b) ? -1 : 1));
     const last = num(rs[rs.length - 1][field]) || 0;
     if (i === 0) {
+      // The lottery terminal is closed from midnight to 6 AM, so the day's counters are still $0 when the morning shift starts.
+      // A morning shift with only its end report can start from $0 (no start photo needed).
+      const zeroStart = opts.zeroDate === d && rs.length === 1 && String(rs[0].time || "") >= "08:00";
+      if (zeroStart) { total += last; return; }
       if (rs.length < 2 && dates.length === 1) { partial = true; warns.push("Only one lottery report so far. The start and end of the shift are both needed."); }
       else if (rs.length < 2) { partial = true; warns.push("The previous day's final lottery report is missing, so 10pm to midnight isn't counted."); }
       total += last - (num(rs[0][field]) || 0);
@@ -369,7 +373,7 @@ function lotteryDelta(list, field) {
   });
   return { value: r2(total), warns, partial };
 }
-function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet = new Set(), vfMap = {}) {
+function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet = new Set(), vfMap = {}, lotPhotos = true) {
   // Merge shifts that share a double into one group.
   const groups = [];
   const find = k => groups.find(g => g.shifts.includes(k));
@@ -399,7 +403,8 @@ function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet 
     const useVf = vf.length > 0;
     const sum = f => useVf ? r2(vf.reduce((a, x) => a + Math.abs(Number((x.lotto || {})[vfF[f]]) || 0), 0)) : photoSum(f);
     const haveReg = useVf || registers.length > 0;
-    const oS = lotteryDelta(online, "netSales"), oP = lotteryDelta(online, "pays"), sP = lotteryDelta(scratch, "pays"), sC = lotteryDelta(scratch, "paysCount");
+    const zo = { zeroDate: g.shifts[0] === 2 ? date : null };
+    const oS = lotteryDelta(online, "netSales", zo), oP = lotteryDelta(online, "pays", zo), sP = lotteryDelta(scratch, "pays", zo), sC = lotteryDelta(scratch, "paysCount", zo);
     const warns = [...new Set([...oS.warns, ...sP.warns])];
     const manual = sscsMap[date + "|" + key];
     const imported = g.shifts.reduce((a, k) => (countsMap[k] ? { sum: r2((a ? a.sum : 0) + countsMap[k].sales), n: (a ? a.n : 0) + countsMap[k].n } : a), null);
@@ -407,6 +412,8 @@ function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet 
     const checks = [];
     const add = (name, term, reg, key2, partial) => {
       // No terminal photo but the registers rang $0 (e.g. overnight, the lotto terminal is closed): nothing to check.
+      // A store whose cashiers don't send lottery photos: only the SSCS check applies.
+      if (!lotPhotos && key2 !== "scratch") { checks.push({ key: key2, name, terminal: null, registers: reg, diff: null, ok: true, missing: false, none: true, na: true, photo: null }); return; }
       const none = !lotRows.length && key2 !== "scratch" && reg === 0;
       // Part of the shift isn't on the photos (no previous-day final): only a match can be trusted, anything else can't be checked yet.
       const missing = !none && (term === null || term === undefined || reg === null || (partial && Math.abs(reg - term) >= 0.01));
@@ -423,7 +430,7 @@ function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet 
     const regIssues = registers.filter(r => r.flag).length + registers.filter(r => r.dropsDiff !== null && Math.abs(r.dropsDiff) >= 0.01 && !r.dropFixed).length + registers.filter(r => r.nameMismatch).length;
     const problems = regIssues + checks.filter(c => !c.ok && !c.missing).length;
     const lotNeeded = !checks.length || checks.some(c => c.key !== "scratch" && !c.none);
-    const todo = ((haveReg || shiftRows.length) && !lotRows.length && lotNeeded ? 1 : 0) + checks.filter(c => c.missing && (c.key !== "scratch" || haveReg)).length + registers.filter(r => !r.drops.length && (r.safeDrop || 0) > 0).length;
+    const todo = ((haveReg || shiftRows.length) && !lotRows.length && lotNeeded && lotPhotos ? 1 : 0) + checks.filter(c => c.missing && (c.key !== "scratch" || haveReg)).length + registers.filter(r => !r.drops.length && (r.safeDrop || 0) > 0).length;
     return {
       key, shifts: g.shifts, worked: shiftRows.map(r => ({ staff: r.staff_name, cover: (r.data && r.data.cover) || null, extra: (r.data && r.data.extra) || null })), label: g.shifts.length > 1 ? "Shifts " + g.shifts.join(" & ") : "Shift " + g.shifts[0],
       empty: !g.rows.length && !useVf, registers, regSource: useVf ? "verifone" : "photos",
@@ -677,7 +684,17 @@ async function dayData(env, S, date, c) {
       if (pe) rows.push({ ...pe, id: pe.id + "~a", shift: String(k), stage: "start", borrowed: { staff: pe.staff_name, shift: covers(pe.shift).slice(-1)[0], date: pe.date, end: true } });
     }
   } catch (e) { console.error("borrow start", e && e.message); }
-  const groups = buildDay(date, rows, dropsMap, sscsMap, c.flag, countsMap, fixSet, cashiers);
+  const lotPhotos = !!(await env.DB.prepare("SELECT 1 AS x FROM closes WHERE store = ? AND kind = 'lottery' LIMIT 1").bind(S).first());
+  const groups = buildDay(date, rows, dropsMap, sscsMap, c.flag, countsMap, fixSet, cashiers, lotPhotos);
+  // SSCS counts and register closes don't happen at the same minute, so tickets sold in between land on the next shift:
+  // one shift shows over and the next shows the same amount short. When two shifts in a row cancel out (within $5), it's timing, not money.
+  for (let i = 0; i + 1 < groups.length; i++) {
+    const a = groups[i].lottery.checks.find(x => x.key === "scratch"), b = groups[i + 1].lottery.checks.find(x => x.key === "scratch");
+    if (!a || !b || a.ok || b.ok || a.diff === null || b.diff === null || Math.sign(a.diff) === Math.sign(b.diff)) continue;
+    if (Math.abs(a.diff + b.diff) > 5) continue;
+    [[a, groups[i]], [b, groups[i + 1]]].forEach(([x, g]) => { x.ok = true; x.timing = true; g.problems = Math.max(0, g.problems - 1); });
+    a.timingNote = b.timingNote = "Count timing: " + usd2(Math.abs(a.diff)) + " moved between Shift " + groups[i].shifts.join("+") + " and Shift " + groups[i + 1].shifts.join("+") + (Math.abs(a.diff + b.diff) >= 0.01 ? " (net " + usd2(a.diff + b.diff) + ")" : "");
+  }
   try { await addHandoff(env, S, date, rows, groups); } catch (e) { console.error("handoff", e && e.message); }
   let rejects = [];
   try { const rj = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'rejects'").bind(S).first(); rejects = (rj ? JSON.parse(rj.data) : []).filter(x => x.date === date); } catch {}
@@ -688,21 +705,24 @@ async function dayData(env, S, date, c) {
 // Lottery handoff: a shift's start numbers should equal the previous shift's end numbers (same terminal day).
 const HANDOFF_F = [["online", "netSales", "Online lotto sales"], ["online", "pays", "Online lotto payouts"], ["scratch", "pays", "Scratch-off payouts"]];
 async function addHandoff(env, S, date, rows, groups) {
-  const lot = rows.filter(r => r.kind === "lottery");
+  const lot = rows.filter(r => r.kind === "lottery" && !r.borrowed && r.stage !== "prev");
+  // Each receipt is matched by its printed time: a cashier may put the online and scratch receipts in different photos.
+  const stampOf = x => x && x.time ? (x.printDate || x.forDate || "") + "T" + String(x.time).padStart(5, "0") : null;
+  const pickR = (list, k, latest) => { let b = null; list.forEach(r => { const x = (r.data || {})[k], t = stampOf(x); if (t && (!b || (latest ? t > b.t : t < b.t))) b = { t, x }; }); return b ? b.x : {}; };
   let prev = null;
   for (const g of groups) {
-    const start = lot.find(r => r.stage === "start" && covers(r.shift).some(k => g.shifts.includes(k)));
-    if (!start) continue;
-    const first = g.shifts[0]; let pe;
-    if (first > 1) pe = lot.filter(r => r.stage === "end" && covers(r.shift).includes(first - 1)).pop();
+    const mine = lot.filter(r => covers(r.shift).some(k => g.shifts.includes(k)));
+    if (!mine.some(r => r.stage === "start")) continue;
+    const first = g.shifts[0]; let pl;
+    if (first > 1) pl = lot.filter(r => covers(r.shift).includes(first - 1));
     else {
       if (!prev) prev = ((await env.DB.prepare("SELECT shift, stage, data FROM closes WHERE date = ? AND store = ? AND kind = 'lottery' ORDER BY created").bind(addDays(date, -1), S).all()).results || []).map(r => ({ ...r, data: JSON.parse(r.data) }));
-      pe = prev.filter(r => r.stage === "end" && covers(r.shift).includes(3)).pop();
+      pl = prev.filter(r => r.stage !== "prev" && covers(r.shift).includes(3));
     }
-    if (!pe) continue;
+    if (!pl.length || !pl.some(r => r.stage === "end")) continue;
     const msgs = [];
     HANDOFF_F.forEach(([k, f, label]) => {
-      const a = (pe.data || {})[k] || {}, b = (start.data || {})[k] || {};
+      const a = pickR(pl, k, true), b = pickR(mine, k, false);
       if (!a.forDate || a.forDate !== b.forDate) return;
       const va = num(a[f]), vb = num(b[f]); if (va === null || vb === null) return;
       if (Math.abs(va - vb) >= 0.01) msgs.push(label + ": " + usd2(vb) + " at this start vs " + usd2(va) + " at the last end");
@@ -2457,7 +2477,7 @@ $("impgo").addEventListener("click",function(){var b=this,raw=$("impin").value.t
       .catch(function(e){b.disabled=false;$("impmsg").innerHTML='<div class="msg err">'+esc(e.message)+'</div>'})};
   if(raw)go(raw);else if(navigator.clipboard&&navigator.clipboard.readText)navigator.clipboard.readText().then(function(t){go((t||"").trim())},function(){go("")});else go("");});
 $("recent").addEventListener("click",function(e){var b=e.target.closest("[data-d]");if(b){$("date").value=b.dataset.d;loadDay()}});
-function pill(c){if(c.none)return '<span class="pill good">No sales</span>';if(c.missing)return '<span class="pill info">'+(c.key==="scratch"?"Enter SSCS":"Need report")+'</span>';return c.ok?'<span class="pill good">Match</span>':'<span class="pill bad">'+(c.diff>0?"Over ":"Short ")+money(Math.abs(c.diff))+'</span>'}
+function pill(c){if(c.na)return '<span class="pill">No photos at this store</span>';if(c.timing)return '<span class="pill good" title="'+esc(c.timingNote||"")+'">Count timing</span>';if(c.none)return '<span class="pill good">No sales</span>';if(c.missing)return '<span class="pill info">'+(c.key==="scratch"?"Enter SSCS":"Need report")+'</span>';return c.ok?'<span class="pill good">Match</span>':'<span class="pill bad">'+(c.diff>0?"Over ":"Short ")+money(Math.abs(c.diff))+'</span>'}
 function workedHtml(g){if(!g.worked||!g.worked.length)return "";return '<div class="mute" style="margin:2px 0 8px">Worked: '+g.worked.map(function(w){var t='<b>'+esc(w.staff)+'</b>';if(w.cover)t+=' (+'+w.cover.minutes+' min covering '+esc(w.cover.otherName)+')';if(w.extra)t+=' (+'+w.extra.minutes+' min extra: '+esc(w.extra.note)+')';return t}).join(", ")+'</div>'}
 function renderDay(){var j=DAY,h="";
   if(j.rejects&&j.rejects.length)h+='<div class="card"><h2>Sends that didn\u2019t go through</h2>'+j.rejects.map(function(x){var t=new Date(x.at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"});return '<div class="'+(x.later?"mute":"warn-line")+'" style="margin:6px 0"><b>'+esc(x.staff)+'</b> '+t+' · Shift '+esc(x.shift)+' '+esc(x.stage||x.kind)+(x.later?' (sent OK later)':'')+'<br>'+x.problems.map(esc).join("<br>")+'</div>'}).join("")+'</div>';
