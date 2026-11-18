@@ -427,6 +427,11 @@ function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet 
       add("Scratch-off payouts", lotRows.length ? sP.value : null, haveReg ? sum("scratchPay") : null, "scratchPay", sP.partial);
       add("Scratch-off sales (SSCS)", sscs ?? null, haveReg ? sum("scratch") : null, "scratch");
     }
+    // A sale rung on the wrong lottery key (e.g. a $25 online ticket rung as scratch-off) shows as over on one line and short on another.
+    // If the cash effect of all the lottery lines nets to $0, the money is right: show it as a wrong-key note, not a shortage.
+    const SIGN = { lotto: 1, scratch: 1, lottoPay: -1, scratchPay: -1 }, off = checks.filter(x => !x.ok && !x.missing && x.diff !== null);
+    if (off.length >= 2 && Math.abs(checks.reduce((a, x) => a + (x.diff !== null && !x.missing ? SIGN[x.key] * x.diff : 0), 0)) < 0.01)
+      off.forEach(x => { x.ok = true; x.misrung = true; });
     const regIssues = registers.filter(r => r.flag).length + registers.filter(r => r.dropsDiff !== null && Math.abs(r.dropsDiff) >= 0.01 && !r.dropFixed).length + registers.filter(r => r.nameMismatch).length;
     const problems = regIssues + checks.filter(c => !c.ok && !c.missing).length;
     const lotNeeded = !checks.length || checks.some(c => c.key !== "scratch" && !c.none);
@@ -623,7 +628,7 @@ function pairScratch(ga, gb, note = "") {
   if (!a || !b || a.diff === null || b.diff === null || (a.ok && !a.timing) || (b.ok && !b.timing) || a.timing || b.timing) return;
   if (Math.sign(a.diff) === Math.sign(b.diff) || Math.abs(a.diff + b.diff) > 5) return;
   [[a, ga], [b, gb]].forEach(([x, g]) => { x.ok = true; x.timing = true; g.problems = Math.max(0, g.problems - 1); });
-  a.timingNote = b.timingNote = "Count timing: " + usd2(Math.abs(a.diff)) + " moved between " + ga.label + " and " + gb.label + note + (Math.abs(a.diff + b.diff) >= 0.01 ? " (net " + usd2(a.diff + b.diff) + ")" : "");
+  a.timingNote = b.timingNote = "Count timing: " + usd2(Math.abs(a.diff)) + " moved between " + (note === " (yesterday)" ? "yesterday's " + ga.label + " and " + gb.label : note === " (tomorrow)" ? ga.label + " and tomorrow's " + gb.label : ga.label + " and " + gb.label) + (Math.abs(a.diff + b.diff) >= 0.01 ? " (net " + usd2(a.diff + b.diff) + ")" : "");
 }
 // The day plus the overnight hand-over: last night's Shift 3 and this morning's Shift 1 share an SSCS count.
 async function dayDataFull(env, S, date, c) {
@@ -759,6 +764,7 @@ function dayChecks(day, nowMs, tz) {
     if (hasEnd && g.lottery.checks.some(ch => ch.key === "scratch" && ch.missing)) warn.push("Waiting for the SSCS count");
     vf.forEach(x => { if ((x.drops || 0) > 0 && x.counted == null) warn.push(who(x) + " safe drops not counted yet"); });
     (g.lottery.warns || []).forEach(w => warn.push(w));
+    if (g.lottery.checks.some(ch => ch.misrung)) warn.push("A lottery sale was rung on the wrong key (the money is right)");
     (g.handoff || []).forEach(w => bad.push("Lottery handoff gap: " + w));
     const items = bad.concat(warn);
     const level = bad.length ? "bad" : warn.length ? "warn" : (hasEnd || vf.length) ? "good" : "none";
@@ -2488,7 +2494,7 @@ $("impgo").addEventListener("click",function(){var b=this,raw=$("impin").value.t
       .catch(function(e){b.disabled=false;$("impmsg").innerHTML='<div class="msg err">'+esc(e.message)+'</div>'})};
   if(raw)go(raw);else if(navigator.clipboard&&navigator.clipboard.readText)navigator.clipboard.readText().then(function(t){go((t||"").trim())},function(){go("")});else go("");});
 $("recent").addEventListener("click",function(e){var b=e.target.closest("[data-d]");if(b){$("date").value=b.dataset.d;loadDay()}});
-function pill(c){if(c.na)return '<span class="pill">No photos at this store</span>';if(c.timing)return '<span class="pill good" title="'+esc(c.timingNote||"")+'">Count timing</span>';if(c.none)return '<span class="pill good">No sales</span>';if(c.missing)return '<span class="pill info">'+(c.key==="scratch"?"Enter SSCS":"Need report")+'</span>';return c.ok?'<span class="pill good">Match</span>':'<span class="pill bad">'+(c.diff>0?"Over ":"Short ")+money(Math.abs(c.diff))+'</span>'}
+function pill(c){if(c.misrung)return '<span class="pill warn" title="Rung on the wrong lottery key. The money is right.">Wrong key '+(c.diff>0?"+":"−")+money(Math.abs(c.diff))+'</span>';if(c.na)return '<span class="pill">No photos at this store</span>';if(c.timing)return '<span class="pill good" title="'+esc(c.timingNote||"")+'">Count timing</span>';if(c.none)return '<span class="pill good">No sales</span>';if(c.missing)return '<span class="pill info">'+(c.key==="scratch"?"Enter SSCS":"Need report")+'</span>';return c.ok?'<span class="pill good">Match</span>':'<span class="pill bad">'+(c.diff>0?"Over ":"Short ")+money(Math.abs(c.diff))+'</span>'}
 function workedHtml(g){if(!g.worked||!g.worked.length)return "";return '<div class="mute" style="margin:2px 0 8px">Worked: '+g.worked.map(function(w){var t='<b>'+esc(w.staff)+'</b>';if(w.cover)t+=' (+'+w.cover.minutes+' min covering '+esc(w.cover.otherName)+')';if(w.extra)t+=' (+'+w.extra.minutes+' min extra: '+esc(w.extra.note)+')';return t}).join(", ")+'</div>'}
 function renderDay(){var j=DAY,h="";
   if(j.rejects&&j.rejects.length)h+='<div class="card"><h2>Sends that didn\u2019t go through</h2>'+j.rejects.map(function(x){var t=new Date(x.at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"});return '<div class="'+(x.later?"mute":"warn-line")+'" style="margin:6px 0"><b>'+esc(x.staff)+'</b> '+t+' · Shift '+esc(x.shift)+' '+esc(x.stage||x.kind)+(x.later?' (sent OK later)':'')+'<br>'+x.problems.map(esc).join("<br>")+'</div>'}).join("")+'</div>';
