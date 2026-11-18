@@ -1770,8 +1770,20 @@ export default {
       if (path.startsWith("/api/i/")) { const r = await invManagerApi(req, env, path); if (r) return r; }
       let m = /^\/c\/([a-z0-9]+)$/.exec(path);
       if (m && req.method === "GET") return html(CASHIER_HTML);
-      m = /^\/api\/c\/([a-z0-9]+)\/(me|submit|sent)$/.exec(path);
+      m = /^\/api\/c\/([a-z0-9]+)\/(me|submit|sent|log)$/.exec(path);
       if (m) {
+        if (m[2] === "log" && req.method === "POST") {
+          // The cashier's phone reports a send that never reached us (no connection, page error), so the owner can see it on the Shifts page.
+          const st = await staffByToken(env, m[1]); if (!st) return json({ ok: false }, 403);
+          let b = {}; try { b = JSON.parse((await req.text()).slice(0, 4000)); } catch {}
+          const SS = st.store || DEF_STORE, cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'rejects'").bind(SS).first();
+          let list = []; try { list = cur ? JSON.parse(cur.data) : []; } catch {}
+          list.push({ at: Date.now(), staff: st.name, date: validDate(b.date) ? b.date : new Date(Date.now() - 5 * 3600e3).toISOString().slice(0, 10), shift: String(b.shift || "?").slice(0, 5), kind: "phone", stage: String(b.stage || "").slice(0, 20), problems: [String(b.msg || "Phone error").slice(0, 300)] });
+          list = list.slice(-60);
+          await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'rejects', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(SS, JSON.stringify(list), Date.now()).run();
+          console.log("phone log", st.name, b.msg);
+          return json({ ok: true });
+        }
         if (m[2] === "sent") {
           const st = await staffByToken(env, m[1]);
           if (!st || !st.active) return json({ error: "off" }, 403);
@@ -1972,7 +1984,7 @@ var shots={};
     shrink(f).then(function(s){shots[id]=s.b64;lab.querySelector("img").src=s.preview;lab.classList.add("has");
       var q=s.q,w=q&&q.light<70?"Looks too dark. Turn on more light and retake.":q&&q.sharp<150?"Looks blurry. Hold the phone still and retake.":"";
       lab.classList.toggle("warnph",!!w);lab.querySelector("span").textContent=w||"Ready. Tap to retake."})
-    .catch(function(){msg("err","That photo couldn't be opened. Take it again.")});});
+    .catch(function(e){LOG("Photo couldn't be opened on the phone ("+id+")");msg("err","That photo couldn't be opened. Take it again.")});});
 });
 // Quick check on the phone before sending: very blurry or very dark photos.
 function quality(c){try{var w=320,h=Math.max(3,Math.round(c.height*w/c.width)),k=document.createElement("canvas");k.width=w;k.height=h;var x=k.getContext("2d");x.drawImage(c,0,0,w,h);
@@ -1985,9 +1997,12 @@ function shrink(file){return new Promise(function(res,rej){var img=new Image(),u
   img.onerror=function(){rej()};img.src=u;})}
 function clearShot(id){delete shots[id];var lab=$(id).parentNode;lab.classList.remove("has","warnph");lab.querySelector("img").src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";$(id).value="";
   lab.querySelector("span").textContent=id==="p_cash"||id==="p_track"?"Tap to take photo":"Sent. Tap to add another if needed."}
-function send(body){return fetch("/api/c/"+token+"/submit",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)})
-  .then(function(r){return r.json().catch(function(){return {ok:false,error:"The app didn't answer. Try again."}})})
-  .catch(function(){return {ok:false,error:"No connection. Check your internet and try again."}})}
+function LOG(msg,extra){try{var b=JSON.stringify(Object.assign({msg:String(msg).slice(0,300),date:$("date").value,shift:$("shift").value},extra||{}));if(!(navigator.sendBeacon&&navigator.sendBeacon("/api/c/"+token+"/log",new Blob([b],{type:"text/plain"}))))fetch("/api/c/"+token+"/log",{method:"POST",body:b,keepalive:true}).catch(function(){})}catch(e){}}
+window.addEventListener("error",function(e){LOG("Page error: "+(e.message||"unknown"))});
+function send(body,tries){tries=tries||0;return fetch("/api/c/"+token+"/submit",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)})
+  .then(function(r){return r.json().catch(function(){LOG("The app didn't answer ("+r.status+")",{stage:body.stage||body.kind});return {ok:false,error:"The app didn't answer. Try again."}})})
+  .catch(function(){if(tries<2)return new Promise(function(res){setTimeout(res,2500*(tries+1))}).then(function(){return send(body,tries+1)});
+    LOG("Couldn't reach the app after 3 tries (no connection?)",{stage:body.stage||body.kind});return {ok:false,error:"No connection. Your report did NOT go through. Check your internet and tap Send again."}})}
 $("hrsPick").addEventListener("change",function(){$("earlyBox").hidden=this.value!=="early"});
 $("go").addEventListener("click",function(){
   refreshDefaults();
@@ -1999,7 +2014,7 @@ $("go").addEventListener("click",function(){
   var lotShift=$("lotShift").value,force=FORCE;FORCE=false;
   [["p_start","start","Lottery start of shift"],["p_prev","prev","Lottery previous day final"],["p_end","end","Lottery end of shift"]].forEach(function(x){
     if(shots[x[0]])jobs.push({name:x[2],ids:[x[0]],stage:x[1],body:Object.assign({kind:"lottery",stage:x[1],lotShift:lotShift,images:[shots[x[0]]],force:force&&(REJ[x[1]]||0)>=2},base)});});
-  if(!shots.p_end&&!shots.p_start&&!shots.p_prev&&!SENT_END&&!NOEND_OK){NOEND_OK=true;msg("err","<b>No end-of-shift lottery photo.</b> Print the lottery report, take the photo above, then tap Send. (If the lottery machine is closed, tap Send again to send without it.)");return}
+  if(!shots.p_end&&!shots.p_start&&!shots.p_prev&&!SENT_END&&!NOEND_OK){NOEND_OK=true;LOG("Tapped Send with no lottery photo attached");msg("err","<b>No end-of-shift lottery photo.</b> Print the lottery report, take the photo above, then tap Send. (If the lottery machine is closed, tap Send again to send without it.)");return}
   jobs.push({name:"Your shift",ids:[],hours:1,shift:1,body:Object.assign({kind:"shift",cover:cov,extra:ext,fullShift:$("hrsPick").value==="full",earlyMin:early},base)});
   if(!jobs.length){msg("err","Take the lottery photos first.");return}
   if(!base.date){msg("err","Choose the date.");return}
@@ -2445,7 +2460,7 @@ $("recent").addEventListener("click",function(e){var b=e.target.closest("[data-d
 function pill(c){if(c.none)return '<span class="pill good">No sales</span>';if(c.missing)return '<span class="pill info">'+(c.key==="scratch"?"Enter SSCS":"Need report")+'</span>';return c.ok?'<span class="pill good">Match</span>':'<span class="pill bad">'+(c.diff>0?"Over ":"Short ")+money(Math.abs(c.diff))+'</span>'}
 function workedHtml(g){if(!g.worked||!g.worked.length)return "";return '<div class="mute" style="margin:2px 0 8px">Worked: '+g.worked.map(function(w){var t='<b>'+esc(w.staff)+'</b>';if(w.cover)t+=' (+'+w.cover.minutes+' min covering '+esc(w.cover.otherName)+')';if(w.extra)t+=' (+'+w.extra.minutes+' min extra: '+esc(w.extra.note)+')';return t}).join(", ")+'</div>'}
 function renderDay(){var j=DAY,h="";
-  if(j.rejects&&j.rejects.length)h+='<div class="card"><h2>Photos the app turned down</h2>'+j.rejects.map(function(x){var t=new Date(x.at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"});return '<div class="'+(x.later?"mute":"warn-line")+'" style="margin:6px 0"><b>'+esc(x.staff)+'</b> '+t+' · Shift '+esc(x.shift)+' '+esc(x.stage||x.kind)+(x.later?' (sent OK later)':'')+'<br>'+x.problems.map(esc).join("<br>")+'</div>'}).join("")+'</div>';
+  if(j.rejects&&j.rejects.length)h+='<div class="card"><h2>Sends that didn\u2019t go through</h2>'+j.rejects.map(function(x){var t=new Date(x.at).toLocaleTimeString([],{hour:"numeric",minute:"2-digit"});return '<div class="'+(x.later?"mute":"warn-line")+'" style="margin:6px 0"><b>'+esc(x.staff)+'</b> '+t+' · Shift '+esc(x.shift)+' '+esc(x.stage||x.kind)+(x.later?' (sent OK later)':'')+'<br>'+x.problems.map(esc).join("<br>")+'</div>'}).join("")+'</div>';
   j.groups.forEach(function(g){
     var cls=g.problems?"bad":(!g.empty&&!g.todo?"good":"");
     var st=g.empty?'<span class="pill info">Nothing sent</span>':g.problems?'<span class="pill bad">'+g.problems+' to look at</span>':g.todo?'<span class="pill warn">'+g.todo+' to finish</span>':'<span class="pill good">Balanced</span>';
