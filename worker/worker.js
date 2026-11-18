@@ -349,7 +349,7 @@ function nameMatch(a, b) {
 // The terminal's day resets at midnight. Group receipts by business date:
 // first date = latest − earliest; each later date = latest − 0.
 function lotteryDelta(list, field) {
-  const warns = []; if (!list.length) return { value: null, warns };
+  const warns = []; let partial = false; if (!list.length) return { value: null, warns, partial };
   const stamp = r => (r.printDate || r.forDate || "") + "T" + String(r.time || "00:00").padStart(5, "0");
   // Same receipt sent twice: keep one per print time, preferring a reading whose numbers add up.
   const one = {};
@@ -363,11 +363,11 @@ function lotteryDelta(list, field) {
     const last = num(rs[rs.length - 1][field]) || 0;
     if (i === 0) {
       if (rs.length < 2 && dates.length === 1) warns.push("Only one lottery report so far. The start and end of the shift are both needed.");
-      else if (rs.length < 2) warns.push("The previous day's final lottery report is missing, so 10pm to midnight isn't counted.");
+      else if (rs.length < 2) { partial = true; warns.push("The previous day's final lottery report is missing, so 10pm to midnight isn't counted."); }
       total += last - (num(rs[0][field]) || 0);
     } else total += last;
   });
-  return { value: r2(total), warns };
+  return { value: r2(total), warns, partial };
 }
 function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet = new Set(), vfMap = {}) {
   // Merge shifts that share a double into one group.
@@ -405,18 +405,19 @@ function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet 
     const imported = g.shifts.reduce((a, k) => (countsMap[k] ? { sum: r2((a ? a.sum : 0) + countsMap[k].sales), n: (a ? a.n : 0) + countsMap[k].n } : a), null);
     const sscs = manual ?? (imported ? imported.sum : undefined);
     const checks = [];
-    const add = (name, term, reg, key2) => {
+    const add = (name, term, reg, key2, partial) => {
       // No terminal photo but the registers rang $0 (e.g. overnight, the lotto terminal is closed): nothing to check.
       const none = !lotRows.length && key2 !== "scratch" && reg === 0;
-      const missing = !none && (term === null || term === undefined || reg === null);
+      // Part of the shift isn't on the photos (no previous-day final): only a match can be trusted, anything else can't be checked yet.
+      const missing = !none && (term === null || term === undefined || reg === null || (partial && Math.abs(reg - term) >= 0.01));
       if (none) term = 0;
       checks.push({ key: key2, name, terminal: term ?? null, registers: reg, diff: missing ? null : r2(reg - term), ok: none || (!missing && Math.abs(reg - term) < 0.01), missing, none,
         photo: useVf && registers.length ? photoSum(key2) : null });
     };
     if (haveReg || lotRows.length) {
-      add("Online lotto sales", lotRows.length ? oS.value : null, haveReg ? sum("lotto") : null, "lotto");
-      add("Online lotto payouts", lotRows.length ? oP.value : null, haveReg ? sum("lottoPay") : null, "lottoPay");
-      add("Scratch-off payouts", lotRows.length ? sP.value : null, haveReg ? sum("scratchPay") : null, "scratchPay");
+      add("Online lotto sales", lotRows.length ? oS.value : null, haveReg ? sum("lotto") : null, "lotto", oS.partial);
+      add("Online lotto payouts", lotRows.length ? oP.value : null, haveReg ? sum("lottoPay") : null, "lottoPay", oP.partial);
+      add("Scratch-off payouts", lotRows.length ? sP.value : null, haveReg ? sum("scratchPay") : null, "scratchPay", sP.partial);
       add("Scratch-off sales (SSCS)", sscs ?? null, haveReg ? sum("scratch") : null, "scratch");
     }
     const regIssues = registers.filter(r => r.flag).length + registers.filter(r => r.dropsDiff !== null && Math.abs(r.dropsDiff) >= 0.01 && !r.dropFixed).length + registers.filter(r => r.nameMismatch).length;
@@ -639,29 +640,40 @@ async function dayData(env, S, date, c) {
   });
   Object.values(cashiers).forEach(l => l.sort((a, b) => String(a.open).localeCompare(String(b.open))));
   // A shift's end lottery report is the same receipt as the next shift's start. If a shift has no end photo, use the next start.
+  // Receipts are picked one by one by their printed time (a cashier may photograph the online and scratch receipts in different photos):
+  // the earliest online and earliest scratch receipt of the next shift, or the latest ones of the previous shift.
   try {
     const lotR = rows.filter(r => r.kind === "lottery"), worked = k => rows.some(r => (r.kind === "shift" || r.kind === "register") && covers(r.shift).includes(k)) || (cashiers[k] || []).length > 0;
+    const stampOf = x => x && x.readable !== false && x.time ? (x.printDate || x.forDate || "") + "T" + String(x.time).padStart(5, "0") : null;
+    const pick = (list, latest) => {
+      const best = f => { let b = null; list.forEach(r => { const x = r.data && r.data[f], t = stampOf(x); if (t && (!b || (latest ? t > b.t : t < b.t))) b = { t, x, r }; }); return b; };
+      const on = best("online"), sc = best("scratch"); if (!on && !sc) return null;
+      const base = (on || sc).r, ph = new Set(); [on, sc].forEach(v => v && JSON.parse(v.r.photos || "[]").forEach(p => ph.add(p)));
+      return { ...base, data: { ...base.data, online: on ? on.x : base.data.online, scratch: sc ? sc.x : base.data.scratch }, photos: JSON.stringify([...ph]) };
+    };
     let next = null;
     for (const k of [1, 2, 3]) {
       if (!worked(k) || lotR.some(r => r.stage === "end" && covers(r.shift).includes(k))) continue;
-      let st = null;
-      if (k < 3) st = lotR.filter(r => r.stage === "start" && covers(r.shift)[0] === k + 1)[0];
+      let cand;
+      if (k < 3) cand = lotR.filter(r => r.stage !== "prev" && covers(r.shift)[0] === k + 1);
       else {
-        if (!next) next = ((await env.DB.prepare("SELECT * FROM closes WHERE date = ? AND store = ? AND kind = 'lottery' AND stage = 'start' ORDER BY created").bind(addDays(date, 1), S).all()).results || []).map(r => ({ ...r, data: JSON.parse(r.data) }));
-        st = next.filter(r => covers(r.shift)[0] === 1)[0];
+        if (!next) next = ((await env.DB.prepare("SELECT * FROM closes WHERE date = ? AND store = ? AND kind = 'lottery' ORDER BY created").bind(addDays(date, 1), S).all()).results || []).map(r => ({ ...r, data: JSON.parse(r.data) }));
+        cand = next.filter(r => r.stage !== "prev" && covers(r.shift)[0] === 1);
       }
+      const st = cand.length ? pick(cand, false) : null;
       if (st) rows.push({ ...st, id: st.id + "~b", shift: String(k), stage: "end", borrowed: { staff: st.staff_name, shift: covers(st.shift)[0], date: st.date } });
     }
     // Same the other way: no start photo for a shift, use the previous shift's end.
     let prevEnd = null;
     for (const k of [1, 2, 3]) {
       if (!worked(k) || lotR.some(r => r.stage === "start" && covers(r.shift).includes(k))) continue;
-      let pe = null;
-      if (k > 1) pe = lotR.filter(r => r.stage === "end" && covers(r.shift).slice(-1)[0] === k - 1).pop();
+      let cand;
+      if (k > 1) cand = lotR.filter(r => r.stage !== "prev" && covers(r.shift).slice(-1)[0] === k - 1);
       else {
-        if (!prevEnd) prevEnd = ((await env.DB.prepare("SELECT * FROM closes WHERE date = ? AND store = ? AND kind = 'lottery' AND stage = 'end' ORDER BY created").bind(addDays(date, -1), S).all()).results || []).map(r => ({ ...r, data: JSON.parse(r.data) }));
-        pe = prevEnd.filter(r => covers(r.shift).slice(-1)[0] === 3).pop();
+        if (!prevEnd) prevEnd = ((await env.DB.prepare("SELECT * FROM closes WHERE date = ? AND store = ? AND kind = 'lottery' ORDER BY created").bind(addDays(date, -1), S).all()).results || []).map(r => ({ ...r, data: JSON.parse(r.data) }));
+        cand = prevEnd.filter(r => r.stage !== "prev" && covers(r.shift).slice(-1)[0] === 3);
       }
+      const pe = cand.length ? pick(cand, true) : null;
       if (pe) rows.push({ ...pe, id: pe.id + "~a", shift: String(k), stage: "start", borrowed: { staff: pe.staff_name, shift: covers(pe.shift).slice(-1)[0], date: pe.date, end: true } });
     }
   } catch (e) { console.error("borrow start", e && e.message); }
