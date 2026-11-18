@@ -366,7 +366,7 @@ function lotteryDelta(list, field, opts = {}) {
       // A morning shift with only its end report can start from $0 (no start photo needed).
       const zeroStart = opts.zeroDate === d && rs.length === 1 && String(rs[0].time || "") >= "08:00";
       if (zeroStart) { total += last; return; }
-      if (rs.length < 2 && dates.length === 1) { partial = true; warns.push("Only one lottery report so far. The start and end of the shift are both needed."); }
+      if (rs.length < 2 && dates.length === 1) { partial = true; warns.push(opts.overnight ? "The previous day's final lottery report is missing, so 10pm to midnight isn't counted." : "Only one lottery report so far. The start and end of the shift are both needed."); }
       else if (rs.length < 2) { partial = true; warns.push("The previous day's final lottery report is missing, so 10pm to midnight isn't counted."); }
       total += last - (num(rs[0][field]) || 0);
     } else total += last;
@@ -403,7 +403,7 @@ function buildDay(date, rows, dropsMap, sscsMap, flagAt, countsMap = {}, fixSet 
     const useVf = vf.length > 0;
     const sum = f => useVf ? r2(vf.reduce((a, x) => a + Math.abs(Number((x.lotto || {})[vfF[f]]) || 0), 0)) : photoSum(f);
     const haveReg = useVf || registers.length > 0;
-    const zo = { zeroDate: g.shifts[0] === 2 ? date : null };
+    const zo = { zeroDate: g.shifts[0] === 2 ? date : null, overnight: g.shifts[0] === 1 };
     const oS = lotteryDelta(online, "netSales", zo), oP = lotteryDelta(online, "pays", zo), sP = lotteryDelta(scratch, "pays", zo), sC = lotteryDelta(scratch, "paysCount", zo);
     const warns = [...new Set([...oS.warns, ...sP.warns])];
     const manual = sscsMap[date + "|" + key];
@@ -617,6 +617,23 @@ async function nameAliases(env) {
   try { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'aliases'").first(); return r ? JSON.parse(r.data) || {} : {}; } catch { return {}; }
 }
 function canonName(n, A) { const s = String(n || "").trim(); const k = s.split(/\s+/)[0].toLowerCase(); return (A && A[k]) || s; }
+function pairScratch(ga, gb, note = "") {
+  if (!ga || !gb) return;
+  const a = ga.lottery.checks.find(x => x.key === "scratch"), b = gb.lottery.checks.find(x => x.key === "scratch");
+  if (!a || !b || a.diff === null || b.diff === null || (a.ok && !a.timing) || (b.ok && !b.timing) || a.timing || b.timing) return;
+  if (Math.sign(a.diff) === Math.sign(b.diff) || Math.abs(a.diff + b.diff) > 5) return;
+  [[a, ga], [b, gb]].forEach(([x, g]) => { x.ok = true; x.timing = true; g.problems = Math.max(0, g.problems - 1); });
+  a.timingNote = b.timingNote = "Count timing: " + usd2(Math.abs(a.diff)) + " moved between " + ga.label + " and " + gb.label + note + (Math.abs(a.diff + b.diff) >= 0.01 ? " (net " + usd2(a.diff + b.diff) + ")" : "");
+}
+// The day plus the overnight hand-over: last night's Shift 3 and this morning's Shift 1 share an SSCS count.
+async function dayDataFull(env, S, date, c) {
+  const day = await dayData(env, S, date, c), first = day.groups[0], last = day.groups[day.groups.length - 1];
+  try {
+    if (first && first.shifts[0] === 1) { const p = await dayData(env, S, addDays(date, -1), c), pl = p.groups[p.groups.length - 1]; if (pl && pl.shifts.includes(3)) pairScratch(pl, first, " (yesterday)"); }
+    if (last && last.shifts.includes(3) && date < new Date().toISOString().slice(0, 10)) { const n = await dayData(env, S, addDays(date, 1), c), nf = n.groups[0]; if (nf && nf.shifts[0] === 1) pairScratch(last, nf, " (tomorrow)"); }
+  } catch (e) { console.error("pair across days", e && e.message); }
+  return day;
+}
 async function dayData(env, S, date, c) {
   const ALIAS = await nameAliases(env);
   const rows = ((await env.DB.prepare("SELECT * FROM closes WHERE date = ? AND store = ? ORDER BY created").bind(date, S).all()).results || []).map(r => ({ ...r, data: JSON.parse(r.data) }));
@@ -688,13 +705,7 @@ async function dayData(env, S, date, c) {
   const groups = buildDay(date, rows, dropsMap, sscsMap, c.flag, countsMap, fixSet, cashiers, lotPhotos);
   // SSCS counts and register closes don't happen at the same minute, so tickets sold in between land on the next shift:
   // one shift shows over and the next shows the same amount short. When two shifts in a row cancel out (within $5), it's timing, not money.
-  for (let i = 0; i + 1 < groups.length; i++) {
-    const a = groups[i].lottery.checks.find(x => x.key === "scratch"), b = groups[i + 1].lottery.checks.find(x => x.key === "scratch");
-    if (!a || !b || a.ok || b.ok || a.diff === null || b.diff === null || Math.sign(a.diff) === Math.sign(b.diff)) continue;
-    if (Math.abs(a.diff + b.diff) > 5) continue;
-    [[a, groups[i]], [b, groups[i + 1]]].forEach(([x, g]) => { x.ok = true; x.timing = true; g.problems = Math.max(0, g.problems - 1); });
-    a.timingNote = b.timingNote = "Count timing: " + usd2(Math.abs(a.diff)) + " moved between Shift " + groups[i].shifts.join("+") + " and Shift " + groups[i + 1].shifts.join("+") + (Math.abs(a.diff + b.diff) >= 0.01 ? " (net " + usd2(a.diff + b.diff) + ")" : "");
-  }
+  for (let i = 0; i + 1 < groups.length; i++) pairScratch(groups[i], groups[i + 1]);
   try { await addHandoff(env, S, date, rows, groups); } catch (e) { console.error("handoff", e && e.message); }
   let rejects = [];
   try { const rj = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'rejects'").bind(S).first(); rejects = (rj ? JSON.parse(rj.data) : []).filter(x => x.date === date); } catch {}
@@ -758,7 +769,7 @@ async function storeChecks(env, S, c) {
   const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM staff WHERE store = ? AND active = 1").bind(S).first();
   if (!n || !n.n) return null;
   const tz = env.TIMEZONE || "America/New_York", now = Date.now(), t = localDate(now, tz), out = [];
-  for (const d of [addDays(t, -1), t]) out.push({ date: d, list: dayChecks(await dayData(env, S, d, c), now, tz) });
+  for (const d of [addDays(t, -1), t]) out.push({ date: d, list: dayChecks(await dayDataFull(env, S, d, c), now, tz) });
   return out;
 }
 async function ownerApi(req, env, path, url) {
@@ -804,7 +815,7 @@ async function ownerApi(req, env, path, url) {
   if (path === "/api/day" && req.method === "GET") {
     const date = url.searchParams.get("date");
     if (!validDate(date)) return json({ error: "date" }, 400);
-    return json(await dayData(env, S, date, c));
+    return json(await dayDataFull(env, S, date, c));
   }
   if (path === "/api/recent" && req.method === "GET") {
     const since = addDays(new Date().toISOString().slice(0, 10), -14);
