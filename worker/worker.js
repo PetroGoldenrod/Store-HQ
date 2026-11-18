@@ -362,7 +362,7 @@ function lotteryDelta(list, field) {
     const rs = by[d].slice().sort((a, b) => (stamp(a) < stamp(b) ? -1 : 1));
     const last = num(rs[rs.length - 1][field]) || 0;
     if (i === 0) {
-      if (rs.length < 2 && dates.length === 1) warns.push("Only one lottery report so far. The start and end of the shift are both needed.");
+      if (rs.length < 2 && dates.length === 1) { partial = true; warns.push("Only one lottery report so far. The start and end of the shift are both needed."); }
       else if (rs.length < 2) { partial = true; warns.push("The previous day's final lottery report is missing, so 10pm to midnight isn't counted."); }
       total += last - (num(rs[0][field]) || 0);
     } else total += last;
