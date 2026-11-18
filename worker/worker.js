@@ -455,7 +455,7 @@ function shiftForCount(ms, tz) {
 }
 function addDays(dateStr, n) { const d = new Date(dateStr + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
 function weekStartFor(dateStr, weekStart) { const d = new Date(dateStr + "T00:00:00Z"); const back = (d.getUTCDay() - weekStart + 7) % 7; return addDays(dateStr, -back); }
-function payroll(rows, staff, start, hours) {
+function payroll(rows, staff, start, hours, ownerAdj) {
   const end = addDays(start, 6), seen = new Set(), by = {}, fullKeys = new Set();
   // A person with their own shorter hours (e.g. the cook) can mark a day as a full shift when they cover.
   rows.forEach(r => { if (r.kind !== "shift") return; let d = {}; try { d = typeof r.data === "string" ? JSON.parse(r.data) : (r.data || {}); } catch {} if (d && d.full) covers(r.shift).forEach(k => fullKeys.add(r.staff_id + "|" + r.date + "|" + k)); });
@@ -478,6 +478,12 @@ function payroll(rows, staff, start, hours) {
       if (by[cv.otherId]) { by[cv.otherId].adj -= cv.minutes; by[cv.otherId].notes.push({ id: r.id, part: "cover", min: -cv.minutes, when, text: r.staff_name + " covered (" + why + ")" }); }
     }
     if (ex && ex.minutes > 0 && by[r.staff_id]) { by[r.staff_id].adj += ex.minutes; by[r.staff_id].notes.push({ id: r.id, part: "extra", min: ex.minutes, when, text: "Extra work: " + ex.note }); }
+    if (d.early && d.early.minutes > 0 && by[r.staff_id]) { by[r.staff_id].adj -= d.early.minutes; by[r.staff_id].notes.push({ id: r.id, part: "early", min: -d.early.minutes, when, text: "Left early" }); }
+  });
+  // Owner changes from the Payroll page (add or take off minutes for one day).
+  (ownerAdj || []).forEach(a => {
+    if (a.date < start || a.date > end || !by[a.staffId] || !a.minutes) return;
+    by[a.staffId].adj += a.minutes; by[a.staffId].notes.push({ id: a.id, part: "owner", min: a.minutes, when: a.date + " ", text: "Owner: " + (a.note || "hours changed") });
   });
   const list = Object.values(by).filter(e => e.shifts || e.active || e.adj).map(e => {
     const h = Math.round((e.base + e.adj / 60) * 100) / 100;
@@ -528,10 +534,16 @@ async function handleSubmit(req, env, token) {
       if (!note) return json({ ok: false, error: "Write what extra work you did." }, 400);
       extra = { minutes: mins, note };
     }
+    let early = null;
+    if (b.earlyMin !== undefined && b.earlyMin !== null && b.earlyMin !== "") {
+      const mins = Math.round(Number(b.earlyMin));
+      if (!(mins >= 1 && mins <= 600)) return json({ ok: false, error: "Enter how many minutes early you left." }, 400);
+      early = { minutes: mins };
+    }
     const old = (await env.DB.prepare("SELECT id FROM closes WHERE store = ? AND date = ? AND shift = ? AND staff_id = ? AND kind = 'shift'").bind(SS, b.date, b.shift, st.id).all()).results || [];
     const stmts = old.map(o => env.DB.prepare("DELETE FROM closes WHERE id = ?").bind(o.id));
     stmts.push(env.DB.prepare("INSERT INTO closes (id, created, date, shift, staff_id, staff_name, kind, stage, data, photos, store) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .bind(rid(14), Date.now(), b.date, b.shift, st.id, st.name, "shift", null, JSON.stringify({ cover, extra, full: st.hours > 0 && !!b.fullShift }), "[]", SS));
+      .bind(rid(14), Date.now(), b.date, b.shift, st.id, st.name, "shift", null, JSON.stringify({ cover, extra, early, full: st.hours > 0 && !!b.fullShift && !early }), "[]", SS));
     await env.DB.batch(stmts);
     return json({ ok: true });
   }
@@ -1153,9 +1165,28 @@ async function ownerApi(req, env, path, url) {
     const list = Object.values(P).map(e => ({ ...e, sales: r2(e.sales), os: r2(e.os), voidAmt: r2(e.voidAmt) })).sort((a, b) => a.name.localeCompare(b.name));
     return json({ start, end, flag: c.flag, rows: list });
   }
+  if (path === "/api/payadj" && req.method === "POST") {
+    // Owner adds or takes off minutes for one person on one day.
+    const b = await readBody(req, 1e4), mins = Math.round(Number(b.minutes));
+    if (!validDate(b.date) || !(Math.abs(mins) >= 1 && Math.abs(mins) <= 960)) return json({ error: "Choose the day and the minutes." }, 400);
+    const who = await env.DB.prepare("SELECT id FROM staff WHERE id = ? AND store = ?").bind(String(b.staffId || ""), S).first();
+    if (!who) return json({ error: "Choose the person." }, 400);
+    const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'payadj'").bind(S).first();
+    let list = []; try { list = k ? JSON.parse(k.data) : []; } catch {}
+    list.push({ id: "a" + rid(10), staffId: who.id, date: b.date, minutes: mins, note: String(b.note || "").trim().slice(0, 120), at: Date.now() });
+    list = list.filter(a => a.date >= addDays(b.date, -400));
+    await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'payadj', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(list), Date.now()).run();
+    return json({ ok: true });
+  }
   if (path === "/api/hours-remove" && req.method === "POST") {
     const b = await readBody(req, 1e4);
-    if (!/^[a-z0-9]+$/.test(String(b.id || "")) || !["cover", "extra"].includes(b.part)) return json({ error: "id" }, 400);
+    if (b.part === "owner") {
+      const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'payadj'").bind(S).first();
+      let list = []; try { list = k ? JSON.parse(k.data) : []; } catch {}
+      await env.DB.prepare("UPDATE store_kv SET data = ?, updated = ? WHERE store = ? AND k = 'payadj'").bind(JSON.stringify(list.filter(a => a.id !== String(b.id))), Date.now(), S).run();
+      return json({ ok: true });
+    }
+    if (!/^[a-z0-9]+$/.test(String(b.id || "")) || !["cover", "extra", "early"].includes(b.part)) return json({ error: "id" }, 400);
     const r = await env.DB.prepare("SELECT data FROM closes WHERE id = ? AND store = ? AND kind = 'shift'").bind(b.id, S).first();
     if (!r) return json({ error: "not found" }, 404);
     let d = {}; try { d = JSON.parse(r.data || "{}"); } catch {}
@@ -1168,7 +1199,8 @@ async function ownerApi(req, env, path, url) {
     const start = weekStartFor(ref, c.weekStart);
     const rows = (await env.DB.prepare("SELECT id, date, shift, staff_id, staff_name, kind, data FROM closes WHERE store = ? AND date BETWEEN ? AND ?").bind(S, start, addDays(start, 6)).all()).results || [];
     const staff = (await env.DB.prepare("SELECT id, name, active, rate, hours FROM staff WHERE store = ?").bind(S).all()).results || [];
-    return json({ ...payroll(rows, staff, start, c.hours), hoursPerShift: c.hours });
+    let adjs = []; try { const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'payadj'").bind(S).first(); adjs = k ? JSON.parse(k.data) : []; } catch {}
+    return json({ ...payroll(rows, staff, start, c.hours, adjs), hoursPerShift: c.hours, staffList: staff.filter(x => x.active).map(x => ({ id: x.id, name: x.name })) });
   }
   return json({ error: "not found" }, 404);
 }
@@ -1858,7 +1890,8 @@ ul.probs{margin:6px 0 0;padding-left:20px}
  <div class="card">
   <h2>My hours</h2>
   <div class="mute">Everyone taps <b>Send</b> at the end of their shift. That is how your shift gets counted for payroll.</div>
-  <div id="hrsBox" hidden><label for="hrsPick">Today I worked</label><select id="hrsPick"><option value="">My usual hours</option><option value="full">A full shift</option></select></div>
+  <div id="hrsBox"><label for="hrsPick">Today I worked</label><select id="hrsPick"><option value="">My usual hours</option><option value="full" hidden>A full shift</option><option value="early">I left early</option></select>
+   <div id="earlyBox" hidden><label for="earlyMin">How many minutes early did you leave?</label><input id="earlyMin" inputmode="numeric" placeholder="60"><div class="mute" style="font-size:.85rem;margin-top:4px">Example: you left 1 hour early, write 60.</div></div></div>
   <details class="more" id="covBox"><summary>I covered for another cashier</summary>
    <div class="mute" style="font-size:.85rem;margin-top:6px">They came in late or left early, and you worked their time.</div>
    <label for="covWho">Who did you cover for?</label><select id="covWho"><option value="">Choose…</option></select>
@@ -1896,7 +1929,7 @@ function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp
 fetch("/api/c/"+token+"/me").then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j}})}).then(function(x){
   if(!x.ok){$("hello").textContent="";$("off").hidden=false;return}
   $("hello").textContent="Hi "+x.j.name+". Send your reports here at the end of each shift.";$("app").hidden=false;
-  var co=x.j.coworkers||[],o='<option value="">Choose…</option>';co.forEach(function(c){o+='<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>'});$("covWho").innerHTML=o;$("covBox").hidden=!co.length;if(x.j.myHours){$("hrsBox").hidden=false;$("hrsPick").options[0].text="My usual hours ("+x.j.myHours+" h)";$("hrsPick").options[1].text="A full shift ("+x.j.normalHours+" h), I covered";}checkSent();
+  var co=x.j.coworkers||[],o='<option value="">Choose…</option>';co.forEach(function(c){o+='<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>'});$("covWho").innerHTML=o;$("covBox").hidden=!co.length;if(x.j.myHours){$("hrsPick").options[0].text="My usual hours ("+x.j.myHours+" h)";$("hrsPick").options[1].text="A full shift ("+x.j.normalHours+" h), I covered";$("hrsPick").options[1].hidden=false;}checkSent();
 }).catch(function(){$("hello").textContent="No connection. Check your internet and reload."});
 var TOUCHED=false,SENT_END=false,NOEND_OK=false,REJ={},FORCE=false;
 function setDefaults(){var d=new Date(),h=d.getHours(),s;
@@ -1943,17 +1976,19 @@ function clearShot(id){delete shots[id];var lab=$(id).parentNode;lab.classList.r
 function send(body){return fetch("/api/c/"+token+"/submit",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)})
   .then(function(r){return r.json().catch(function(){return {ok:false,error:"The app didn't answer. Try again."}})})
   .catch(function(){return {ok:false,error:"No connection. Check your internet and try again."}})}
+$("hrsPick").addEventListener("change",function(){$("earlyBox").hidden=this.value!=="early"});
 $("go").addEventListener("click",function(){
   refreshDefaults();
   var jobs=[],base={date:$("date").value,shift:$("shift").value};
   var cov=null,ext=null,cm=$("covMin").value.trim(),em=$("extMin").value.trim(),en=$("extNote").value.trim();
   if($("covWho").value||cm){var n=Math.round(Number(cm));if(!$("covWho").value){msg("err","Choose who you covered for.");return}if(!(n>=1&&n<=600)){msg("err","Enter how many minutes you covered.");return}cov={otherId:$("covWho").value,why:$("covWhy").value,minutes:n}}
   if(em||en){var n2=Math.round(Number(em));if(!(n2>=1&&n2<=600)){msg("err","Enter how many extra minutes you stayed.");return}if(!en){msg("err","Write what extra work you did.");return}ext={minutes:n2,note:en}}
+  var early=null;if($("hrsPick").value==="early"){early=Math.round(Number($("earlyMin").value.trim()));if(!(early>=1&&early<=600)){msg("err","Enter how many minutes early you left.");return}}
   var lotShift=$("lotShift").value,force=FORCE;FORCE=false;
   [["p_start","start","Lottery start of shift"],["p_prev","prev","Lottery previous day final"],["p_end","end","Lottery end of shift"]].forEach(function(x){
     if(shots[x[0]])jobs.push({name:x[2],ids:[x[0]],stage:x[1],body:Object.assign({kind:"lottery",stage:x[1],lotShift:lotShift,images:[shots[x[0]]],force:force&&(REJ[x[1]]||0)>=2},base)});});
   if(!shots.p_end&&!shots.p_start&&!shots.p_prev&&!SENT_END&&!NOEND_OK){NOEND_OK=true;msg("err","<b>No end-of-shift lottery photo.</b> Print the lottery report, take the photo above, then tap Send. (If the lottery machine is closed, tap Send again to send without it.)");return}
-  jobs.push({name:"Your shift",ids:[],hours:1,shift:1,body:Object.assign({kind:"shift",cover:cov,extra:ext,fullShift:$("hrsPick").value==="full"},base)});
+  jobs.push({name:"Your shift",ids:[],hours:1,shift:1,body:Object.assign({kind:"shift",cover:cov,extra:ext,fullShift:$("hrsPick").value==="full",earlyMin:early},base)});
   if(!jobs.length){msg("err","Take the lottery photos first.");return}
   if(!base.date){msg("err","Choose the date.");return}
   var btn=$("go");btn.disabled=true;msg("info",jobs.length>1?"Checking your photos… this takes about a minute. Keep this page open.":"Sending…");
@@ -1967,7 +2002,7 @@ $("go").addEventListener("click",function(){
           (canForce?'<br><button type="button" class="alt" id="forceGo" style="margin-top:10px">Still not working? Send it anyway for the owner to check</button>':'')+'</div>'}
       $("msg").innerHTML=h;if($("forceGo"))$("forceGo").addEventListener("click",function(){FORCE=true;$("go").click()});if(!bad.length)NOEND_OK=false;return}
     var j=jobs[i];send(j.body).then(function(r){
-      if(r.ok){done.push(j.name);if(r.review)review=true;if(j.stage)REJ[j.stage]=0;j.ids.forEach(clearShot);if(j.hours){["covWho","covMin","extMin","extNote"].forEach(function(i){$(i).value=""});$("covBox").open=false;$("extBox").open=false}}
+      if(r.ok){done.push(j.name);if(r.review)review=true;if(j.stage)REJ[j.stage]=0;j.ids.forEach(clearShot);if(j.hours){["covWho","covMin","extMin","extNote","earlyMin","hrsPick"].forEach(function(i){$(i).value=""});$("earlyBox").hidden=true;$("covBox").open=false;$("extBox").open=false}}
       else{if(j.stage){lotBad=true;REJ[j.stage]=(REJ[j.stage]||0)+1}
         if(r.problems)r.problems.forEach(function(p){bad.push(p)});else bad.push(j.name+": "+(r.error||"could not be sent"))}
       next(i+1);});
@@ -2197,6 +2232,15 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 <section id="v-pay" hidden>
  <div class="bar"><button class="alt sm" id="pprev">‹ Week</button><span id="pweek" class="num" style="flex:1;text-align:center;font-weight:700"></span><button class="alt sm" id="pnext">Week ›</button></div>
  <div id="pay"></div>
+ <details class="card" id="padjBox"><summary><b>Change someone’s hours</b></summary>
+  <div class="mute" style="margin:6px 0">For a day someone left early, came late or stayed longer and nobody reported it.</div>
+  <label for="paWho">Who</label><select id="paWho"></select>
+  <label for="paDay">Day</label><select id="paDay"></select>
+  <label for="paDir">Change</label><select id="paDir"><option value="-1">Take off time</option><option value="1">Add time</option></select>
+  <label for="paMin">How many minutes?</label><input id="paMin" inputmode="numeric" placeholder="60">
+  <label for="paNote">Note</label><input id="paNote" maxlength="120" placeholder="Example: left at 1 PM">
+  <button type="button" id="paSave" style="margin-top:10px">Save</button> <span id="paMsg" class="mute"></span>
+ </details>
  <div id="score"></div>
 </section>
 </div>
@@ -2634,8 +2678,13 @@ function loadPay(){api("/api/payroll?date="+payRef).then(function(j){
   $("pweek").textContent=fmtDay(j.start)+" – "+fmtDay(j.end);
   var h='<div class="card tw"><table><thead><tr><th>Cashier</th><th class="r">Shifts</th><th class="r">Hours</th><th class="r">Rate</th><th class="r">Pay</th></tr></thead><tbody>';
   j.rows.forEach(function(r){h+='<tr><td><b>'+esc(r.name)+'</b><span class="s">'+esc(r.days.join(", "))+'</span>'+payNotes(r)+'</td><td class="r num">'+r.shifts+'</td><td class="r num">'+fmtH(r.hours)+'</td><td class="r num">'+money(r.rate)+'</td><td class="r num">'+money(r.pay)+'</td></tr>'});
-  h+='<tr><td><b>Total</b></td><td></td><td></td><td></td><td class="r num"><b>'+money(j.total)+'</b></td></tr></tbody></table></div><div class="mute">Each shift sent counts '+j.hoursPerShift+' hours, or their own hours if set on the Staff tab. A double counts two shifts. Cover time moves minutes from the cashier who came in late or left early to the one who covered; extra work adds minutes. Tap remove on anything you don’t approve. Pay day is the Thursday after the week ends.</div>';
-  $("pay").innerHTML=h;loadScore()}).catch(function(){})}
+  h+='<tr><td><b>Total</b></td><td></td><td></td><td></td><td class="r num"><b>'+money(j.total)+'</b></td></tr></tbody></table></div><div class="mute">Each shift sent counts '+j.hoursPerShift+' hours, or their own hours if set on the Staff tab. A double counts two shifts. Cover time moves minutes from the cashier who came in late or left early to the one who covered; extra work adds minutes; leaving early takes minutes off. Tap remove on anything you don’t approve. Pay day is the Thursday after the week ends.</div>';
+  $("pay").innerHTML=h;
+  var wo=$("paWho").value,dv=$("paDay").value;$("paWho").innerHTML=(j.staffList||[]).map(function(x){return '<option value="'+esc(x.id)+'">'+esc(x.name)+'</option>'}).join("");if(wo)$("paWho").value=wo;
+  var dd="";for(var i=0;i<7;i++){var d=addDays(j.start,i);dd+='<option value="'+d+'">'+esc(fmtDay(d))+'</option>'}$("paDay").innerHTML=dd;if(dv&&dv>=j.start&&dv<=j.end)$("paDay").value=dv;
+  loadScore()}).catch(function(){})}
+$("paSave").addEventListener("click",function(){var m=Math.round(Number($("paMin").value));if(!(m>=1&&m<=960)){$("paMsg").textContent="Enter the minutes.";return}
+  $("paMsg").textContent="Saving…";api("/api/payadj",{method:"POST",body:{staffId:$("paWho").value,date:$("paDay").value,minutes:m*Number($("paDir").value),note:$("paNote").value}}).then(function(){$("paMin").value="";$("paNote").value="";$("paMsg").textContent="Saved.";loadPay()}).catch(function(e){$("paMsg").textContent=e.message||"Didn’t save, try again."})});
 function loadScore(){api("/api/scorecard?date="+payRef).then(function(j){
   var h='<div class="sec">Cashier scorecard</div>';
   if(!j.rows.length){$("score").innerHTML=h+'<div class="mute">No Verifone shifts or lottery photos for this week yet.</div>';return}
