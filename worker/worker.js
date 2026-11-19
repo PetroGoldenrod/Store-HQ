@@ -629,6 +629,7 @@ async function nameAliases(env) {
   try { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'aliases'").first(); return r ? JSON.parse(r.data) || {} : {}; } catch { return {}; }
 }
 function canonName(n, A) { const s = String(n || "").trim(); const k = s.split(/\s+/)[0].toLowerCase(); return (A && A[k]) || s; }
+function invStore(inv) { const n = String((inv && inv.retailer) || ""); return /goldenrod/i.test(n) ? "655675" : /trail|orange blossom/i.test(n) ? "654287" : null; }
 // Weekly lottery invoice vs. what the registers rang that week (Verifone), with the shifts that explain any difference.
 async function lotInvoiceCheck(env, S, inv, c) {
   const from = inv.weekFrom, to = inv.weekTo;
@@ -858,8 +859,11 @@ async function ownerApi(req, env, path, url) {
     return json({ ok: true, out });
   }
   if (path === "/api/lotinv" && req.method === "GET") {
-    const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'lotinv'").bind(S).first();
-    let list = []; try { list = k ? JSON.parse(k.data) : []; } catch {}
+    // Invoices are filed under the store named on the report, whichever store the app was showing when it was added.
+    const all = ((await env.DB.prepare("SELECT store, data FROM store_kv WHERE k = 'lotinv'").all()).results || []);
+    let list = [], seen = new Set();
+    all.forEach(r => { let l = []; try { l = JSON.parse(r.data); } catch {} l.forEach(x => { if ((invStore(x) || r.store) === S && !seen.has(x.weekFrom)) { seen.add(x.weekFrom); list.push(x); } }); });
+    list.sort((a, b2) => a.weekFrom.localeCompare(b2.weekFrom));
     const out = [];
     for (const inv of list.slice(-6).reverse()) out.push({ ...inv, check: await lotInvoiceCheck(env, S, inv, c) });
     return json({ invoices: out });
@@ -876,12 +880,13 @@ async function ownerApi(req, env, path, url) {
     const dueX = r2(num(X.booksSettledAmt) - num(X.salesComm) - num(X.pays) - num(X.cashingComm) + num(X.adjustments));
     const readOk = Math.abs(dueT - num(T.due)) < 0.02 && Math.abs(dueX - num(X.due)) < 0.02 && Math.abs(num(T.due) + num(X.due) - num(inv.totalDue)) < 0.02;
     const pid = rid(16); await env.DB.prepare("INSERT INTO photos (id, created, b64) VALUES (?, ?, ?)").bind(pid, Date.now(), b.image).run();
-    const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'lotinv'").bind(S).first();
+    const SS = invStore(inv) || S;
+    const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'lotinv'").bind(SS).first();
     let list = []; try { list = k ? JSON.parse(k.data) : []; } catch {}
     list = list.filter(x => x.weekFrom !== inv.weekFrom);
     list.push({ ...inv, readOk, photo: pid, at: Date.now() }); list.sort((a, b2) => a.weekFrom.localeCompare(b2.weekFrom)); list = list.slice(-30);
-    await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'lotinv', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(list), Date.now()).run();
-    return json({ ok: true, readOk });
+    await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'lotinv', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(SS, JSON.stringify(list), Date.now()).run();
+    return json({ ok: true, readOk, store: SS, otherStore: SS !== S });
   }
   if (path === "/api/day" && req.method === "GET") {
     const date = url.searchParams.get("date");
@@ -2410,7 +2415,7 @@ function loadInv(){api("/api/lotinv").then(function(j){var h="";(j.invoices||[])
   $("invlist").innerHTML=h||'<div class="mute" style="margin-top:8px">No invoices yet.</div>'}).catch(function(){})}
 $("invbox").addEventListener("toggle",function(){if(this.open)loadInv()});
 ["invfile","invcam"].forEach(function(id){$(id).addEventListener("change",function(){var inp=this,f=inp.files[0];if(!f)return;$("invmsg").textContent="Reading the report… (about 30 seconds)";
-  invShrink(f).then(function(b){return api("/api/lotinv",{method:"POST",body:{image:b}})}).then(function(){$("invmsg").textContent="Saved.";inp.value="";loadInv()}).catch(function(e){inp.value="";$("invmsg").textContent=e.message||"Didn’t save, try again."})})});
+  invShrink(f).then(function(b){return api("/api/lotinv",{method:"POST",body:{image:b}})}).then(function(r){$("invmsg").textContent=r.otherStore?"Saved under "+(r.store==="655675"?"Goldenrod":"Trail")+" (the store named on the report). Switch to that store to see it.":"Saved.";inp.value="";loadInv()}).catch(function(e){inp.value="";$("invmsg").textContent=e.message||"Didn’t save, try again."})})});
 function today(){var d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function addDays(s,n){var d=new Date(s+"T12:00:00");d.setDate(d.getDate()+n);return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function fmtDay(s){var d=new Date(s+"T12:00:00");return d.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}
