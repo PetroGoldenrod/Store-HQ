@@ -2319,7 +2319,10 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  </details>
  <details class="card" id="invbox"><summary style="cursor:pointer;font-weight:700">Weekly lottery invoice</summary>
   <div class="mute" style="margin-top:8px">Print the <b>Weekly Settlement Report</b> on the lottery machine and take a photo of it. The app checks it against what the registers rang that week.</div>
-  <label class="alt" style="display:inline-block;margin-top:10px;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Add the report photo<input type="file" id="invfile" accept="image/*" capture="environment" hidden></label>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+   <label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Take a photo<input type="file" id="invcam" accept="image/*" capture="environment" hidden></label>
+   <label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Upload a photo<input type="file" id="invfile" accept="image/*" hidden></label>
+  </div>
   <div id="invmsg" class="mute" style="margin-top:8px"></div><div id="invlist"></div>
  </details>
  <div id="day"><div class="mute">Loading…</div></div>
@@ -2406,8 +2409,8 @@ function loadInv(){api("/api/lotinv").then(function(j){var h="";(j.invoices||[])
   h+='<div class="mute" style="margin-top:6px">Scratch-offs: '+(v.scratch&&v.scratch.booksSettled||0)+' books settled ('+money(k.booksSettledAmt||0)+'). Scratch-offs sold that week: '+money(k.scratchSold||0)+'. Books settle when they sell out or time runs out, so these two only even out over several weeks.</div></div>'});
   $("invlist").innerHTML=h||'<div class="mute" style="margin-top:8px">No invoices yet.</div>'}).catch(function(){})}
 $("invbox").addEventListener("toggle",function(){if(this.open)loadInv()});
-$("invfile").addEventListener("change",function(){var f=this.files[0];if(!f)return;$("invmsg").textContent="Reading the report… (about 30 seconds)";
-  invShrink(f).then(function(b){return api("/api/lotinv",{method:"POST",body:{image:b}})}).then(function(){$("invmsg").textContent="Saved.";$("invfile").value="";loadInv()}).catch(function(e){$("invmsg").textContent=e.message||"Didn’t save, try again."})});
+["invfile","invcam"].forEach(function(id){$(id).addEventListener("change",function(){var inp=this,f=inp.files[0];if(!f)return;$("invmsg").textContent="Reading the report… (about 30 seconds)";
+  invShrink(f).then(function(b){return api("/api/lotinv",{method:"POST",body:{image:b}})}).then(function(){$("invmsg").textContent="Saved.";inp.value="";loadInv()}).catch(function(e){inp.value="";$("invmsg").textContent=e.message||"Didn’t save, try again."})})});
 function today(){var d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function addDays(s,n){var d=new Date(s+"T12:00:00");d.setDate(d.getDate()+n);return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function fmtDay(s){var d=new Date(s+"T12:00:00");return d.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}
