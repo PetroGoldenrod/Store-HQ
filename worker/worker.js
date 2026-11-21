@@ -2086,11 +2086,23 @@ function syncLot(){var sh=$("shift").value,cv=sh.match(/[123]/g)||[];
   var lotShift=cv.length>1?$("lotShift").value:cv[0];$("prevWrap").hidden=lotShift!=="1";}
 $("shift").addEventListener("change",checkSent);$("date").addEventListener("change",checkSent);$("shift").addEventListener("change",syncLot);$("lotShift").addEventListener("change",syncLot);syncLot();
 var shots={};
+// Some phones close the page in the background while the camera is open, and it reloads empty.
+// Each photo is saved on the phone the moment it's taken, so a reload brings the earlier photos back.
+var KEEP=null,KEEP_MS=10*3600e3;
+function kdb(){if(KEEP)return KEEP;KEEP=new Promise(function(res){try{var r=indexedDB.open("closeout-photos",1);r.onupgradeneeded=function(){r.result.createObjectStore("shots")};r.onsuccess=function(){res(r.result)};r.onerror=function(){res(null)}}catch(e){res(null)}});return KEEP}
+function keepPut(id,v){kdb().then(function(db){if(!db)return;try{db.transaction("shots","readwrite").objectStore("shots").put(v,token+"|"+id)}catch(e){}})}
+function keepDel(id){kdb().then(function(db){if(!db)return;try{db.transaction("shots","readwrite").objectStore("shots").delete(token+"|"+id)}catch(e){}})}
+function showShot(id,b64,w,txt){var lab=$(id).parentNode;lab.querySelector("img").src="data:image/jpeg;base64,"+b64;lab.classList.add("has");lab.classList.toggle("warnph",!!w);lab.querySelector("span").textContent=w||txt||"Ready. Tap to retake."}
+function restoreShots(){kdb().then(function(db){if(!db)return;var n=0,ids=["p_start","p_prev","p_end"],left=ids.length;
+  ids.forEach(function(id){try{var g=db.transaction("shots").objectStore("shots").get(token+"|"+id);
+    g.onsuccess=function(){var v=g.result;if(v&&v.b64&&Date.now()-v.at<KEEP_MS){if(!shots[id]){shots[id]=v.b64;showShot(id,v.b64,v.w,"Saved from earlier. Tap to retake.");n++}}else if(v)keepDel(id);if(!--left&&n)LOG("Page reloaded: brought back "+n+" photo"+(n>1?"s":"")+" taken earlier")};
+    g.onerror=function(){--left}}catch(e){--left}})})}
+restoreShots();
 ["p_start","p_prev","p_end"].forEach(function(id){
   $(id).addEventListener("change",function(){var f=this.files[0],lab=this.parentNode;if(!f)return;
-    shrink(f).then(function(s){shots[id]=s.b64;lab.querySelector("img").src=s.preview;lab.classList.add("has");
+    shrink(f).then(function(s){shots[id]=s.b64;
       var q=s.q,w=q&&q.light<70?"Looks too dark. Turn on more light and retake.":q&&q.sharp<150?"Looks blurry. Hold the phone still and retake.":"";
-      lab.classList.toggle("warnph",!!w);lab.querySelector("span").textContent=w||"Ready. Tap to retake."})
+      showShot(id,s.b64,w);keepPut(id,{b64:s.b64,w:w,at:Date.now()})})
     .catch(function(e){LOG("Photo couldn't be opened on the phone ("+id+")");msg("err","That photo couldn't be opened. Take it again.")});});
 });
 // Quick check on the phone before sending: very blurry or very dark photos.
@@ -2102,7 +2114,7 @@ function shrink(file){return new Promise(function(res,rej){var img=new Image(),u
   img.onload=function(){var s=Math.min(1,2000/Math.max(img.width,img.height)),c=document.createElement("canvas");c.width=Math.round(img.width*s);c.height=Math.round(img.height*s);
     c.getContext("2d").drawImage(img,0,0,c.width,c.height);URL.revokeObjectURL(u);var d=c.toDataURL("image/jpeg",0.85);res({b64:d.split(",")[1],preview:d,q:quality(c)})};
   img.onerror=function(){rej()};img.src=u;})}
-function clearShot(id){delete shots[id];var lab=$(id).parentNode;lab.classList.remove("has","warnph");lab.querySelector("img").src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";$(id).value="";
+function clearShot(id){delete shots[id];keepDel(id);var lab=$(id).parentNode;lab.classList.remove("has","warnph");lab.querySelector("img").src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";$(id).value="";
   lab.querySelector("span").textContent=id==="p_cash"||id==="p_track"?"Tap to take photo":"Sent. Tap to add another if needed."}
 function LOG(msg,extra){try{var b=JSON.stringify(Object.assign({msg:String(msg).slice(0,300),date:$("date").value,shift:$("shift").value},extra||{}));if(!(navigator.sendBeacon&&navigator.sendBeacon("/api/c/"+token+"/log",new Blob([b],{type:"text/plain"}))))fetch("/api/c/"+token+"/log",{method:"POST",body:b,keepalive:true}).catch(function(){})}catch(e){}}
 window.addEventListener("error",function(e){LOG("Page error: "+(e.message||"unknown"))});
