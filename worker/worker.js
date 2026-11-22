@@ -1476,7 +1476,7 @@ function mailHeader(s) { s = String(s).replace(/[\r\n]+/g, " "); return /^[\x20-
 // Each alert is sent once when the tank crosses into it; a delivery that fills the tank back up resets it.
 const TANK_LOW = 0.25, TANK_VERY_LOW = 0.15, TANK_WATER = 1;
 // Owner's alert points in gallons, by tank name (both stores). Tanks not listed here use the 25% / 15% rule.
-const TANK_ALERT_GAL = { Regular: 1500, Diesel: 1200, Premium: 1200 };
+const TANK_ALERT_GAL = { Regular: 1500, Plus: 1200, Diesel: 1200, Premium: 1200 };
 function tankLevel(name, g, cap) { const lim = TANK_ALERT_GAL[name]; if (lim) return g < lim ? 1 : 0; const pct = cap ? g / cap : 1; return pct < TANK_VERY_LOW ? 2 : pct < TANK_LOW ? 1 : 0; }
 async function tankAlerts(env, S, tanks) {
   const cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tankalert'").bind(S).first();
