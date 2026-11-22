@@ -963,15 +963,16 @@ async function ownerApi(req, env, path, url) {
     await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'pc', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(d), d.at).run();
     return json({ ok: true });
   }
-  if (path.startsWith("/api/push/") && req.headers.get("x-partner")) return json({ error: "Phone alerts are for the owner login." }, 403);
-  if (path === "/api/push/key" && req.method === "GET") return json({ key: (await vapidKeys(env)).pub, phones: (await pushSubs(env)).length });
+  // Phone alerts: the owner's phones get every store's alerts; a manager's phone only gets its own store's.
+  if (path === "/api/push/key" && req.method === "GET") return json({ key: (await vapidKeys(env)).pub });
   if (path === "/api/push/sub" && req.method === "POST") {
     const b = await readBody(req, 4000), sub = b.sub || {}, ep = String(sub.endpoint || "");
     if (!/^https:\/\//.test(ep)) return json({ error: "bad subscription" }, 400);
-    const list = (await pushSubs(env)).filter(x => x.endpoint !== ep); list.push({ endpoint: ep, at: Date.now(), ua: String(req.headers.get("user-agent") || "").slice(0, 120) });
+    const pStore = req.headers.get("x-partner") || "";
+    const list = (await pushSubs(env)).filter(x => x.endpoint !== ep); list.push({ endpoint: ep, store: pStore, role: MGR ? "manager" : pStore ? "partner" : "owner", at: Date.now(), ua: String(req.headers.get("user-agent") || "").slice(0, 120) });
     await savePushSubs(env, list);
-    const n = await pushAlert(env, "Store HQ alerts are on", "This phone will get a notification when a gas tank runs low or shows water.", "/#sales");
-    return json({ ok: true, phones: list.length, sent: n });
+    const n = await pushAlert(env, "Store HQ alerts are on", "This phone will get a notification when a gas tank" + (pStore ? " at this store" : "") + " runs low or shows water.", "/#fuel", pStore, ep);
+    return json({ ok: true, sent: n });
   }
   if (path === "/api/cigs" && req.method === "GET") {
     // Cig price check: the store's list of cig groups (cost, buydown, sources) with the registers' current shelf prices.
@@ -1485,7 +1486,7 @@ async function tankAlerts(env, S, tanks) {
   try { const r = await env.DB.prepare("SELECT data FROM inv_store WHERE store = ?").bind(S).first(); if (r) store = JSON.parse(r.data).name || store; } catch {}
   const when = new Date().toLocaleString("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "2-digit" });
   const text = store + " tank reading, " + when + ":\n\n" + lines.join("\n") + "\n\nAll tanks now:\n" + tanks.map(t => { const num = (/#(\d+)$/.exec(t[0] || "") || [])[1] || t[0], g = Number(t[1]) || 0, cap = g + (Number(t[2]) || 0); return "  " + (TN[num] || t[0]) + ": " + Math.round(g).toLocaleString("en-US") + " gal (" + (cap ? Math.round(g / cap * 100) : 0) + "%)"; }).join("\n") + "\n\nStore HQ reads the tanks every 6 hours (Sales page, Tanks now).";
-  try { await pushAlert(env, (lines.some(l => /% full/.test(l)) ? "Gas low at " : "Tank alert at ") + store, lines.join("\n"), "/#sales"); } catch (e) { console.error("tank push", e && e.message); }
+  try { await pushAlert(env, (lines.some(l => /% full/.test(l)) ? "Gas low at " : "Tank alert at ") + store, lines.join("\n"), "/#fuel", S); } catch (e) { console.error("tank push", e && e.message); }
   await smtpSend(env, { to: String(env.DAILY_MAIL_TO || MAIL_USER(env)).trim(), fromName: "Store HQ", subject: (lines.some(l => /% full/.test(l)) ? "Gas low at " : "Tank alert at ") + store + ": " + lines.map(l => l.split(":")[0]).filter((v, i, a) => a.indexOf(v) === i).join(", "), text });
 }
 // ---- Cig price check. One document per store in store_kv (k = 'cigs'):
@@ -1603,14 +1604,14 @@ async function vapidKeys(env) {
   return JSON.parse((await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'vapid'").first()).data);
 }
 async function pushSubs(env) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pushsubs'").first(); try { return r ? JSON.parse(r.data) : []; } catch { return []; } }
-async function savePushSubs(env, list) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES ('*', 'pushsubs', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(JSON.stringify(list.slice(-10)), Date.now()).run(); }
-async function pushAlert(env, title, body, url) {
+async function savePushSubs(env, list) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES ('*', 'pushsubs', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(JSON.stringify(list.slice(-30)), Date.now()).run(); }
+async function pushAlert(env, title, body, url, store, onlyEp) {
   // Keep the last 20 messages for phones to fetch, then wake every registered phone.
   const cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pushmsg'").first();
   let msgs = []; try { msgs = cur ? JSON.parse(cur.data) : []; } catch {}
-  msgs.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), at: Date.now(), title: String(title).slice(0, 120), body: String(body).slice(0, 500), url: url || "/" });
-  await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES ('*', 'pushmsg', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(JSON.stringify(msgs.slice(-20)), Date.now()).run();
-  const subs = await pushSubs(env); if (!subs.length) return 0;
+  msgs.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), at: Date.now(), store: store || "", to: onlyEp || "", title: String(title).slice(0, 120), body: String(body).slice(0, 500), url: url || "/" });
+  await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES ('*', 'pushmsg', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(JSON.stringify(msgs.slice(-40)), Date.now()).run();
+  const all = await pushSubs(env), subs = all.filter(x => (onlyEp ? x.endpoint === onlyEp : !x.store || !store || x.store === store)); if (!subs.length) return 0;
   const k = await vapidKeys(env), key = await crypto.subtle.importKey("jwk", k.priv, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
   const enc = o => b64u(new TextEncoder().encode(JSON.stringify(o)));
   let sent = 0; const keep = [];
@@ -1624,7 +1625,7 @@ async function pushAlert(env, title, body, url) {
     } catch (e) { console.error("push", e && e.message); }
     keep.push(sub);
   }
-  if (keep.length !== subs.length) await savePushSubs(env, keep);
+  if (keep.length !== subs.length) { const gone = new Set(subs.filter(x => !keep.includes(x)).map(x => x.endpoint)); await savePushSubs(env, all.filter(x => !gone.has(x.endpoint))); }
   return sent;
 }
 const SW_JS = `self.addEventListener("install",function(){self.skipWaiting()});
@@ -2153,10 +2154,11 @@ export default {
       if (path === "/api/push/latest" && req.method === "POST") {
         // A phone woken by a push asks for the newest alerts. Only registered phones (by their subscription address) get them.
         const b = await readBody(req, 4000), ep = String(b.endpoint || "");
-        if (!ep || !(await pushSubs(env)).some(x => x.endpoint === ep)) return json({ msgs: [] }, 403);
+        const me = (await pushSubs(env)).find(x => x.endpoint === ep);
+        if (!ep || !me) return json({ msgs: [] }, 403);
         const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pushmsg'").first();
         let msgs = []; try { msgs = r ? JSON.parse(r.data) : []; } catch {}
-        return json({ msgs: msgs.filter(x => Date.now() - x.at < 2 * 86400e3).slice(-3) });
+        return json({ msgs: msgs.filter(x => Date.now() - x.at < 2 * 86400e3 && (x.to ? x.to === ep : !me.store || !x.store || x.store === me.store)).slice(-3) });
       }
       if (path === "/desk" && req.method === "GET") return html(DESK_HTML);
       if (path === "/apple-touch-icon.png" || path === "/apple-touch-icon-precomposed.png" || path === "/icon.png") return new Response(b64ToBytes(ICON_B64), { headers: { "content-type": "image/png", "cache-control": "no-cache" } });
@@ -2771,7 +2773,7 @@ $("subnav").addEventListener("click",function(e){var b=e.target.closest("button"
 $("signout").addEventListener("click",function(){fetch("/api/logout",{method:"POST"}).then(function(){show(false)})});
 var PARTNER=false,MANAGER=false;
 function applyRole(){var pc=$("chkCard");if(pc)pc.hidden=MANAGER;["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl)$/.test(CUR)||(CUR==="store"&&SUB.store==="cigs")))openView("home");else if(CUR==="store")openView("store")}
-function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
+function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(location.hash==="#fuel"){try{history.replaceState(null,"",location.pathname)}catch(e){}openView("store","fuel")}if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
   $("store").innerHTML=L.map(function(s){return '<option value="'+esc(s.store)+'"'+(s.store===STORE?" selected":"")+'>'+esc(s.name)+'</option>'}).join("");$("store").hidden=L.length<2}).catch(function(){})}
 $("store").addEventListener("change",function(){STORE=this.value;try{localStorage.setItem("store",STORE)}catch(e){}
   loadView()});
@@ -3195,7 +3197,7 @@ function renderTanks(L){var el=$("tanksNow");if(!el)return;L=L||[];if(!L.length)
       h+='<tr><td>'+esc(t[0])+'</td><td class="r num">'+Math.round(g).toLocaleString()+'</td><td class="r num">'+pct+'%'+((t[6]!==undefined?t[6]:pct<25)?' <span class="pill bad">Low</span>':'')+(t[7]?'<div class="mute" style="font-size:.8em">alert under '+(+t[7]).toLocaleString()+' gal</div>':'')+'</td><td class="r num">'+Math.round(room).toLocaleString()+'</td><td class="r num">'+w+(w>=1?' <span class="pill bad">Check</span>':'')+'</td>'+(prev?'<td class="r num">'+(p===null?'':(p>0?'+':'')+Math.round(p).toLocaleString()+(p>500?' <span class="pill">Delivery?</span>':''))+'</td>':'')+'</tr>'});
     h+='</tbody></table></div>'}
   if(!newest.ok)h+='<div class="msg err" style="margin-top:8px">The last reading at '+esc(when(newest.at))+' didn’t work: '+esc(newest.err||"no tanks in the answer")+'</div>';
-  if(!MANAGER)h+='<div style="margin-top:10px"><button type="button" class="alt" id="pushOn">Get phone alerts when a tank runs low</button> <span class="mute" id="pushMsg"></span></div>';
+  h+='<div style="margin-top:10px"><button type="button" class="alt" id="pushOn">Get phone alerts when a tank runs low</button> <span class="mute" id="pushMsg"></span></div>';
   el.innerHTML=h+'</div>';$("pushOn").addEventListener("click",pushOn);
   try{if(window.Notification&&Notification.permission==="granted"&&navigator.serviceWorker)navigator.serviceWorker.getRegistration("/").then(function(r){return r&&r.pushManager.getSubscription()}).then(function(s){if(s){$("pushOn").textContent="Phone alerts are on (tap to re-check)";}}).catch(function(){})}catch(e){}}
 function pushOn(){var m=$("pushMsg");
