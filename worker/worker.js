@@ -157,7 +157,7 @@ async function managerCookie(env, store) {
   return "manager=" + store + "." + exp + "." + (await hmac(env["MANAGER_PASSWORD_" + store], "manager|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
 }
 // Pages a manager may not open.
-const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
+const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
 async function partnerCookie(env, store) {
   const exp = Date.now() + 30 * 86400000;
   return "partner=" + store + "." + exp + "." + (await hmac(env["PARTNER_PASSWORD_" + store], "partner|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
@@ -1020,6 +1020,33 @@ async function ownerApi(req, env, path, url) {
     await saveCigDoc(env, S, doc);
     return json({ ok: true });
   }
+  if (path === "/api/registers/send" && req.method === "POST") {
+    // Owner taps "Send to registers": the store PC (regsend.ps1, every 5 minutes) picks this up and runs VS-Poll /SENDITEMS.
+    if (req.headers.get("x-partner")) return json({ error: "Only the owner login can send to the registers." }, 403);
+    const cur = await regSendDoc(env, S);
+    if (cur.status === "waiting" || cur.status === "running") return json({ error: "A send is already on its way." }, 409);
+    const doc = { ...cur, id: Date.now().toString(36), status: "waiting", requested: Date.now(), finished: null, log: "" };
+    await saveRegSend(env, S, doc);
+    return json({ ok: true, doc });
+  }
+  if (path === "/api/registers/status" && req.method === "GET") return json({ doc: await regSendDoc(env, S) });
+  if (path === "/api/pc-regsend" && req.method === "GET") {
+    // Store PC checks in. A request older than 30 minutes that nobody picked up is dropped, so an old tap never fires late.
+    const doc = await regSendDoc(env, S), now = Date.now();
+    doc.pcSeen = now; doc.pcVer = Number(url.searchParams.get("v")) || 0;
+    let send = null;
+    if (doc.status === "waiting") {
+      if (now - doc.requested > 30 * 60e3) { doc.status = "expired"; doc.finished = now; doc.log = "The store PC didn't pick it up within 30 minutes."; }
+      else { doc.status = "running"; doc.started = now; send = doc.id; }
+    }
+    await saveRegSend(env, S, doc);
+    return json({ send });
+  }
+  if (path === "/api/pc-regsend" && req.method === "POST") {
+    const b = await readBody(req, 2e4), doc = await regSendDoc(env, S);
+    if (b.id && b.id === doc.id) { doc.status = b.ok ? "done" : "failed"; doc.finished = Date.now(); doc.log = String(b.log || "").slice(0, 2000); await saveRegSend(env, S, doc); }
+    return json({ ok: true });
+  }
   if (path === "/api/reg-plu" && req.method === "POST") {
     // Nightly from the store PC: every item as the registers have it (gzipped tab text: key, name, dept, price). Kept as [[key, name, dept, price]].
     const b = await readBody(req, 6e6);
@@ -1481,6 +1508,13 @@ async function tankAlerts(env, S, tanks) {
 async function cigDoc(env, S) {
   const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'cigs'").bind(S).first();
   try { return r ? JSON.parse(r.data) : { groups: [] }; } catch { return { groups: [] }; }
+}
+async function regSendDoc(env, S) {
+  const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'regsend'").bind(S).first();
+  try { return r ? JSON.parse(r.data) : {}; } catch { return {}; }
+}
+async function saveRegSend(env, S, doc) {
+  await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'regsend', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(doc), Date.now()).run();
 }
 async function saveCigDoc(env, S, doc) {
   await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'cigs', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(doc), Date.now()).run();
@@ -2119,7 +2153,7 @@ export default {
       if (pStore) { owner = true; req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.set("x-store", pStore); h.set("x-partner", pStore); if (mgr) h.set("x-role", "manager"); else h.delete("x-role"); return h; })() }); url.searchParams.set("store", pStore); }
       else if (req.headers.get("x-role")) { req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.delete("x-role"); return h; })() }); }
       // Nightly pulls: may call ONLY /api/sscs-import and /api/voids-import, with the secret in the x-import-token header.
-      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/reg-plu" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
+      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/reg-plu" || path === "/api/pc-regsend" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
         safeEqual(await hmac("cmp", req.headers.get("x-import-token")), await hmac("cmp", env.SSCS_TOKEN));
       m = /^\/photo\/([a-z0-9]+)$/.exec(path);
       if (m) {
@@ -2580,6 +2614,8 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  <div class="ds cg">
   <div class="card"><h2>Cig prices</h2><p class="sub" id="cgsub">Loading…</p><div id="cgsum" class="cgsum"></div></div>
   <div id="cgappr"></div>
+  <div class="card"><h2>Send to registers</h2><p class="sub" style="margin:0 0 10px">Sends everything waiting in Sunray to the registers now (VS-Poll), instead of waiting for tonight's automatic send. Enter the prices in Sunray first.</p>
+   <div class="cgbtns" style="margin-top:0"><button type="button" id="rsBtn">Send to registers</button></div><p class="mute" id="rsMsg" style="font-size:.9rem;margin:8px 0 0"></p></div>
   <div class="card"><div class="tw"><table><thead><tr><th>Item</th><th class="r">Shelf</th><th class="r">Profit</th><th>Status</th><th class="r">Suggested</th><th class="r">Carton</th><th>OK?</th></tr></thead><tbody id="cgbody"></tbody></table></div>
   <p class="mute" style="margin:10px 0 0;font-size:.85rem">Tap a row for its cost, buydown and where each number came from. Profit is shelf price minus cost after buydown. Carton = 10 packs − $2.50.</p></div>
  </div>
@@ -2671,7 +2707,17 @@ function cgRow(g){var cfg=(CG.d.doc.cfg)||{},T=cfg.target||1.25,LO=cfg.low||1.15
   if(sug!=null)sug=Math.round(sug*100)/100;
   var ap=g.approved,ringing=ap&&shelf!=null&&Math.abs(shelf-ap.price)<0.005&&!!sh;
   return {g:g,shelf:shelf,fromReg:!!sh,mixed:sh&&sh.min!==sh.max?sh:null,net:net,profit:profit,st:st,sug:sug,ap:ap,ringing:ringing}}
-function loadCG(){$("cgsub").textContent="Loading…";api("/api/cigs").then(function(j){CG.d=j;renderCG()}).catch(function(x){if(x.message!=="signin")$("cgsub").textContent="Couldn't load: "+x.message})}
+var RS={arm:false,t:null};
+function rsLoad(){api("/api/registers/status").then(function(j){var d=j.doc||{},m=$("rsMsg"),b=$("rsBtn"),ago=function(t){var s=Math.round((Date.now()-t)/60000);return s<1?"just now":s<60?s+" min ago":Math.round(s/60)+" h ago"},tm=function(t){return new Date(t).toLocaleString("en-US",{weekday:"short",hour:"numeric",minute:"2-digit"})};
+  var pc=d.pcSeen?"Store PC last checked in "+ago(d.pcSeen)+".":"The store PC isn't set up for this yet (run 'Setup send to registers' on it once).",st="";
+  if(d.status==="waiting")st="Waiting for the store PC to pick it up (it checks every 5 minutes).";else if(d.status==="running")st="Sending now…";
+  else if(d.status==="done")st="Sent "+tm(d.finished)+". The Cigs list shows Ringing after tonight's register list arrives.";else if(d.status==="failed")st="Last send failed "+tm(d.finished)+": "+(d.log||"no details");else if(d.status==="expired")st=d.log;
+  m.textContent=(st?st+" ":"")+pc;b.disabled=d.status==="waiting"||d.status==="running";
+  clearTimeout(RS.t);if(d.status==="waiting"||d.status==="running")RS.t=setTimeout(function(){if(!$("v-cigs").hidden)rsLoad()},20000)}).catch(function(){})}
+document.addEventListener("click",function(e){var b=e.target.closest&&e.target.closest("#rsBtn");if(!b)return;
+  if(!RS.arm){RS.arm=true;b.textContent="Tap again: send everything waiting in Sunray";setTimeout(function(){RS.arm=false;b.textContent="Send to registers"},6000);return}
+  RS.arm=false;b.disabled=true;b.textContent="Send to registers";api("/api/registers/send",{method:"POST",body:{}}).then(rsLoad).catch(function(x){b.disabled=false;$("rsMsg").textContent="Couldn't send: "+x.message})});
+function loadCG(){$("cgsub").textContent="Loading…";rsLoad();api("/api/cigs").then(function(j){CG.d=j;renderCG()}).catch(function(x){if(x.message!=="signin")$("cgsub").textContent="Couldn't load: "+x.message})}
 function renderCG(){var d=CG.d,doc=d.doc||{},G=doc.groups||[];
   if(!G.length){$("cgsub").textContent="No cig list for this store yet.";$("cgsum").innerHTML="";$("cgbody").innerHTML="";$("cgappr").innerHTML="";return}
   var P=doc.periods||{},dt=function(t){return t?new Date(t).toLocaleDateString("en-US",{month:"short",day:"numeric"}):""};
