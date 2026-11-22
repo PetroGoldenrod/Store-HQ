@@ -1556,7 +1556,7 @@ async function homeAttention(env, S, MGR, st) {
       let raise = 0, bd = 0, waiting = 0;
       for (const g of doc.groups) {
         if (g.disc) continue;
-        const sh = shelf[g.id], p = sh ? sh.p : g.price, net = g.cost != null ? g.cost - (g.bd || 0) : null;
+        const sh = shelf[g.id], p = sh ? sh.p : g.price, pr = g.promo && g.promo.qty > 0 ? (Number(g.promo.off) || 0) / g.promo.qty : 0, net = g.cost != null ? g.cost - (g.bd || 0) + pr : null;
         if (g.approved) { if (sh && Math.abs(sh.p - g.approved.price) >= 0.005 && now - g.approved.at > 30 * 36e5) waiting++; continue; }
         if (p == null || net == null) continue;
         if (g.max && p > g.max) bd++; else if (p - net < LO) raise++;
@@ -2788,7 +2788,7 @@ var CG={d:null,open:""};
 function cgP9(x){var c=Math.round(x*100),b=c-(c%10)+9,o=[b-10,b,b+10];o.sort(function(a,b2){return Math.abs(a-c)-Math.abs(b2-c)});return o[0]/100}
 function cgMoney(v){return v==null||isNaN(v)?"":"$"+(+v).toFixed(2)}
 function cgRow(g){var cfg=(CG.d.doc.cfg)||{},T=cfg.target||1.25,LO=cfg.low||1.15,HI=cfg.high||1.40,sh=CG.d.shelf[g.id],shelf=sh?sh.p:g.price,
-  net=g.cost!=null?g.cost-(g.bd||0):null,profit=shelf!=null&&net!=null?shelf-net:null,st="OK",sug=null;
+  pr=g.promo&&g.promo.qty>0?(+g.promo.off||0)/g.promo.qty:0,net=g.cost!=null?g.cost-(g.bd||0)+pr:null,profit=shelf!=null&&net!=null?shelf-net:null,st="OK",sug=null;
   if(g.disc)st="Discount";else if(profit==null)st="Missing";
   else if(g.max&&shelf>g.max){st="Lower to keep buydown";sug=Math.floor(g.max*10)/10-0.01;if(sug+0.1<=g.max)sug=Math.round((sug+0.1)*100)/100}
   else if(profit<LO){st="Raise";sug=cgP9(net+T)}else if(profit>HI){st="Could lower";sug=cgP9(net+T)}
