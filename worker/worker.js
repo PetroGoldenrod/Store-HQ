@@ -976,20 +976,7 @@ async function ownerApi(req, env, path, url) {
   if (path === "/api/cigs" && req.method === "GET") {
     // Cig price check: the store's list of cig groups (cost, buydown, sources) with the registers' current shelf prices.
     const doc = await cigDoc(env, S);
-    const shelf = {}; let regAt = null;
-    try {
-      const rb = await env.DB.prepare("SELECT text, updated FROM inv_blob WHERE key = ?").bind("reg:" + S).first();
-      if (rb) {
-        regAt = rb.updated; const m = new Map(); for (const it of JSON.parse(rb.text).items || []) m.set(it[0], it[3]);
-        for (const g of doc.groups || []) {
-          const ps = (g.upcs || []).map(u => m.get(u)).filter(v => v > 0);
-          if (!ps.length) continue;
-          const c = {}; ps.forEach(v => c[v] = (c[v] || 0) + 1);
-          const mode = +Object.keys(c).sort((a, b) => c[b] - c[a] || a - b)[0];
-          shelf[g.id] = { p: mode, min: Math.min(...ps), max: Math.max(...ps), n: ps.length };
-        }
-      }
-    } catch {}
+    const { shelf, regAt } = await cigShelf(env, S, doc);
     return json({ doc, shelf, regAt });
   }
   if (path === "/api/cigs/approve" && req.method === "POST") {
@@ -1185,7 +1172,9 @@ async function ownerApi(req, env, path, url) {
       const last = days.length ? days[days.length - 1].date : null;
       const cl = last ? await env.DB.prepare("SELECT COUNT(*) AS n FROM closes WHERE store = ? AND date = ?").bind(store, last).first() : null;
       let checks = null; try { checks = await storeChecks(env, store, c); } catch (e) { console.error("checks", e && e.message); }
-      out.push({ store, checks, name: info.name, invLink: info.mt && !MGR ? "/i/" + info.mt : "", lastUpload: up && up.r ? up.r : 0, days: MGR ? days.map(d => ({ date: d.date })) : days, invoices: { n: inv ? inv.n : 0, total: inv && inv.t ? inv.t : 0, waiting: pend ? pend.n : 0, err: pend && pend.e ? pend.e : "" }, closesLast: cl ? cl.n : 0, pc });
+      const row = { store, checks, name: info.name, invLink: info.mt && !MGR ? "/i/" + info.mt : "", lastUpload: up && up.r ? up.r : 0, days: MGR ? days.map(d => ({ date: d.date })) : days, invoices: { n: inv ? inv.n : 0, total: inv && inv.t ? inv.t : 0, waiting: pend ? pend.n : 0, err: pend && pend.e ? pend.e : "" }, closesLast: cl ? cl.n : 0, pc };
+      try { row.attn = await homeAttention(env, store, MGR, row); } catch (e) { console.error("attn", e && e.message); row.attn = []; }
+      out.push(row);
     }
     return json({ stores: out, month: cm.slice(0, 7), mailOn: !!env.GMAIL_APP_PASSWORD });
   }
@@ -1513,6 +1502,83 @@ async function tanksFor(env, S) {
   const TN = TANK_NAMES[S] || {};
   tanks.forEach(r => (r.tanks || []).forEach(t => { const n = (/#(\d+)$/.exec(t[0] || "") || [])[1]; if (n && TN[n]) t[0] = TN[n]; const g = Number(t[1]) || 0; t[6] = tankLevel(t[0], g, g + (Number(t[2]) || 0)) > 0; t[7] = TANK_ALERT_GAL[t[0]] || 0; }));
   return tanks;
+}
+// Shelf price per cig group from the registers' nightly item list (the most common price across its UPCs).
+async function cigShelf(env, S, doc) {
+  const shelf = {}; let regAt = null;
+  try {
+    const rb = await env.DB.prepare("SELECT text, updated FROM inv_blob WHERE key = ?").bind("reg:" + S).first();
+    if (rb) {
+      regAt = rb.updated; const m = new Map(); for (const it of JSON.parse(rb.text).items || []) m.set(it[0], it[3]);
+      for (const g of doc.groups || []) {
+        const ps = (g.upcs || []).map(u => m.get(u)).filter(v => v > 0);
+        if (!ps.length) continue;
+        const c = {}; ps.forEach(v => c[v] = (c[v] || 0) + 1);
+        const mode = +Object.keys(c).sort((a, b) => c[b] - c[a] || a - b)[0];
+        shelf[g.id] = { p: mode, min: Math.min(...ps), max: Math.max(...ps), n: ps.length };
+      }
+    }
+  } catch {}
+  return { shelf, regAt };
+}
+// The Today page's "Needs attention" list for one store: [{lvl:"bad"|"warn", t:title, d:detail, tab, sub, date}]. Same rules as the pages they link to.
+async function homeAttention(env, S, MGR, st) {
+  const A = [], now = Date.now(), when = t => new Date(t).toLocaleString("en-US", { timeZone: env.TIMEZONE || "America/New_York", weekday: "short", hour: "numeric", minute: "2-digit" });
+  // Store PC and nightly upload
+  const upH = st.lastUpload ? (now - st.lastUpload) / 36e5 : 1e9;
+  if (upH > 30) A.push({ lvl: "bad", t: st.lastUpload ? "No sales upload since " + when(st.lastUpload) : "Store PC isn't sending sales yet", d: "Check that the store PC is on and signed in.", tab: MGR ? "home" : "sales" });
+  if (st.pc && !MGR) {
+    const pH = (now - st.pc.at) / 36e5;
+    if (pH > 30 && upH <= 30) A.push({ lvl: "warn", t: "Store PC hasn't reported since " + when(st.pc.at), d: "Sales still arrived, but the PC's own check-in didn't.", tab: "sales" });
+    else if (pH <= 30 && (!st.pc.ok || (st.pc.errors || []).length)) A.push({ lvl: "warn", t: "Store PC reported a problem", d: String((st.pc.errors || [])[0] || "Its last nightly run didn't finish cleanly.").slice(0, 160), tab: "sales" });
+  }
+  // Shifts
+  for (const d of st.checks || []) for (const x of d.list || []) if (x.level === "bad") A.push({ lvl: "bad", t: x.label + " · " + new Date(d.date + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" }), d: (x.items || []).join(" · ").slice(0, 200), tab: "day", date: d.date });
+  // Tanks: latest reading under its alert point, water, or no reading for 13+ hours
+  try {
+    const tk = await tanksFor(env, S), last = tk[tk.length - 1], good = tk.filter(r => r.ok).pop();
+    if (good) {
+      for (const t of good.tanks) {
+        const g = Math.round(Number(t[1]) || 0);
+        if (t[6]) A.push({ lvl: "bad", t: t[0] + " is low: " + g.toLocaleString("en-US") + " gal", d: t[7] ? "Alert point is " + t[7].toLocaleString("en-US") + " gal. Read " + when(good.at) + "." : "Read " + when(good.at) + ".", tab: "store", sub: "fuel" });
+        if ((Number(t[3]) || 0) >= TANK_WATER) A.push({ lvl: "warn", t: "Water in " + t[0] + ": " + t[3] + " in", d: "Read " + when(good.at) + ".", tab: "store", sub: "fuel" });
+      }
+      if (now - good.at > 13 * 36e5) A.push({ lvl: "warn", t: "No tank reading since " + when(good.at), d: last && !last.ok && last.err ? String(last.err).slice(0, 160) : "Readings come every 6 hours from the store PC.", tab: "store", sub: "fuel" });
+    }
+  } catch {}
+  if (MGR) return A;
+  // Cig prices (owner only)
+  try {
+    const doc = await cigDoc(env, S);
+    if ((doc.groups || []).length) {
+      const { shelf } = await cigShelf(env, S, doc), cf = doc.cfg || {}, LO = cf.low || 1.15;
+      let raise = 0, bd = 0, waiting = 0;
+      for (const g of doc.groups) {
+        if (g.disc) continue;
+        const sh = shelf[g.id], p = sh ? sh.p : g.price, net = g.cost != null ? g.cost - (g.bd || 0) : null;
+        if (g.approved) { if (sh && Math.abs(sh.p - g.approved.price) >= 0.005 && now - g.approved.at > 30 * 36e5) waiting++; continue; }
+        if (p == null || net == null) continue;
+        if (g.max && p > g.max) bd++; else if (p - net < LO) raise++;
+      }
+      if (raise || bd) A.push({ lvl: "warn", t: (raise + bd) + " cig price" + (raise + bd > 1 ? "s" : "") + " to look at", d: [raise ? raise + " under your profit target" : "", bd ? bd + " above the buydown max (losing the buydown)" : ""].filter(Boolean).join(" · "), tab: "store", sub: "cigs" });
+      if (waiting) A.push({ lvl: "warn", t: waiting + " approved cig price" + (waiting > 1 ? "s aren't" : " isn't") + " ringing yet", d: "Approved over a day ago but the registers still ring the old price.", tab: "store", sub: "cigs" });
+    }
+  } catch {}
+  // Send to registers
+  try {
+    const rs = await regSendDoc(env, S);
+    const stale = (rs.status === "waiting" || rs.status === "running") && now - (rs.requested || 0) > 45 * 60e3;
+    if ((rs.status === "failed" || rs.status === "expired" || stale) && now - (rs.finished || rs.requested || 0) < 3 * 864e5) A.push({ lvl: "bad", t: "Send to registers didn't go through", d: stale ? "The store PC didn't pick it up. Check that it's on." : String(rs.log || "").slice(0, 160), tab: "store", sub: "cigs" });
+  } catch {}
+  // Invoices stuck sending
+  if (st.invoices && st.invoices.err) A.push({ lvl: "warn", t: "An invoice didn't send", d: String(st.invoices.err).slice(0, 160), href: "/desk?store=" + S });
+  // Weekly lottery report that didn't add up when read
+  try {
+    const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'lotinv'").bind(S).first();
+    const l = r ? JSON.parse(r.data) : [], v = l[l.length - 1];
+    if (v && !v.readOk && now - (v.at || 0) < 10 * 864e5) A.push({ lvl: "warn", t: "Weekly lottery report: check the photo", d: "Week of " + v.weekFrom + ": the numbers didn't add up when read.", tab: "day" });
+  } catch {}
+  return A;
 }
 async function regSendDoc(env, S) {
   const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'regsend'").bind(S).first();
@@ -3062,9 +3128,14 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
   var h='<p class="mute" style="margin:2px 0 12px">'+(MANAGER?'Close-outs, payroll and gas prices for your store.':'Every tool and report for your stations, in one place. Tap a store to switch.')+'</p><div class="stores">';
   L.forEach(function(s){var i=HOME_INFO[s.store]||{};h+='<button class="store'+(s.store===STORE?' on':'')+'" data-store="'+esc(s.store)+'"><b>'+esc(s.name)+'</b><small>'+esc(i.addr||("#"+s.store))+'</small></button>'});
   h+='</div>';
+  var AT=st.attn||[];AT.sort(function(a,b){return (a.lvl==="bad"?0:1)-(b.lvl==="bad"?0:1)});
+  h+='<div class="sec">Needs attention'+(AT.length?' <span class="pill '+(AT.some(function(a){return a.lvl==="bad"})?'bad':'warn')+'">'+AT.length+'</span>':'')+'</div><div class="card chk attn">';
+  if(AT.length)AT.forEach(function(a){var at=a.href?'href="'+esc(a.href)+'"':a.date?'href="#" data-chkdate="'+esc(a.date)+'"':'href="#" data-tab="'+esc(a.tab||"home")+'"'+(a.sub?' data-sub="'+esc(a.sub)+'"':'');
+    h+='<a class="chkrow '+(a.lvl==="bad"?"bad":"warn")+'" '+at+'><i></i><b>'+esc(a.t)+'</b><span>'+esc(a.d||"")+'</span></a>'});
+  else h+='<div class="chkrow"><i></i><b>All clear</b><span>Shifts, tanks'+(MANAGER?'':', cig prices')+' and the store PC look fine right now.</span></div>';
+  h+='</div>';
   if(st.pc){var pa=(Date.now()-st.pc.at)/36e5,pt=new Date(st.pc.at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}),bad=pa>30||!st.pc.ok||(st.pc.errors||[]).length;
-    h+='<div class="'+(bad?'warn-line':'mute')+'" style="margin-top:10px;font-size:13px">Store PC'+(st.pc.host?' '+esc(st.pc.host):'')+': '+(pa>30?'no report since '+esc(pt):'reported '+esc(pt)+(st.pc.ok?' \u2713':' with problems'))+' \u00b7 script v'+(st.pc.version||'?')+((st.pc.errors||[]).length?'<br>'+esc(st.pc.errors[0]):'')+'</div>'}
-  if(age>30)h+='<div class="warn-line" style="margin-top:12px">'+(st.lastUpload?'No Verifone upload from this store PC since '+esc(up)+'. Check that the PC is on.':'This store PC isn\\'t sending Verifone days yet.')+'</div>';
+    h+='<div class="mute" style="margin-top:10px;font-size:13px">Store PC'+(st.pc.host?' '+esc(st.pc.host):'')+': '+(pa>30?'no report since '+esc(pt):'reported '+esc(pt)+(st.pc.ok?' \u2713':' with problems'))+' \u00b7 script v'+(st.pc.version||'?')+((st.pc.errors||[]).length?'<br>'+esc(st.pc.errors[0]):'')+'</div>'}
   var salesDesc=last?'<b>'+fmtDay(last.date)+':</b> '+money(+last.net||0)+' total · '+gal(+last.gal||0)+' gal · KKC '+money(+last.kkc||0)+'<br>Month to date: '+money(S(cur,"net"))+' '+pct(S(cur,"net"),S(prev,"net"))+' vs same days last month':'Each day\\'s sales from Verifone, sent by the store PC every night.';
   if(st.checks){var ch='';st.checks.forEach(function(d){d.list.forEach(function(x){if(x.level==="none")return;ch+='<a href="#" class="chkrow '+x.level+'" data-chkdate="'+d.date+'"><i></i><b>'+esc(fmtDay(d.date))+' · '+esc(x.label)+'</b><span>'+(x.items.length?esc(x.items.join(" · ")):"All good")+(x.worked&&x.worked.length?' · '+esc(x.worked.join(", ")):'')+'</span></a>'})});
     h+='<div class="sec">Shift check</div><div class="card chk">'+(ch||'<div class="mute" style="padding:8px 14px">Nothing to check yet today.</div>')+'</div>'}
@@ -3083,7 +3154,7 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
   $("home").innerHTML=h}
 $("home").addEventListener("click",function(e){var s=e.target.closest("[data-store]");if(s){STORE=s.dataset.store;try{localStorage.setItem("store",STORE)}catch(x){}$("store").value=STORE;renderHome();return}
   var c=e.target.closest("[data-chkdate]");if(c){e.preventDefault();$("date").value=c.dataset.chkdate;goTab("day");return}
-  var t=e.target.closest("[data-tab]");if(t){e.preventDefault();goTab(t.dataset.tab)}});
+  var t=e.target.closest("[data-tab]");if(t){e.preventDefault();openView(t.dataset.tab,t.dataset.sub)}});
 /* ---------- sales (nightly Verifone upload) ---------- */
 var salesMonth=today().slice(0,7),SALES=null,salesPick=null;
 function monthAdd(m,n){var y=+m.slice(0,4),mo=+m.slice(5,7)-1+n;y+=Math.floor(mo/12);mo=((mo%12)+12)%12;return y+"-"+String(mo+1).padStart(2,"0")}
