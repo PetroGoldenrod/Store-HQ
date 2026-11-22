@@ -157,7 +157,7 @@ async function managerCookie(env, store) {
   return "manager=" + store + "." + exp + "." + (await hmac(env["MANAGER_PASSWORD_" + store], "manager|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
 }
 // Pages a manager may not open.
-const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
+const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
 async function partnerCookie(env, store) {
   const exp = Date.now() + 30 * 86400000;
   return "partner=" + store + "." + exp + "." + (await hmac(env["PARTNER_PASSWORD_" + store], "partner|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
@@ -973,6 +973,53 @@ async function ownerApi(req, env, path, url) {
     const n = await pushAlert(env, "Store HQ alerts are on", "This phone will get a notification when a gas tank runs low or shows water.", "/#sales");
     return json({ ok: true, phones: list.length, sent: n });
   }
+  if (path === "/api/cigs" && req.method === "GET") {
+    // Cig price check: the store's list of cig groups (cost, buydown, sources) with the registers' current shelf prices.
+    const doc = await cigDoc(env, S);
+    const shelf = {}; let regAt = null;
+    try {
+      const rb = await env.DB.prepare("SELECT text, updated FROM inv_blob WHERE key = ?").bind("reg:" + S).first();
+      if (rb) {
+        regAt = rb.updated; const m = new Map(); for (const it of JSON.parse(rb.text).items || []) m.set(it[0], it[3]);
+        for (const g of doc.groups || []) {
+          const ps = (g.upcs || []).map(u => m.get(u)).filter(v => v > 0);
+          if (!ps.length) continue;
+          const c = {}; ps.forEach(v => c[v] = (c[v] || 0) + 1);
+          const mode = +Object.keys(c).sort((a, b) => c[b] - c[a] || a - b)[0];
+          shelf[g.id] = { p: mode, min: Math.min(...ps), max: Math.max(...ps), n: ps.length };
+        }
+      }
+    } catch {}
+    return json({ doc, shelf, regAt });
+  }
+  if (path === "/api/cigs/approve" && req.method === "POST") {
+    // Owner ticks a suggested price (or unticks). Nothing goes to Sunray from here: the owner enters approved prices himself.
+    const b = await readBody(req, 4000), doc = await cigDoc(env, S), g = (doc.groups || []).find(x => x.id === b.id);
+    if (!g) return json({ error: "No such item." }, 404);
+    const price = Math.round(Number(b.price) * 100) / 100;
+    g.approved = b.approve && price > 0 ? { price, at: Date.now() } : null;
+    await saveCigDoc(env, S, doc);
+    return json({ ok: true });
+  }
+  if (path === "/api/cigs/entered" && req.method === "POST") {
+    // Owner says the approved prices are in Sunray: they stay on the page until the registers ring them.
+    const doc = await cigDoc(env, S), now = Date.now();
+    for (const g of doc.groups || []) if (g.approved && !g.approved.entered) g.approved.entered = now;
+    await saveCigDoc(env, S, doc);
+    return json({ ok: true });
+  }
+  if (path === "/api/cigs/edit" && req.method === "POST") {
+    // Owner corrects a number by hand (a cost, a buydown, a price limit, the fallback shelf price).
+    const b = await readBody(req, 4000), doc = await cigDoc(env, S), g = (doc.groups || []).find(x => x.id === b.id);
+    if (!g) return json({ error: "No such item." }, 404);
+    const f = b.fields || {}, num = v => (v === "" || v == null ? null : Math.round(Number(v) * 1000) / 1000);
+    for (const k of ["cost", "bd", "max", "price"]) if (k in f) { const v = num(f[k]); if (v !== null && !(v >= 0 && v < 1000)) return json({ error: "Check the number for " + k + "." }, 400); g[k] = v; }
+    if ("cost" in f) { g.costSrc = "Typed in Store HQ"; g.costDate = new Date().toISOString().slice(0, 10); }
+    if ("bd" in f) g.bdSrc = "Typed in Store HQ";
+    if ("note" in f) g.note = String(f.note || "").slice(0, 200);
+    await saveCigDoc(env, S, doc);
+    return json({ ok: true });
+  }
   if (path === "/api/reg-plu" && req.method === "POST") {
     // Nightly from the store PC: every item as the registers have it (gzipped tab text: key, name, dept, price). Kept as [[key, name, dept, price]].
     const b = await readBody(req, 6e6);
@@ -1427,6 +1474,16 @@ async function tankAlerts(env, S, tanks) {
   const text = store + " tank reading, " + when + ":\n\n" + lines.join("\n") + "\n\nAll tanks now:\n" + tanks.map(t => { const num = (/#(\d+)$/.exec(t[0] || "") || [])[1] || t[0], g = Number(t[1]) || 0, cap = g + (Number(t[2]) || 0); return "  " + (TN[num] || t[0]) + ": " + Math.round(g).toLocaleString("en-US") + " gal (" + (cap ? Math.round(g / cap * 100) : 0) + "%)"; }).join("\n") + "\n\nStore HQ reads the tanks every 6 hours (Sales page, Tanks now).";
   try { await pushAlert(env, (lines.some(l => /% full/.test(l)) ? "Gas low at " : "Tank alert at ") + store, lines.join("\n"), "/#sales"); } catch (e) { console.error("tank push", e && e.message); }
   await smtpSend(env, { to: String(env.DAILY_MAIL_TO || MAIL_USER(env)).trim(), fromName: "Store HQ", subject: (lines.some(l => /% full/.test(l)) ? "Gas low at " : "Tank alert at ") + store + ": " + lines.map(l => l.split(":")[0]).filter((v, i, a) => a.indexOf(v) === i).join(", "), text });
+}
+// ---- Cig price check. One document per store in store_kv (k = 'cigs'):
+// {cfg:{target,low,high}, periods:{altria,rjr,itg}, costsAt, bdAt, groups:[{id,name,kind:"pack"|"can",upcs,cost,costSrc,costDate,bd,bdSrc,max,disc,price,note,approved}]}
+// Costs and buydowns are filled by Claude (from invoices and the Altria / RJR / ITG sites); shelf prices come from the registers' nightly item list.
+async function cigDoc(env, S) {
+  const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'cigs'").bind(S).first();
+  try { return r ? JSON.parse(r.data) : { groups: [] }; } catch { return { groups: [] }; }
+}
+async function saveCigDoc(env, S, doc) {
+  await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'cigs', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(doc), Date.now()).run();
 }
 // ---- Phone push alerts (Web Push). The owner turns them on once per phone from the Sales page.
 // Pushes carry no data (no payload encryption needed): the phone wakes up and asks /api/push/latest for the newest alerts,
@@ -2417,6 +2474,19 @@ table.lg{border-collapse:collapse;font-size:.85rem;width:auto}tr.lgrow td{paddin
 .mv .seg button{width:auto;margin:0;border:0;border-radius:0;background:var(--paper);color:var(--muted);padding:8px 12px;font-weight:600}.mv .seg button.on{background:var(--accent);color:var(--accent-ink)}
 .mv .tw{overflow-x:auto}.mv table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 .mv th,.mv td{padding:8px 10px;text-align:left;border-top:1px solid var(--line);white-space:nowrap}.mv th{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);border-top:0}
+.cg .tw{overflow-x:auto}.cg table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.cg th,.cg td{padding:8px 10px;text-align:left;border-top:1px solid var(--line);white-space:nowrap;vertical-align:middle}.cg th{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);border-top:0}
+.cg td:first-child{white-space:normal;min-width:170px;max-width:300px}.cg td.r,.cg th.r{text-align:right}.cg td.neg{color:var(--bad);font-weight:700}.cg tr.cgr{cursor:pointer}.cg tr.cgr:hover{background:var(--chip)}
+.cg tr.cgr.bad td:first-child{box-shadow:inset 4px 0 var(--bad)}.cg tr.cgr.blue td:first-child{box-shadow:inset 4px 0 #3b7bd4}.cg tr.cgr.warn td:first-child{box-shadow:inset 4px 0 var(--accent)}
+.cgchip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.78rem;font-weight:600;background:var(--chip);color:var(--muted)}
+.cgchip.bad{background:var(--bad-soft);color:var(--bad)}.cgchip.good{background:var(--good-soft);color:var(--good)}.cgchip.warn{background:var(--accent-soft);color:var(--accent-text)}.cgchip.blue{background:#dfeaf9;color:#1d4f91}
+.cgsum{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.cgsum .cgchip{font-size:.9rem;padding:4px 10px}
+.cgin{width:78px;text-align:right;padding:4px 6px;margin:0}.cgok{width:20px;height:20px;margin:0}
+.cgdet{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr);gap:8px 14px;align-items:center;white-space:normal;padding:4px 0}
+.cgdet label{display:flex;flex-direction:column;gap:3px;font-size:.8rem;color:var(--muted);margin:0}.cgdet input{width:100%;margin:0}.cgdet span{color:var(--muted);font-size:.85rem}
+.cgbtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;grid-column:1/-1}.cgbtns button{width:auto}
+.cgal{display:flex;flex-direction:column;gap:6px}.cgal div{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}.cgal span:first-child{flex:1 1 200px}
+@media (prefers-color-scheme:dark){.cgchip.blue{background:#1a2c45;color:#9cc3f5}}
 .mv td.r,.mv th.r{text-align:right}.mv tbody tr{cursor:pointer}.mv tbody tr:hover{background:var(--chip)}.mv tr.sel{background:var(--accent-soft)}
 .mv .up{color:var(--good)}.mv .dn{color:var(--bad)}
 .mv .it{display:flex;gap:12px;padding:10px 0;border-top:1px solid var(--line)}.mv .it:first-child{border-top:0}
@@ -2450,7 +2520,7 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h1 style="margin:0">Store <span>HQ</span></h1><select id="store" aria-label="Store" style="width:auto;font-weight:700" hidden></select></div>
 <section id="login" hidden><div class="card"><label for="pw">Password</label><input type="password" id="pw" autocomplete="current-password"><button id="lg" style="margin-top:12px;width:100%">Sign in</button><div id="lmsg"></div></div></section>
 <div id="app" hidden>
-<div class="tabs" role="tablist"><button data-v="home" class="on">Home</button><button data-v="day">Shifts</button><button data-v="staff">Staff</button><button data-v="pay">Payroll</button><button data-v="sales">Sales</button><button data-v="pl">P&amp;L</button><button data-v="movers">Movers</button><button data-v="gas">Gas</button><button data-v="out" style="margin-left:auto">Sign out</button></div>
+<div class="tabs" role="tablist"><button data-v="home" class="on">Home</button><button data-v="day">Shifts</button><button data-v="staff">Staff</button><button data-v="pay">Payroll</button><button data-v="sales">Sales</button><button data-v="pl">P&amp;L</button><button data-v="movers">Movers</button><button data-v="cigs">Cigs</button><button data-v="gas">Gas</button><button data-v="out" style="margin-left:auto">Sign out</button></div>
 <section id="v-home"><div id="home"><div class="mute">Loading…</div></div></section>
 <section id="v-day" hidden>
  <div class="bar"><button class="alt sm" id="prev" aria-label="Previous day">‹</button><input type="date" id="date"><button class="alt sm" id="next" aria-label="Next day">›</button><button class="alt sm" id="rf">Refresh</button></div>
@@ -2504,6 +2574,14 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  <div class="ds mv">
   <p class="sub" id="mvsub">Loading…</p>
   <div id="mvbody"></div>
+ </div>
+</section>
+<section id="v-cigs" hidden>
+ <div class="ds cg">
+  <div class="card"><h2>Cig prices</h2><p class="sub" id="cgsub">Loading…</p><div id="cgsum" class="cgsum"></div></div>
+  <div id="cgappr"></div>
+  <div class="card"><div class="tw"><table><thead><tr><th>Item</th><th class="r">Shelf</th><th class="r">Profit</th><th>Status</th><th class="r">Suggested</th><th class="r">Carton</th><th>OK?</th></tr></thead><tbody id="cgbody"></tbody></table></div>
+  <p class="mute" style="margin:10px 0 0;font-size:.85rem">Tap a row for its cost, buydown and where each number came from. Profit is shelf price minus cost after buydown. Carton = 10 packs − $2.50.</p></div>
  </div>
 </section>
 <section id="v-gas" hidden>
@@ -2566,11 +2644,11 @@ function labelTables(){document.querySelectorAll(".tw table").forEach(function(t
 new MutationObserver(function(){if(labelTables.p)return;labelTables.p=requestAnimationFrame(function(){labelTables.p=0;labelTables()})}).observe(document.body,{childList:true,subtree:true});
 function goTab(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.click()}
 var PARTNER=false,MANAGER=false;
-function applyRole(){["sales","pl","movers"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER){var on=document.querySelector(".tabs button.on");if(on&&/^(sales|pl|movers)$/.test(on.dataset.v))goTab("home")}}
+function applyRole(){["sales","pl","movers","cigs"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER){var on=document.querySelector(".tabs button.on");if(on&&/^(sales|pl|movers|cigs)$/.test(on.dataset.v))goTab("home")}}
 function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
   $("store").innerHTML=L.map(function(s){return '<option value="'+esc(s.store)+'"'+(s.store===STORE?" selected":"")+'>'+esc(s.name)+'</option>'}).join("");$("store").hidden=L.length<2}).catch(function(){})}
 $("store").addEventListener("change",function(){STORE=this.value;try{localStorage.setItem("store",STORE)}catch(e){}
-  var on=document.querySelector(".tabs button.on"),v=on?on.dataset.v:"day";if(v==="staff")loadStaff();else if(v==="pay")loadPay();else if(v==="sales")loadSales();else if(v==="pl")loadPL();else if(v==="movers")loadMV();else if(v==="gas")loadGas();else if(v==="home")loadHome();else loadDay()});
+  var on=document.querySelector(".tabs button.on"),v=on?on.dataset.v:"day";if(v==="staff")loadStaff();else if(v==="pay")loadPay();else if(v==="sales")loadSales();else if(v==="pl")loadPL();else if(v==="movers")loadMV();else if(v==="cigs")loadCG();else if(v==="gas")loadGas();else if(v==="home")loadHome();else loadDay()});
 $("lg").addEventListener("click",login);$("pw").addEventListener("keydown",function(e){if(e.key==="Enter")login()});
 function login(){$("lg").disabled=true;fetch("/api/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:$("pw").value})})
   .then(function(r){return r.json().then(function(j){$("lg").disabled=false;if(r.ok){$("pw").value="";show(true)}else $("lmsg").innerHTML='<div class="msg err">'+esc(j.error||"Wrong password.")+'</div>'})})
@@ -2578,8 +2656,58 @@ function login(){$("lg").disabled=true;fetch("/api/login",{method:"POST",headers
 document.querySelector(".tabs").addEventListener("click",function(e){var b=e.target.closest("button");if(!b)return;var v=b.dataset.v;
   if(v==="out"){fetch("/api/logout",{method:"POST"}).then(function(){show(false)});return}
   document.querySelectorAll(".tabs button").forEach(function(x){x.classList.toggle("on",x===b)});
-  ["home","day","staff","pay","sales","pl","movers","gas"].forEach(function(k){$("v-"+k).hidden=k!==v});$("store").style.visibility=(v==="home"||PARTNER)?"hidden":"";if(v==="sales")loadSales();if(v==="pl")loadPL();if(v==="movers")loadMV();if(v==="gas")loadGas();if(v==="home")loadHome();
+  ["home","day","staff","pay","sales","pl","movers","cigs","gas"].forEach(function(k){$("v-"+k).hidden=k!==v});$("store").style.visibility=(v==="home"||PARTNER)?"hidden":"";if(v==="sales")loadSales();if(v==="pl")loadPL();if(v==="movers")loadMV();if(v==="cigs")loadCG();if(v==="gas")loadGas();if(v==="home")loadHome();
   if(v==="day")loadDay();if(v==="staff")loadStaff();if(v==="pay")loadPay();});
+
+/* ---------- cig prices ---------- */
+var CG={d:null,open:""};
+function cgP9(x){var c=Math.round(x*100),b=c-(c%10)+9,o=[b-10,b,b+10];o.sort(function(a,b2){return Math.abs(a-c)-Math.abs(b2-c)});return o[0]/100}
+function cgMoney(v){return v==null||isNaN(v)?"":"$"+(+v).toFixed(2)}
+function cgRow(g){var cfg=(CG.d.doc.cfg)||{},T=cfg.target||1.25,LO=cfg.low||1.15,HI=cfg.high||1.40,sh=CG.d.shelf[g.id],shelf=sh?sh.p:g.price,
+  net=g.cost!=null?g.cost-(g.bd||0):null,profit=shelf!=null&&net!=null?shelf-net:null,st="OK",sug=null;
+  if(g.disc)st="Discount";else if(profit==null)st="Missing";
+  else if(g.max&&shelf>g.max){st="Lower to keep buydown";sug=Math.floor(g.max*10)/10-0.01;if(sug+0.1<=g.max)sug=Math.round((sug+0.1)*100)/100}
+  else if(profit<LO){st="Raise";sug=cgP9(net+T)}else if(profit>HI){st="Could lower";sug=cgP9(net+T)}
+  if(sug!=null)sug=Math.round(sug*100)/100;
+  var ap=g.approved,ringing=ap&&shelf!=null&&Math.abs(shelf-ap.price)<0.005&&!!sh;
+  return {g:g,shelf:shelf,fromReg:!!sh,mixed:sh&&sh.min!==sh.max?sh:null,net:net,profit:profit,st:st,sug:sug,ap:ap,ringing:ringing}}
+function loadCG(){$("cgsub").textContent="Loading…";api("/api/cigs").then(function(j){CG.d=j;renderCG()}).catch(function(x){if(x.message!=="signin")$("cgsub").textContent="Couldn't load: "+x.message})}
+function renderCG(){var d=CG.d,doc=d.doc||{},G=doc.groups||[];
+  if(!G.length){$("cgsub").textContent="No cig list for this store yet.";$("cgsum").innerHTML="";$("cgbody").innerHTML="";$("cgappr").innerHTML="";return}
+  var P=doc.periods||{},dt=function(t){return t?new Date(t).toLocaleDateString("en-US",{month:"short",day:"numeric"}):""};
+  $("cgsub").innerHTML="Costs from invoices, updated "+esc(doc.costsAt||"?")+". Buydowns: Altria "+esc(P.altria||"?")+", RJR "+esc(P.rjr||"?")+", ITG "+esc(P.itg||"?")+". "+(d.regAt?"Shelf prices from the registers ("+esc(dt(d.regAt))+").":"Shelf prices from your price list until the registers' item list arrives.");
+  var R=G.map(cgRow),cnt={};R.forEach(function(r){cnt[r.st]=(cnt[r.st]||0)+1});
+  var chip=function(k,cls){return cnt[k]?'<span class="cgchip '+cls+'"><b>'+cnt[k]+'</b> '+esc(k==="OK"?"OK":k.toLowerCase())+'</span>':""};
+  $("cgsum").innerHTML=chip("Raise","bad")+chip("Lower to keep buydown","blue")+chip("Could lower","warn")+chip("OK","good")+chip("Discount","")+chip("Missing","");
+  var A=R.filter(function(r){return r.ap});
+  if(A.length){var todo=A.filter(function(r){return !r.ap.entered}),txt=A.map(function(r){return r.g.name+": "+cgMoney(r.shelf)+" → "+cgMoney(r.ap.price)+(r.g.kind==="pack"?" (carton "+cgMoney(10*r.ap.price-2.5)+")":"")}).join("\\n");
+    $("cgappr").innerHTML='<div class="card"><h2>Approved, to enter in Sunray</h2><div class="cgal">'+A.map(function(r){return '<div><span>'+esc(r.g.name)+'</span><b>'+cgMoney(r.shelf)+' → '+cgMoney(r.ap.price)+(r.g.kind==="pack"?' · carton '+cgMoney(10*r.ap.price-2.5):'')+'</b>'+(r.ringing?'<span class="cgchip good">Ringing</span>':r.ap.entered?'<span class="cgchip warn">Entered, not ringing yet</span>':'')+'</div>'}).join("")+'</div>'+
+    '<div class="cgbtns"><button type="button" class="alt" id="cgcopy">Copy list</button>'+(todo.length?'<button type="button" id="cgent">I entered these in Sunray</button>':'')+'</div><p class="mute" style="font-size:.85rem;margin:8px 0 0">Remember to send the changes to the registers. Each one shows "Ringing" once the registers ring the new price.</p></div>';
+    $("cgcopy").onclick=function(){var b=this;try{navigator.clipboard.writeText(txt).then(function(){b.textContent="Copied"},function(){b.textContent="Couldn't copy"})}catch(e){b.textContent="Couldn't copy"}};
+    if($("cgent"))$("cgent").onclick=function(){this.disabled=true;api("/api/cigs/entered",{method:"POST",body:{}}).then(loadCG).catch(function(x){alertMsg(x)})}}
+  else $("cgappr").innerHTML="";
+  var order={"Raise":0,"Lower to keep buydown":1,"Could lower":2,"Missing":3,"OK":4,"Discount":5};
+  R.sort(function(a,b){return (order[a.st]-order[b.st])||0});
+  $("cgbody").innerHTML=R.map(function(r){var g=r.g,cls={"Raise":"bad","Lower to keep buydown":"blue","Could lower":"warn","OK":"good"}[r.st]||"",ap=r.ap,val=ap?ap.price:r.sug,
+    row='<tr class="cgr '+cls+'" data-id="'+esc(g.id)+'"><td>'+esc(g.name)+(r.mixed?' <span class="cgchip warn" title="Styles ring at different prices">'+cgMoney(r.mixed.min)+'–'+cgMoney(r.mixed.max)+'</span>':'')+'</td><td class="r">'+cgMoney(r.shelf)+(r.fromReg?'':'<sup title="From your price list, not the registers">*</sup>')+'</td><td class="r '+(r.profit!=null&&r.profit<((CG.d.doc.cfg||{}).low||1.15)?'neg':'')+'">'+cgMoney(r.profit)+'</td><td><span class="cgchip '+cls+'">'+esc(r.st==="Lower to keep buydown"?"Lower for buydown":r.st)+'</span></td>'+
+    '<td class="r">'+(val!=null?'<input class="cgin" type="text" inputmode="decimal" value="'+(+val).toFixed(2)+'" aria-label="Price for '+esc(g.name)+'">':'')+'</td><td class="r">'+(val!=null&&g.kind==="pack"?cgMoney(10*val-2.5):'')+'</td><td>'+(val!=null?'<input type="checkbox" class="cgok"'+(ap?' checked':'')+' aria-label="Approve '+esc(g.name)+'">':'')+'</td></tr>';
+    if(CG.open===g.id)row+='<tr class="cgd"><td colspan="7"><div class="cgdet">'+
+      '<label>Cost / '+(g.kind==="can"?"can":"pack")+'<input data-f="cost" value="'+(g.cost!=null?g.cost:"")+'"></label><span>'+esc(g.costSrc||"")+'</span>'+
+      '<label>Buydown<input data-f="bd" value="'+(g.bd!=null?g.bd:"")+'"></label><span>'+esc(g.bdSrc||"")+'</span>'+
+      '<label>Highest price for buydown<input data-f="max" value="'+(g.max!=null?g.max:"")+'"></label><span>'+(g.max?"The program pays the buydown only at this price or less.":"No limit")+'</span>'+
+      '<label>Price if registers have none<input data-f="price" value="'+(g.price!=null?g.price:"")+'"></label><span>Cost after buydown '+cgMoney(r.net)+(g.note?" · "+esc(g.note):"")+'</span>'+
+      '<div class="cgbtns"><button type="button" class="alt cgsave">Save numbers</button></div></div></td></tr>';
+    return row}).join("")}
+document.addEventListener("click",function(e){var t=e.target;if(!t.closest||!t.closest("#cgbody"))return;
+  if(t.classList.contains("cgok")){var tr=t.closest("tr"),id=tr.dataset.id,price=parseFloat(tr.querySelector(".cgin").value);t.disabled=true;
+    api("/api/cigs/approve",{method:"POST",body:{id:id,price:price,approve:t.checked}}).then(loadCG).catch(function(x){t.disabled=false;alertMsg(x)});return}
+  if(t.classList.contains("cgsave")){var dr=t.closest("tr"),id2=dr.previousElementSibling.dataset.id,f={};dr.querySelectorAll("input[data-f]").forEach(function(i){f[i.dataset.f]=i.value.trim()});t.disabled=true;
+    api("/api/cigs/edit",{method:"POST",body:{id:id2,fields:f}}).then(loadCG).catch(function(x){t.disabled=false;alertMsg(x)});return}
+  if(t.closest("input,button,label"))return;
+  var r=t.closest("tr.cgr");if(r){CG.open=CG.open===r.dataset.id?"":r.dataset.id;renderCG()}});
+document.addEventListener("input",function(e){var t=e.target;if(!t.classList||!t.classList.contains("cgin"))return;var tr=t.closest("tr"),v=parseFloat(t.value),c=tr.children[5];
+  var g=(CG.d.doc.groups||[]).find(function(x){return x.id===tr.dataset.id});if(g&&g.kind==="pack")c.textContent=isNaN(v)?"":cgMoney(10*v-2.5)});
+function alertMsg(x){if(x&&x.message!=="signin")$("cgsub").textContent="Couldn't save: "+x.message}
 
 /* ---------- sales movers ---------- */
 var MV_DEPT={"2":"Cigarettes","3":"Other tobacco","4":"Beer","5":"Wine","6":"Liquor","7":"Packaged beverages","8":"Candy","9":"Fluid milk","10":"Other dairy & deli","11":"Sandwiches & meat snacks","12":"Ice cream","15":"Salty snacks","16":"Sweet snacks","17":"Alternative snacks","18":"Refrigerated snacks","19":"Edible grocery","20":"Non-edible grocery","21":"Health & beauty","22":"General merchandise","24":"Automotive","29":"Boiled peanuts","31":"Store brand drinks","32":"Frozen dispensed","67":"Vapor","79":"KKC"};
