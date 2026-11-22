@@ -1533,7 +1533,7 @@ async function homeAttention(env, S, MGR, st) {
     else if (pH <= 30 && (!st.pc.ok || (st.pc.errors || []).length)) A.push({ lvl: "warn", t: "Store PC reported a problem", d: String((st.pc.errors || [])[0] || "Its last nightly run didn't finish cleanly.").slice(0, 160), tab: "sales" });
   }
   // Shifts
-  for (const d of st.checks || []) for (const x of d.list || []) if (x.level === "bad") A.push({ lvl: "bad", t: x.label + " · " + new Date(d.date + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" }), d: (x.items || []).join(" · ").slice(0, 200), tab: "day", date: d.date });
+  for (const d of st.checks || []) for (const x of d.list || []) if (x.level === "bad") A.push({ lvl: "bad", t: x.label + " · " + new Date(d.date + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" }), d: (x.items || []).join(" · ").slice(0, 400) + (x.worked && x.worked.length ? " · " + x.worked.join(", ") : ""), tab: "day", date: d.date });
   // Tanks: latest reading under its alert point, water, or no reading for 13+ hours
   try {
     const tk = await tanksFor(env, S), last = tk[tk.length - 1], good = tk.filter(r => r.ok).pop();
@@ -2650,7 +2650,7 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 </section>
 <section id="v-staff" hidden>
  <div class="card"><h2>Add a cashier</h2><div class="row"><div><label for="nn">Name</label><input id="nn" autocomplete="off"></div><div><label for="nr">Hourly rate ($)</label><input id="nr" inputmode="decimal"></div></div><button id="add" style="margin-top:12px">Add and make link</button><div id="smsg"></div></div>
- <div class="card"><h2>Photo reader</h2><div class="mute">Checks that your Claude API key works.</div><button id="chk" class="alt" style="margin-top:10px">Test photo reader</button><div id="cmsg"></div></div>
+ <div class="card" id="chkCard"><h2>Photo reader</h2><div class="mute">Checks that your Claude API key works.</div><button id="chk" class="alt" style="margin-top:10px">Test photo reader</button><div id="cmsg"></div></div>
  <div class="mute" style="margin:0 0 8px">Send each cashier their own link. Turn a cashier off and their link stops working right away.</div>
  <div class="staff" id="staff"></div>
 </section>
@@ -2770,7 +2770,7 @@ function goTab(v){openView(v)}
 $("subnav").addEventListener("click",function(e){var b=e.target.closest("button");if(b)openView(CUR,b.dataset.sub)});
 $("signout").addEventListener("click",function(){fetch("/api/logout",{method:"POST"}).then(function(){show(false)})});
 var PARTNER=false,MANAGER=false;
-function applyRole(){["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl)$/.test(CUR)||(CUR==="store"&&SUB.store==="cigs")))openView("home");else if(CUR==="store")openView("store")}
+function applyRole(){var pc=$("chkCard");if(pc)pc.hidden=MANAGER;["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl)$/.test(CUR)||(CUR==="store"&&SUB.store==="cigs")))openView("home");else if(CUR==="store")openView("store")}
 function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
   $("store").innerHTML=L.map(function(s){return '<option value="'+esc(s.store)+'"'+(s.store===STORE?" selected":"")+'>'+esc(s.name)+'</option>'}).join("");$("store").hidden=L.length<2}).catch(function(){})}
 $("store").addEventListener("change",function(){STORE=this.value;try{localStorage.setItem("store",STORE)}catch(e){}
@@ -3137,8 +3137,8 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
   if(st.pc){var pa=(Date.now()-st.pc.at)/36e5,pt=new Date(st.pc.at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}),bad=pa>30||!st.pc.ok||(st.pc.errors||[]).length;
     h+='<div class="mute" style="margin-top:10px;font-size:13px">Store PC'+(st.pc.host?' '+esc(st.pc.host):'')+': '+(pa>30?'no report since '+esc(pt):'reported '+esc(pt)+(st.pc.ok?' \u2713':' with problems'))+' \u00b7 script v'+(st.pc.version||'?')+((st.pc.errors||[]).length?'<br>'+esc(st.pc.errors[0]):'')+'</div>'}
   var salesDesc=last?'<b>'+fmtDay(last.date)+':</b> '+money(+last.net||0)+' total · '+gal(+last.gal||0)+' gal · KKC '+money(+last.kkc||0)+'<br>Month to date: '+money(S(cur,"net"))+' '+pct(S(cur,"net"),S(prev,"net"))+' vs same days last month':'Each day\\'s sales from Verifone, sent by the store PC every night.';
-  if(st.checks){var ch='';st.checks.forEach(function(d){d.list.forEach(function(x){if(x.level==="none")return;ch+='<a href="#" class="chkrow '+x.level+'" data-chkdate="'+d.date+'"><i></i><b>'+esc(fmtDay(d.date))+' · '+esc(x.label)+'</b><span>'+(x.items.length?esc(x.items.join(" · ")):"All good")+(x.worked&&x.worked.length?' · '+esc(x.worked.join(", ")):'')+'</span></a>'})});
-    h+='<div class="sec">Shift check</div><div class="card chk">'+(ch||'<div class="mute" style="padding:8px 14px">Nothing to check yet today.</div>')+'</div>'}
+  if(st.checks){var ch='';st.checks.forEach(function(d){d.list.forEach(function(x){if(x.level==="none"||x.level==="bad")return;ch+='<a href="#" class="chkrow '+x.level+'" data-chkdate="'+d.date+'"><i></i><b>'+esc(fmtDay(d.date))+' · '+esc(x.label)+'</b><span>'+(x.items.length?esc(x.items.join(" · ")):"All good")+(x.worked&&x.worked.length?' · '+esc(x.worked.join(", ")):'')+'</span></a>'})});
+    if(ch)h+='<div class="sec">Shifts still open</div><div class="card chk">'+ch+'</div>'}
   h+='<div class="sec">Every shift</div><div class="tlist">'+row({tab:"day",name:"Close-Outs",desc:"Shifts, safe drops, over/short, lottery checks, voids & no-sales."+(last?" "+st.closesLast+" sent for "+fmtDay(last.date)+".":"")})+row({tab:"staff",name:"Staff & links",desc:"Add cashiers and send them their own close-out link."})+row({tab:"pay",name:"Payroll",desc:"Shifts worked this pay week (Fri–Thu)."})+'</div>';
   if(!MANAGER){h+='<div class="sec">Sales &amp; profit</div><div class="tlist">'+row({tab:"sales",name:"Sales",desc:salesDesc});
   /* Manager invoice page removed (Nov 2026). Owner keeps the Invoice Desk. */
@@ -3195,7 +3195,7 @@ function renderTanks(L){var el=$("tanksNow");if(!el)return;L=L||[];if(!L.length)
       h+='<tr><td>'+esc(t[0])+'</td><td class="r num">'+Math.round(g).toLocaleString()+'</td><td class="r num">'+pct+'%'+((t[6]!==undefined?t[6]:pct<25)?' <span class="pill bad">Low</span>':'')+(t[7]?'<div class="mute" style="font-size:.8em">alert under '+(+t[7]).toLocaleString()+' gal</div>':'')+'</td><td class="r num">'+Math.round(room).toLocaleString()+'</td><td class="r num">'+w+(w>=1?' <span class="pill bad">Check</span>':'')+'</td>'+(prev?'<td class="r num">'+(p===null?'':(p>0?'+':'')+Math.round(p).toLocaleString()+(p>500?' <span class="pill">Delivery?</span>':''))+'</td>':'')+'</tr>'});
     h+='</tbody></table></div>'}
   if(!newest.ok)h+='<div class="msg err" style="margin-top:8px">The last reading at '+esc(when(newest.at))+' didn’t work: '+esc(newest.err||"no tanks in the answer")+'</div>';
-  h+='<div style="margin-top:10px"><button type="button" class="alt" id="pushOn">Get phone alerts when a tank runs low</button> <span class="mute" id="pushMsg"></span></div>';
+  if(!MANAGER)h+='<div style="margin-top:10px"><button type="button" class="alt" id="pushOn">Get phone alerts when a tank runs low</button> <span class="mute" id="pushMsg"></span></div>';
   el.innerHTML=h+'</div>';$("pushOn").addEventListener("click",pushOn);
   try{if(window.Notification&&Notification.permission==="granted"&&navigator.serviceWorker)navigator.serviceWorker.getRegistration("/").then(function(r){return r&&r.pushManager.getSubscription()}).then(function(s){if(s){$("pushOn").textContent="Phone alerts are on (tap to re-check)";}}).catch(function(){})}catch(e){}}
 function pushOn(){var m=$("pushMsg");
