@@ -973,6 +973,7 @@ async function ownerApi(req, env, path, url) {
     let list = []; try { list = cur ? JSON.parse(cur.data) : []; } catch {}
     list.push(rec); list = list.slice(-120);
     await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'tanks', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(list), rec.at).run();
+    if (rec.ok) { try { await tankAlerts(env, S, tanks); } catch (e) { console.error("tank alert", e && e.message); } }
     return json({ ok: true });
   }
   if (path === "/api/pc-script" && req.method === "GET") {
@@ -1375,6 +1376,29 @@ const MAIL_USER = env => String(env.GMAIL_USER || "petro.goldenrod@gmail.com").t
 function b64utf8(s) { const b = new TextEncoder().encode(String(s)); let o = ""; for (let i = 0; i < b.length; i += 0x8000) o += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(o); }
 function wrap76(s) { return s.replace(/.{1,76}/g, "$&\r\n"); }
 function mailHeader(s) { s = String(s).replace(/[\r\n]+/g, " "); return /^[\x20-\x7e]*$/.test(s) ? s : "=?UTF-8?B?" + b64utf8(s) + "?="; }
+// Email the owner when a tank drops under 25% full (low) or 15% (very low), or shows 1 inch of water or more.
+// Each alert is sent once when the tank crosses into it; a delivery that fills the tank back up resets it.
+const TANK_LOW = 0.25, TANK_VERY_LOW = 0.15, TANK_WATER = 1;
+async function tankAlerts(env, S, tanks) {
+  const cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tankalert'").bind(S).first();
+  let st = {}; try { st = cur ? JSON.parse(cur.data) : {}; } catch {}
+  const TN = TANK_NAMES[S] || {}, lines = [], next = {};
+  for (const t of tanks) {
+    const num = (/#(\d+)$/.exec(t[0] || "") || [])[1] || t[0], name = TN[num] || t[0], g = Number(t[1]) || 0, cap = g + (Number(t[2]) || 0), w = Number(t[3]) || 0;
+    if (!cap) continue;
+    const pct = g / cap, lvl = pct < TANK_VERY_LOW ? 2 : pct < TANK_LOW ? 1 : 0, wet = w >= TANK_WATER ? 1 : 0, was = st[num] || { lvl: 0, wet: 0 };
+    if (lvl > was.lvl) lines.push(name + ": " + Math.round(g).toLocaleString("en-US") + " gallons left, " + Math.round(pct * 100) + "% full" + (lvl === 2 ? " (VERY LOW)" : " (low)") + ". Room for " + Math.round(cap - g).toLocaleString("en-US") + " gallons.");
+    if (wet && !was.wet) lines.push(name + ": " + w + " inches of water in the tank. Have it checked.");
+    next[num] = { lvl, wet };
+  }
+  await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'tankalert', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(next), Date.now()).run();
+  if (!lines.length) return;
+  let store = S === DEF_STORE ? "Goldenrod Shell" : S;
+  try { const r = await env.DB.prepare("SELECT data FROM inv_store WHERE store = ?").bind(S).first(); if (r) store = JSON.parse(r.data).name || store; } catch {}
+  const when = new Date().toLocaleString("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "2-digit" });
+  const text = store + " tank reading, " + when + ":\n\n" + lines.join("\n") + "\n\nAll tanks now:\n" + tanks.map(t => { const num = (/#(\d+)$/.exec(t[0] || "") || [])[1] || t[0], g = Number(t[1]) || 0, cap = g + (Number(t[2]) || 0); return "  " + (TN[num] || t[0]) + ": " + Math.round(g).toLocaleString("en-US") + " gal (" + (cap ? Math.round(g / cap * 100) : 0) + "%)"; }).join("\n") + "\n\nStore HQ reads the tanks every 6 hours (Sales page, Tanks now).";
+  await smtpSend(env, { to: String(env.DAILY_MAIL_TO || MAIL_USER(env)).trim(), fromName: "Store HQ", subject: (lines.some(l => /full \(/.test(l)) ? "Gas low at " : "Tank alert at ") + store + ": " + lines.map(l => l.split(":")[0]).filter((v, i, a) => a.indexOf(v) === i).join(", "), text });
+}
 async function smtpSend(env, m) {
   const user = MAIL_USER(env), pass = String(env.GMAIL_APP_PASSWORD || "").replace(/\s+/g, "");
   if (!pass) throw new Error("Email isn't set up yet (no Gmail app password in Cloudflare).");
