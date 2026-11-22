@@ -9,7 +9,7 @@ param(
   [string]$Url = "https://closeout.petro-goldenrod.workers.dev",
   [string]$Token = ""
 )
-$ScriptVersion = 3
+$ScriptVersion = 4
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -120,6 +120,28 @@ try {
     Log ("Shift detail sent from " + $files.Count + " log(s): " + $shiftDays)
   } else { Log "Shift detail: no LOGD files in $dir."; $errors += "No LOGD transaction logs in $dir" }
 } catch { Log ("Shift detail upload failed: " + $_.Exception.Message); $errors += ("Shift detail upload failed: " + $_.Exception.Message) }
+
+# Register item list (names and shelf prices exactly as the registers have them), from the PLU file VS-Poll saves each night.
+# Lets Store HQ show current item names even when a PLU number is reused. A failure here is logged and does not affect anything above.
+try {
+  $pf = Join-Path $dir "GETALLPLU.XML"
+  if (Test-Path $pf) {
+    $px = LoadXml $pf; $sb = New-Object Text.StringBuilder; $n = 0
+    foreach ($p in $px.DocumentElement.SelectNodes("*[local-name()='PLU']")) {
+      if ((T $p (P "upcModifier")) -ne "000") { continue }
+      $u = T $p (P "upc"); if ($u.Length -lt 13) { continue }
+      $k13 = $u.Substring(0, 13); $num = [decimal]$k13
+      $key = if ($num -lt 1000000) { [string]$num } else { $k13.Substring(2) }
+      $d = (T $p (P "description")) -replace "[\t\r\n]", " "
+      [void]$sb.Append($key + "`t" + $d + "`t" + (T $p (P "department")) + "`t" + (T $p (P "price")) + "`n"); $n++
+    }
+    $ms = New-Object IO.MemoryStream; $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Compress)
+    $bytes = [Text.Encoding]::UTF8.GetBytes($sb.ToString()); $gz.Write($bytes, 0, $bytes.Length); $gz.Close()
+    $json = '{"file":"' + [Convert]::ToBase64String($ms.ToArray()) + '","polled":"' + (Get-Item $pf).LastWriteTime.ToString("s") + '"}'
+    $r = Invoke-RestMethod -Method Post -Uri "$Url/api/reg-plu?store=$Store" -Headers @{ "x-import-token" = $Token } -ContentType "application/json" -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 180
+    Log ("Register item list sent: $n items (saved " + $r.saved + ")")
+  } else { Log "Register item list: no GETALLPLU.XML in $dir." }
+} catch { Log ("Register item list upload failed: " + $_.Exception.Message); $errors += ("Register item list upload failed: " + $_.Exception.Message) }
 
 # Self-update: if the app has a newer version of this script, check it and install it for the next run.
 # The new script must arrive intact (SHA-256 matches), carry the Store HQ marker and its version number, and parse as valid PowerShell.

@@ -973,6 +973,18 @@ async function ownerApi(req, env, path, url) {
     const n = await pushAlert(env, "Store HQ alerts are on", "This phone will get a notification when a gas tank runs low or shows water.", "/#sales");
     return json({ ok: true, phones: list.length, sent: n });
   }
+  if (path === "/api/reg-plu" && req.method === "POST") {
+    // Nightly from the store PC: every item as the registers have it (gzipped tab text: key, name, dept, price). Kept as [[key, name, dept, price]].
+    const b = await readBody(req, 6e6);
+    const txt = await new Response(new Blob([b64ToBytes(String(b.file || ""))]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+    const items = [];
+    for (const line of txt.split("\n")) { const f = line.split("\t"); if (f.length < 4 || !/^[0-9]{1,13}$/.test(f[0])) continue; items.push([f[0], f[1].trim().slice(0, 40), f[2].slice(0, 6), Math.round(Number(f[3]) * 100) / 100 || 0]); }
+    if (!items.length) return json({ error: "no items" }, 400);
+    const text = JSON.stringify({ polled: String(b.polled || "").slice(0, 25), items });
+    if (text.length > 1.95e6) return json({ error: "too big" }, 413);
+    await env.DB.prepare("INSERT INTO inv_blob (key, text, updated) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET text = excluded.text, updated = excluded.updated").bind("reg:" + S, text, Date.now()).run();
+    return json({ ok: true, saved: items.length });
+  }
   if (path === "/api/tank-read" && req.method === "POST") {
     // Every 6 hours from the store PC (tankread.ps1): a live tank reading the register got from the tank gauge.
     // Tanks: [name, gallons, room (ullage), water inches, temperature F, fuel height inches]. Failed reads are kept too, so the owner sees why.
@@ -1166,8 +1178,10 @@ async function ownerApi(req, env, path, url) {
     if (!r) return json({ none: true });
     const m = JSON.parse(r.data), pb = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("pb:" + S).first();
     const look = new Map(); if (pb) { try { for (const it of JSON.parse(pb.text).items || []) if (!look.has(it[0])) look.set(it[0], it); } catch {} }
-    // The name SSCS sold it under wins: a PLU can be reused for a new item after the saved price book copy was made.
-    const rows = (m.rows || []).map(x => { const it = look.get(x[0]); return [x[0], x[4] || (it ? it[1] : x[0]), String(x[1]), x[2], x[3], it ? Number(it[4]) || 0 : 0]; });
+    // Names: the registers' current item list (sent every night by the store PC) wins, then the name SSCS sold it under,
+    // then the saved price book copy. A PLU number can be reused for a new item, so the newest name is the right one.
+    const reg = new Map(); try { const rb = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("reg:" + S).first(); if (rb) for (const it of JSON.parse(rb.text).items || []) reg.set(it[0], it); } catch {}
+    const rows = (m.rows || []).map(x => { const it = look.get(x[0]), rg = reg.get(x[0]) || reg.get(String(x[0]).replace(/^0+/, "")); return [x[0], (rg && rg[1]) || x[4] || (it ? it[1] : x[0]), String(x[1]), x[2], x[3], (rg && rg[3]) || (it ? Number(it[4]) || 0 : 0)]; });
     return json({ cur: m.cur, prev: m.prev, source: m.source || "", depts: m.depts || null, updated: r.updated, rows });
   }
   if (path === "/api/movers" && req.method === "POST") {
@@ -2048,7 +2062,7 @@ export default {
       if (pStore) { owner = true; req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.set("x-store", pStore); h.set("x-partner", pStore); if (mgr) h.set("x-role", "manager"); else h.delete("x-role"); return h; })() }); url.searchParams.set("store", pStore); }
       else if (req.headers.get("x-role")) { req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.delete("x-role"); return h; })() }); }
       // Nightly pulls: may call ONLY /api/sscs-import and /api/voids-import, with the secret in the x-import-token header.
-      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
+      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/reg-plu" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
         safeEqual(await hmac("cmp", req.headers.get("x-import-token")), await hmac("cmp", env.SSCS_TOKEN));
       m = /^\/photo\/([a-z0-9]+)$/.exec(path);
       if (m) {
