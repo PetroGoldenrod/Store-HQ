@@ -1166,7 +1166,8 @@ async function ownerApi(req, env, path, url) {
     if (!r) return json({ none: true });
     const m = JSON.parse(r.data), pb = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("pb:" + S).first();
     const look = new Map(); if (pb) { try { for (const it of JSON.parse(pb.text).items || []) if (!look.has(it[0])) look.set(it[0], it); } catch {} }
-    const rows = (m.rows || []).map(x => { const it = look.get(x[0]); return [x[0], it ? it[1] : (x[4] || x[0]), String(x[1]), x[2], x[3], it ? Number(it[4]) || 0 : 0]; });
+    // The name SSCS sold it under wins: a PLU can be reused for a new item after the saved price book copy was made.
+    const rows = (m.rows || []).map(x => { const it = look.get(x[0]); return [x[0], x[4] || (it ? it[1] : x[0]), String(x[1]), x[2], x[3], it ? Number(it[4]) || 0 : 0]; });
     return json({ cur: m.cur, prev: m.prev, source: m.source || "", depts: m.depts || null, updated: r.updated, rows });
   }
   if (path === "/api/movers" && req.method === "POST") {
