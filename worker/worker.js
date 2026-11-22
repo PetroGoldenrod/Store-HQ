@@ -963,6 +963,16 @@ async function ownerApi(req, env, path, url) {
     await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'pc', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(d), d.at).run();
     return json({ ok: true });
   }
+  if (path.startsWith("/api/push/") && req.headers.get("x-partner")) return json({ error: "Phone alerts are for the owner login." }, 403);
+  if (path === "/api/push/key" && req.method === "GET") return json({ key: (await vapidKeys(env)).pub, phones: (await pushSubs(env)).length });
+  if (path === "/api/push/sub" && req.method === "POST") {
+    const b = await readBody(req, 4000), sub = b.sub || {}, ep = String(sub.endpoint || "");
+    if (!/^https:\/\//.test(ep)) return json({ error: "bad subscription" }, 400);
+    const list = (await pushSubs(env)).filter(x => x.endpoint !== ep); list.push({ endpoint: ep, at: Date.now(), ua: String(req.headers.get("user-agent") || "").slice(0, 120) });
+    await savePushSubs(env, list);
+    const n = await pushAlert(env, "Store HQ alerts are on", "This phone will get a notification when a gas tank runs low or shows water.", "/#sales");
+    return json({ ok: true, phones: list.length, sent: n });
+  }
   if (path === "/api/tank-read" && req.method === "POST") {
     // Every 6 hours from the store PC (tankread.ps1): a live tank reading the register got from the tank gauge.
     // Tanks: [name, gallons, room (ullage), water inches, temperature F, fuel height inches]. Failed reads are kept too, so the owner sees why.
@@ -1397,8 +1407,55 @@ async function tankAlerts(env, S, tanks) {
   try { const r = await env.DB.prepare("SELECT data FROM inv_store WHERE store = ?").bind(S).first(); if (r) store = JSON.parse(r.data).name || store; } catch {}
   const when = new Date().toLocaleString("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "2-digit" });
   const text = store + " tank reading, " + when + ":\n\n" + lines.join("\n") + "\n\nAll tanks now:\n" + tanks.map(t => { const num = (/#(\d+)$/.exec(t[0] || "") || [])[1] || t[0], g = Number(t[1]) || 0, cap = g + (Number(t[2]) || 0); return "  " + (TN[num] || t[0]) + ": " + Math.round(g).toLocaleString("en-US") + " gal (" + (cap ? Math.round(g / cap * 100) : 0) + "%)"; }).join("\n") + "\n\nStore HQ reads the tanks every 6 hours (Sales page, Tanks now).";
+  try { await pushAlert(env, (lines.some(l => /full \(/.test(l)) ? "Gas low at " : "Tank alert at ") + store, lines.join("\n"), "/#sales"); } catch (e) { console.error("tank push", e && e.message); }
   await smtpSend(env, { to: String(env.DAILY_MAIL_TO || MAIL_USER(env)).trim(), fromName: "Store HQ", subject: (lines.some(l => /full \(/.test(l)) ? "Gas low at " : "Tank alert at ") + store + ": " + lines.map(l => l.split(":")[0]).filter((v, i, a) => a.indexOf(v) === i).join(", "), text });
 }
+// ---- Phone push alerts (Web Push). The owner turns them on once per phone from the Sales page.
+// Pushes carry no data (no payload encryption needed): the phone wakes up and asks /api/push/latest for the newest alerts,
+// proving it is a registered phone by sending its own subscription address. VAPID keys are made once and kept in D1.
+function b64u(bytes) { let s = ""; const b = new Uint8Array(bytes); for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+async function vapidKeys(env) {
+  const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'vapid'").first();
+  if (r) return JSON.parse(r.data);
+  const kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const k = { priv: await crypto.subtle.exportKey("jwk", kp.privateKey), pub: b64u(await crypto.subtle.exportKey("raw", kp.publicKey)) };
+  await env.DB.prepare("INSERT OR IGNORE INTO store_kv (store, k, data, updated) VALUES ('*', 'vapid', ?, ?)").bind(JSON.stringify(k), Date.now()).run();
+  return JSON.parse((await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'vapid'").first()).data);
+}
+async function pushSubs(env) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pushsubs'").first(); try { return r ? JSON.parse(r.data) : []; } catch { return []; } }
+async function savePushSubs(env, list) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES ('*', 'pushsubs', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(JSON.stringify(list.slice(-10)), Date.now()).run(); }
+async function pushAlert(env, title, body, url) {
+  // Keep the last 20 messages for phones to fetch, then wake every registered phone.
+  const cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pushmsg'").first();
+  let msgs = []; try { msgs = cur ? JSON.parse(cur.data) : []; } catch {}
+  msgs.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), at: Date.now(), title: String(title).slice(0, 120), body: String(body).slice(0, 500), url: url || "/" });
+  await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES ('*', 'pushmsg', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(JSON.stringify(msgs.slice(-20)), Date.now()).run();
+  const subs = await pushSubs(env); if (!subs.length) return 0;
+  const k = await vapidKeys(env), key = await crypto.subtle.importKey("jwk", k.priv, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const enc = o => b64u(new TextEncoder().encode(JSON.stringify(o)));
+  let sent = 0; const keep = [];
+  for (const sub of subs) {
+    try {
+      const aud = new URL(sub.endpoint).origin, unsigned = enc({ typ: "JWT", alg: "ES256" }) + "." + enc({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: "mailto:" + String(MAIL_USER(env) || "owner@example.com") });
+      const sig = b64u(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(unsigned)));
+      const r = await fetch(sub.endpoint, { method: "POST", headers: { TTL: "86400", Urgency: "high", Authorization: "vapid t=" + unsigned + "." + sig + ", k=" + k.pub, "Content-Length": "0" } });
+      if (r.status === 404 || r.status === 410) continue; // phone turned alerts off or uninstalled
+      if (r.ok) sent++; else console.error("push", r.status, (await r.text()).slice(0, 200));
+    } catch (e) { console.error("push", e && e.message); }
+    keep.push(sub);
+  }
+  if (keep.length !== subs.length) await savePushSubs(env, keep);
+  return sent;
+}
+const SW_JS = `self.addEventListener("install",function(){self.skipWaiting()});
+self.addEventListener("activate",function(e){e.waitUntil(self.clients.claim())});
+self.addEventListener("push",function(e){e.waitUntil(self.registration.pushManager.getSubscription().then(function(sub){
+  return fetch("/api/push/latest",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({endpoint:sub?sub.endpoint:""})}).then(function(r){return r.json()})}).then(function(j){
+  var m=(j&&j.msgs&&j.msgs.length)?j.msgs[j.msgs.length-1]:{title:"Store HQ",body:"New alert. Open Store HQ.",url:"/"};
+  return self.registration.showNotification(m.title,{body:m.body,tag:m.id||"storehq",icon:"/icon.png",badge:"/icon.png",data:{url:m.url||"/"}})}).catch(function(){
+  return self.registration.showNotification("Store HQ",{body:"New alert. Open Store HQ.",icon:"/icon.png"})}))});
+self.addEventListener("notificationclick",function(e){e.notification.close();var u=(e.notification.data&&e.notification.data.url)||"/";
+  e.waitUntil(self.clients.matchAll({type:"window"}).then(function(cs){for(var i=0;i<cs.length;i++){if("focus" in cs[i])return cs[i].focus()}return self.clients.openWindow(u)}))});`;
 async function smtpSend(env, m) {
   const user = MAIL_USER(env), pass = String(env.GMAIL_APP_PASSWORD || "").replace(/\s+/g, "");
   if (!pass) throw new Error("Email isn't set up yet (no Gmail app password in Cloudflare).");
@@ -1912,6 +1969,15 @@ export default {
       if (!env.DB) return html(setupPage("The database isn't connected yet. In Cloudflare, add a D1 database binding named DB to this Worker."), 500);
       await ensureSchema(env);
       if (path === "/" || path === "/owner") return html(OWNER_HTML);
+      if (path === "/sw.js") return new Response(SW_JS, { headers: { "content-type": "application/javascript", "cache-control": "no-cache", "service-worker-allowed": "/" } });
+      if (path === "/api/push/latest" && req.method === "POST") {
+        // A phone woken by a push asks for the newest alerts. Only registered phones (by their subscription address) get them.
+        const b = await readBody(req, 4000), ep = String(b.endpoint || "");
+        if (!ep || !(await pushSubs(env)).some(x => x.endpoint === ep)) return json({ msgs: [] }, 403);
+        const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pushmsg'").first();
+        let msgs = []; try { msgs = r ? JSON.parse(r.data) : []; } catch {}
+        return json({ msgs: msgs.filter(x => Date.now() - x.at < 2 * 86400e3).slice(-3) });
+      }
       if (path === "/desk" && req.method === "GET") return html(DESK_HTML);
       if (path === "/apple-touch-icon.png" || path === "/apple-touch-icon-precomposed.png" || path === "/icon.png") return new Response(b64ToBytes(ICON_B64), { headers: { "content-type": "image/png", "cache-control": "no-cache" } });
       if (path === "/inv.js") return new Response(INV_JS, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" } });
@@ -2846,7 +2912,19 @@ function renderTanks(L){var el=$("tanksNow");if(!el)return;L=L||[];if(!L.length)
       h+='<tr><td>'+esc(t[0])+'</td><td class="r num">'+Math.round(g).toLocaleString()+'</td><td class="r num">'+pct+'%'+(pct<25?' <span class="pill bad">Low</span>':'')+'</td><td class="r num">'+Math.round(room).toLocaleString()+'</td><td class="r num">'+w+(w>=1?' <span class="pill bad">Check</span>':'')+'</td>'+(prev?'<td class="r num">'+(p===null?'':(p>0?'+':'')+Math.round(p).toLocaleString()+(p>500?' <span class="pill">Delivery?</span>':''))+'</td>':'')+'</tr>'});
     h+='</tbody></table></div>'}
   if(!newest.ok)h+='<div class="msg err" style="margin-top:8px">The last reading at '+esc(when(newest.at))+' didn’t work: '+esc(newest.err||"no tanks in the answer")+'</div>';
-  el.innerHTML=h+'</div>'}
+  h+='<div style="margin-top:10px"><button type="button" class="alt" id="pushOn">Get phone alerts when a tank runs low</button> <span class="mute" id="pushMsg"></span></div>';
+  el.innerHTML=h+'</div>';$("pushOn").addEventListener("click",pushOn);
+  try{if(window.Notification&&Notification.permission==="granted"&&navigator.serviceWorker)navigator.serviceWorker.getRegistration("/").then(function(r){return r&&r.pushManager.getSubscription()}).then(function(s){if(s){$("pushOn").textContent="Phone alerts are on (tap to re-check)";}}).catch(function(){})}catch(e){}}
+function pushOn(){var m=$("pushMsg");
+  if(!("serviceWorker" in navigator)||!window.PushManager||!window.Notification){m.textContent=/iPhone|iPad/.test(navigator.userAgent)?"On iPhone: tap Share, then Add to Home Screen, open Store HQ from that icon and tap this again.":"This browser can’t do notifications. Use Chrome on your phone.";return}
+  m.textContent="Turning on…";
+  Notification.requestPermission().then(function(p){if(p!=="granted")throw new Error("Notifications are blocked for this site. Allow them in the browser settings and try again.");
+    return Promise.all([navigator.serviceWorker.register("/sw.js",{scope:"/"}).then(function(){return navigator.serviceWorker.ready}),api("/api/push/key")])})
+  .then(function(a){var reg=a[0],k=a[1].key.replace(/-/g,"+").replace(/_/g,"/"),raw=atob(k+"===".slice((k.length+3)%4)),u=new Uint8Array(raw.length);for(var i=0;i<raw.length;i++)u[i]=raw.charCodeAt(i);
+    return reg.pushManager.getSubscription().then(function(s){return s||reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:u})})})
+  .then(function(sub){return api("/api/push/sub",{method:"POST",body:{sub:sub.toJSON()}})})
+  .then(function(j){m.textContent="Done. A test notification is on its way.";$("pushOn").textContent="Phone alerts are on (tap to re-check)"})
+  .catch(function(e){m.textContent=e.message==="signin"?"":"Couldn’t turn on: "+e.message})}
 function renderSales(){var j=SALES,by={};renderTanks(j.tanks);j.days.forEach(function(d){(by[d.date]=by[d.date]||[]).push(d)});
   var X=j.extra||{},rows=Object.keys(by).sort().map(function(k){return dsRow(dsum(by[k]),X[k])});
   var up=j.lastUpload?new Date(j.lastUpload).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}):"never";
