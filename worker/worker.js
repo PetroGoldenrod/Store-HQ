@@ -818,6 +818,7 @@ async function storeChecks(env, S, c) {
   for (const d of [addDays(t, -1), t]) out.push({ date: d, list: dayChecks(await dayDataFull(env, S, d, c), now, tz) });
   return out;
 }
+const TANK_NAMES = { "655675": { "1": "Regular", "2": "Diesel", "3": "Premium" } };
 async function ownerApi(req, env, path, url) {
   const c = cfg(env), S = storeOf(req, url), MGR = req.headers.get("x-role") === "manager";
   if (MGR && MANAGER_BLOCKED.test(path)) return json({ error: "Not available on a manager login." }, 403);
@@ -1099,6 +1100,9 @@ async function ownerApi(req, env, path, url) {
     const ex = {}; ((await env.DB.prepare("SELECT date, p, v FROM sales_extra WHERE store = ? AND date LIKE ?").bind(S, mo + "-%").all()).results || []).forEach(r => (ex[r.date] = { p: r.p, v: r.v }));
     const tk = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tanks'").bind(S).first();
     let tanks = []; try { tanks = tk ? JSON.parse(tk.data).slice(-12) : []; } catch {}
+    // Owner's names for the tanks, by tank number (the register's own labels are off at Goldenrod).
+    const TN = TANK_NAMES[S] || {};
+    tanks.forEach(r => (r.tanks || []).forEach(t => { const n = (/#(\d+)$/.exec(t[0] || "") || [])[1]; if (n && TN[n]) t[0] = TN[n]; }));
     // Rows are stored as JSON already; pass them through without parsing (keeps CPU low).
     return new Response('{"month":"' + mo + '","lastUpload":' + (last && last.r ? last.r : 0) + ',"tanks":' + JSON.stringify(tanks) + ',"extra":' + JSON.stringify(ex) + ',"days":[' + rows.map(r => r.data).join(",") + "]}", { headers: { "content-type": "application/json", "cache-control": "no-store" } });
   }
