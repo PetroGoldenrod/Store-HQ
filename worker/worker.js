@@ -818,7 +818,7 @@ async function storeChecks(env, S, c) {
   for (const d of [addDays(t, -1), t]) out.push({ date: d, list: dayChecks(await dayDataFull(env, S, d, c), now, tz) });
   return out;
 }
-const TANK_NAMES = { "655675": { "1": "Regular", "2": "Diesel", "3": "Premium" } };
+const TANK_NAMES = { "655675": { "1": "Regular", "2": "Diesel", "3": "Premium" }, "654287": { "1": "Regular", "2": "Plus", "3": "Premium" } };
 async function ownerApi(req, env, path, url) {
   const c = cfg(env), S = storeOf(req, url), MGR = req.headers.get("x-role") === "manager";
   if (MGR && MANAGER_BLOCKED.test(path)) return json({ error: "Not available on a manager login." }, 403);
