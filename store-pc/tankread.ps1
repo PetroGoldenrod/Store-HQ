@@ -15,7 +15,7 @@ param(
   [string]$Url = "https://closeout.petro-goldenrod.workers.dev",
   [switch]$Setup
 )
-$ScriptVersion = 1
+$ScriptVersion = 2
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -69,10 +69,14 @@ if ($Setup) {
   Write-Host ""
   Write-Host "Store HQ tank readings - store $Store, register $Register"
   Write-Host "Type a register (Commander) login that can run reports. It is saved encrypted on this PC only."
-  $c = Get-Credential -Message "Register (Commander) login for tank readings"
-  if (-not $c) { Log "Setup cancelled."; exit 1 }
-  $c | Export-Clixml -Path $credFile
-  Log "Register login saved for Windows user $env:USERNAME."
+  $keep = $false
+  if (Test-Path $credFile) { $a = Read-Host "A register login is already saved. Press Enter to keep it, or type N to enter a new one"; $keep = ($a -notmatch '^\s*n') }
+  if (-not $keep) {
+    $c = Get-Credential -Message "Register (Commander) login for tank readings"
+    if (-not $c) { Log "Setup cancelled."; exit 1 }
+    $c | Export-Clixml -Path $credFile
+    Log "Register login saved for Windows user $env:USERNAME."
+  }
 }
 
 if (-not (Test-Path $credFile)) { Log "No register login saved yet. Run 'Setup tank readings.bat' once."; Send-Reading @() "No register login saved on the store PC yet (run the setup once)" "" | Out-Null; exit 1 }
@@ -118,11 +122,17 @@ $sent = Send-Reading $tanks $err $how
 
 if ($Setup) {
   if ($tanks.Count) {
-    $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
-    $tr = '"' + $ps + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Site ' + $Site
-    schtasks /Create /F /TN "StoreHQ Tank Reading" /SC HOURLY /MO 6 /ST 00:00 /TR $tr | Out-Null
-    if ($LASTEXITCODE -eq 0) { Log "Scheduled: every 6 hours (12 AM, 6 AM, 12 PM, 6 PM) while this Windows user is signed in." ; Write-Host ""; Write-Host "All set. The first reading is already in Store HQ (Sales page)." }
-    else { Log "Couldn't create the scheduled task (schtasks exit $LASTEXITCODE)." }
+    # Four daily triggers (12 AM, 6 AM, 12 PM, 6 PM) for this Windows user, while signed in (the saved login only works for this user).
+    try {
+      $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+      $act = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Site ' + $Site) -WorkingDirectory $here
+      $trg = @("00:00", "06:00", "12:00", "18:00") | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ }
+      $set = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+      $pri = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive
+      Register-ScheduledTask -TaskName "StoreHQ Tank Reading" -Action $act -Trigger $trg -Settings $set -Principal $pri -Force | Out-Null
+      $ok = $true
+    } catch { $ok = $false; Log ("Couldn't create the scheduled task: " + $_.Exception.Message) }
+    if ($ok) { Log "Scheduled: every 6 hours (12 AM, 6 AM, 12 PM, 6 PM) while this Windows user is signed in." ; Write-Host ""; Write-Host "All set. The first reading is already in Store HQ (Sales page)." }
   } else {
     Write-Host ""; Write-Host "The test reading didn't work, so nothing was scheduled. Store HQ has the reason; tell Claude."
   }
