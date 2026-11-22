@@ -1113,7 +1113,7 @@ async function ownerApi(req, env, path, url) {
     let tanks = []; try { tanks = tk ? JSON.parse(tk.data).slice(-12) : []; } catch {}
     // Owner's names for the tanks, by tank number (the register's own labels are off at Goldenrod).
     const TN = TANK_NAMES[S] || {};
-    tanks.forEach(r => (r.tanks || []).forEach(t => { const n = (/#(\d+)$/.exec(t[0] || "") || [])[1]; if (n && TN[n]) t[0] = TN[n]; }));
+    tanks.forEach(r => (r.tanks || []).forEach(t => { const n = (/#(\d+)$/.exec(t[0] || "") || [])[1]; if (n && TN[n]) t[0] = TN[n]; const g = Number(t[1]) || 0; t[6] = tankLevel(t[0], g, g + (Number(t[2]) || 0)) > 0; t[7] = TANK_ALERT_GAL[t[0]] || 0; }));
     // Rows are stored as JSON already; pass them through without parsing (keeps CPU low).
     return new Response('{"month":"' + mo + '","lastUpload":' + (last && last.r ? last.r : 0) + ',"tanks":' + JSON.stringify(tanks) + ',"extra":' + JSON.stringify(ex) + ',"days":[' + rows.map(r => r.data).join(",") + "]}", { headers: { "content-type": "application/json", "cache-control": "no-store" } });
   }
@@ -1389,6 +1389,9 @@ function mailHeader(s) { s = String(s).replace(/[\r\n]+/g, " "); return /^[\x20-
 // Email the owner when a tank drops under 25% full (low) or 15% (very low), or shows 1 inch of water or more.
 // Each alert is sent once when the tank crosses into it; a delivery that fills the tank back up resets it.
 const TANK_LOW = 0.25, TANK_VERY_LOW = 0.15, TANK_WATER = 1;
+// Owner's alert points in gallons, by tank name (both stores). Tanks not listed here use the 25% / 15% rule.
+const TANK_ALERT_GAL = { Regular: 1500, Diesel: 1200, Premium: 1200 };
+function tankLevel(name, g, cap) { const lim = TANK_ALERT_GAL[name]; if (lim) return g < lim ? 1 : 0; const pct = cap ? g / cap : 1; return pct < TANK_VERY_LOW ? 2 : pct < TANK_LOW ? 1 : 0; }
 async function tankAlerts(env, S, tanks) {
   const cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tankalert'").bind(S).first();
   let st = {}; try { st = cur ? JSON.parse(cur.data) : {}; } catch {}
@@ -1396,8 +1399,8 @@ async function tankAlerts(env, S, tanks) {
   for (const t of tanks) {
     const num = (/#(\d+)$/.exec(t[0] || "") || [])[1] || t[0], name = TN[num] || t[0], g = Number(t[1]) || 0, cap = g + (Number(t[2]) || 0), w = Number(t[3]) || 0;
     if (!cap) continue;
-    const pct = g / cap, lvl = pct < TANK_VERY_LOW ? 2 : pct < TANK_LOW ? 1 : 0, wet = w >= TANK_WATER ? 1 : 0, was = st[num] || { lvl: 0, wet: 0 };
-    if (lvl > was.lvl) lines.push(name + ": " + Math.round(g).toLocaleString("en-US") + " gallons left, " + Math.round(pct * 100) + "% full" + (lvl === 2 ? " (VERY LOW)" : " (low)") + ". Room for " + Math.round(cap - g).toLocaleString("en-US") + " gallons.");
+    const pct = g / cap, lim = TANK_ALERT_GAL[name], lvl = tankLevel(name, g, cap), wet = w >= TANK_WATER ? 1 : 0, was = st[num] || { lvl: 0, wet: 0 };
+    if (lvl > was.lvl) lines.push(name + ": " + Math.round(g).toLocaleString("en-US") + " gallons left, " + Math.round(pct * 100) + "% full" + (lim ? " (under your " + lim.toLocaleString("en-US") + " gallon alert)" : lvl === 2 ? " (VERY LOW)" : " (low)") + ". Room for " + Math.round(cap - g).toLocaleString("en-US") + " gallons.");
     if (wet && !was.wet) lines.push(name + ": " + w + " inches of water in the tank. Have it checked.");
     next[num] = { lvl, wet };
   }
@@ -1407,8 +1410,8 @@ async function tankAlerts(env, S, tanks) {
   try { const r = await env.DB.prepare("SELECT data FROM inv_store WHERE store = ?").bind(S).first(); if (r) store = JSON.parse(r.data).name || store; } catch {}
   const when = new Date().toLocaleString("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "2-digit" });
   const text = store + " tank reading, " + when + ":\n\n" + lines.join("\n") + "\n\nAll tanks now:\n" + tanks.map(t => { const num = (/#(\d+)$/.exec(t[0] || "") || [])[1] || t[0], g = Number(t[1]) || 0, cap = g + (Number(t[2]) || 0); return "  " + (TN[num] || t[0]) + ": " + Math.round(g).toLocaleString("en-US") + " gal (" + (cap ? Math.round(g / cap * 100) : 0) + "%)"; }).join("\n") + "\n\nStore HQ reads the tanks every 6 hours (Sales page, Tanks now).";
-  try { await pushAlert(env, (lines.some(l => /full \(/.test(l)) ? "Gas low at " : "Tank alert at ") + store, lines.join("\n"), "/#sales"); } catch (e) { console.error("tank push", e && e.message); }
-  await smtpSend(env, { to: String(env.DAILY_MAIL_TO || MAIL_USER(env)).trim(), fromName: "Store HQ", subject: (lines.some(l => /full \(/.test(l)) ? "Gas low at " : "Tank alert at ") + store + ": " + lines.map(l => l.split(":")[0]).filter((v, i, a) => a.indexOf(v) === i).join(", "), text });
+  try { await pushAlert(env, (lines.some(l => /% full/.test(l)) ? "Gas low at " : "Tank alert at ") + store, lines.join("\n"), "/#sales"); } catch (e) { console.error("tank push", e && e.message); }
+  await smtpSend(env, { to: String(env.DAILY_MAIL_TO || MAIL_USER(env)).trim(), fromName: "Store HQ", subject: (lines.some(l => /% full/.test(l)) ? "Gas low at " : "Tank alert at ") + store + ": " + lines.map(l => l.split(":")[0]).filter((v, i, a) => a.indexOf(v) === i).join(", "), text });
 }
 // ---- Phone push alerts (Web Push). The owner turns them on once per phone from the Sales page.
 // Pushes carry no data (no payload encryption needed): the phone wakes up and asks /api/push/latest for the newest alerts,
@@ -2902,14 +2905,14 @@ function dsRow(o,x){var cg=0,kg=0;Object.keys(o.grades).forEach(function(k){cg+=
 var CARD_RATES={"V":[1.95,0.17],"M":[1.95,0.17],"MF":[1.95,0.17],"AX":[2.80,0.17],"DS":[2.20,0.20],"DC":[2.40,0.15],"DB":[1.00,0.18],"EB":[1.00,0],"WX":[2.85,0.45],"VG":[2.85,0.45],"SA":[1.87,0.22]},CARD_RATE_DEFAULT=[1.95,0.17];
 function cardFeeEst(per){var f=0,a=0;per.forEach(function(d){(d.cards||[]).forEach(function(c){var r=CARD_RATES[c[0]]||CARD_RATE_DEFAULT;f+=(+c[2]||0)*r[0]/100+(+c[1]||0)*r[1];a+=+c[2]||0})});return a?{f:f,a:a}:null}
 function dsCalc(r){var D=r.c-r.s+r.ob+r.t,cards=r.j+r.k,H=r.g-cards;return {D:D,cards:cards,H:H,W:r.v!==null?r.v-H:null,AB:r.y*0.05+r.z*0.15,AD:r.v!==null?r.m-r.v:null}}
-// Live tank readings (every 6 hours from the store PC). Low = under a quarter full; water 1 inch or more needs a look.
+// Live tank readings (every 6 hours from the store PC). Low = under the owner's gallon alert (or a quarter full); water 1 inch or more needs a look.
 function renderTanks(L){var el=$("tanksNow");if(!el)return;L=L||[];if(!L.length){el.innerHTML="";return}
   var ok=L.filter(function(r){return r.ok}),last=ok[ok.length-1],newest=L[L.length-1],h='<div class="card" style="margin:0 0 14px"><h2>Tanks now</h2>';
   function when(t){return new Date(t).toLocaleString("en-US",{weekday:"short",hour:"numeric",minute:"2-digit"})}
   if(last){var prev=ok.length>1?ok[ok.length-2]:null;
     h+='<div class="mute" style="margin:2px 0 8px">Read from the tank gauge '+esc(when(last.at))+(prev?' · change since '+esc(when(prev.at)):'')+'</div><div class="tw"><table style="min-width:0"><thead><tr><th>Tank</th><th class="r">Gallons</th><th class="r">Full</th><th class="r">Room</th><th class="r">Water</th>'+(prev?'<th class="r">Change</th>':'')+'</tr></thead><tbody>';
     last.tanks.forEach(function(t,i){var g=+t[1]||0,room=+t[2]||0,cap=g+room,pct=cap?Math.round(g/cap*100):0,w=+t[3]||0,p=prev&&prev.tanks[i]&&prev.tanks[i][0]===t[0]?g-(+prev.tanks[i][1]||0):null;
-      h+='<tr><td>'+esc(t[0])+'</td><td class="r num">'+Math.round(g).toLocaleString()+'</td><td class="r num">'+pct+'%'+(pct<25?' <span class="pill bad">Low</span>':'')+'</td><td class="r num">'+Math.round(room).toLocaleString()+'</td><td class="r num">'+w+(w>=1?' <span class="pill bad">Check</span>':'')+'</td>'+(prev?'<td class="r num">'+(p===null?'':(p>0?'+':'')+Math.round(p).toLocaleString()+(p>500?' <span class="pill">Delivery?</span>':''))+'</td>':'')+'</tr>'});
+      h+='<tr><td>'+esc(t[0])+'</td><td class="r num">'+Math.round(g).toLocaleString()+'</td><td class="r num">'+pct+'%'+((t[6]!==undefined?t[6]:pct<25)?' <span class="pill bad">Low</span>':'')+(t[7]?'<div class="mute" style="font-size:.8em">alert under '+(+t[7]).toLocaleString()+' gal</div>':'')+'</td><td class="r num">'+Math.round(room).toLocaleString()+'</td><td class="r num">'+w+(w>=1?' <span class="pill bad">Check</span>':'')+'</td>'+(prev?'<td class="r num">'+(p===null?'':(p>0?'+':'')+Math.round(p).toLocaleString()+(p>500?' <span class="pill">Delivery?</span>':''))+'</td>':'')+'</tr>'});
     h+='</tbody></table></div>'}
   if(!newest.ok)h+='<div class="msg err" style="margin-top:8px">The last reading at '+esc(when(newest.at))+' didn’t work: '+esc(newest.err||"no tanks in the answer")+'</div>';
   h+='<div style="margin-top:10px"><button type="button" class="alt" id="pushOn">Get phone alerts when a tank runs low</button> <span class="mute" id="pushMsg"></span></div>';
