@@ -1020,6 +1020,7 @@ async function ownerApi(req, env, path, url) {
     await saveCigDoc(env, S, doc);
     return json({ ok: true });
   }
+  if (path === "/api/tanks" && req.method === "GET") return json({ tanks: await tanksFor(env, S) });
   if (path === "/api/registers/send" && req.method === "POST") {
     // Owner taps "Send to registers": the store PC (regsend.ps1, every 5 minutes) picks this up and runs VS-Poll /SENDITEMS.
     if (req.headers.get("x-partner")) return json({ error: "Only the owner login can send to the registers." }, 403);
@@ -1195,11 +1196,7 @@ async function ownerApi(req, env, path, url) {
     const last = await env.DB.prepare("SELECT MAX(received) AS r FROM vs_day WHERE store = ?").bind(S).first();
     await env.DB.prepare(SALES_EXTRA_SQL).run();
     const ex = {}; ((await env.DB.prepare("SELECT date, p, v FROM sales_extra WHERE store = ? AND date LIKE ?").bind(S, mo + "-%").all()).results || []).forEach(r => (ex[r.date] = { p: r.p, v: r.v }));
-    const tk = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tanks'").bind(S).first();
-    let tanks = []; try { tanks = tk ? JSON.parse(tk.data).slice(-12) : []; } catch {}
-    // Owner's names for the tanks, by tank number (the register's own labels are off at Goldenrod).
-    const TN = TANK_NAMES[S] || {};
-    tanks.forEach(r => (r.tanks || []).forEach(t => { const n = (/#(\d+)$/.exec(t[0] || "") || [])[1]; if (n && TN[n]) t[0] = TN[n]; const g = Number(t[1]) || 0; t[6] = tankLevel(t[0], g, g + (Number(t[2]) || 0)) > 0; t[7] = TANK_ALERT_GAL[t[0]] || 0; }));
+    const tanks = await tanksFor(env, S);
     // Rows are stored as JSON already; pass them through without parsing (keeps CPU low).
     return new Response('{"month":"' + mo + '","lastUpload":' + (last && last.r ? last.r : 0) + ',"tanks":' + JSON.stringify(tanks) + ',"extra":' + JSON.stringify(ex) + ',"days":[' + rows.map(r => r.data).join(",") + "]}", { headers: { "content-type": "application/json", "cache-control": "no-store" } });
   }
@@ -1508,6 +1505,14 @@ async function tankAlerts(env, S, tanks) {
 async function cigDoc(env, S) {
   const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'cigs'").bind(S).first();
   try { return r ? JSON.parse(r.data) : { groups: [] }; } catch { return { groups: [] }; }
+}
+// The last 12 tank readings, with the owner's tank names, the low flag and the gallon alert point per tank.
+async function tanksFor(env, S) {
+  const tk = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tanks'").bind(S).first();
+  let tanks = []; try { tanks = tk ? JSON.parse(tk.data).slice(-12) : []; } catch {}
+  const TN = TANK_NAMES[S] || {};
+  tanks.forEach(r => (r.tanks || []).forEach(t => { const n = (/#(\d+)$/.exec(t[0] || "") || [])[1]; if (n && TN[n]) t[0] = TN[n]; const g = Number(t[1]) || 0; t[6] = tankLevel(t[0], g, g + (Number(t[2]) || 0)) > 0; t[7] = TANK_ALERT_GAL[t[0]] || 0; }));
+  return tanks;
 }
 async function regSendDoc(env, S) {
   const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'regsend'").bind(S).first();
@@ -2422,6 +2427,8 @@ main{max-width:760px}
 .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:8px 0 14px;overflow-x:auto}
 .tabs button{white-space:nowrap;background:none;color:var(--muted);border-radius:0;border-bottom:3px solid transparent;padding:10px 12px;font-weight:600}
 .tabs button.on{color:var(--ink);border-bottom-color:var(--accent)}
+.subnav{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:-4px 0 14px;background:var(--paper)}
+.subnav button{width:auto;margin:0;border:0;border-radius:0;background:none;color:var(--muted);padding:8px 16px;font-weight:600}.subnav button.on{background:var(--accent);color:var(--accent-ink)}
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}.bar input{width:auto;flex:1;min-width:150px}
 .shift{background:var(--paper);border:1px solid var(--line);border-radius:12px;margin-bottom:12px;overflow:hidden}
 .shift>.h{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}
@@ -2535,7 +2542,7 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 /* Phone: no sideways scrolling. Tabs wrap; tables become stacked cards with each value labelled. */
 @media (max-width:640px){
 .tabs{flex-wrap:wrap;overflow:visible;gap:0 2px}
-.tabs button{padding:8px 9px;font-size:.95rem}
+.tabs button{padding:8px 6px;font-size:.95rem}
 .tw{overflow:visible!important;padding-left:2px;padding-right:2px}
 .tw table{min-width:0!important;width:100%}
 .tw table,.tw tbody,.tw tr,.tw td{display:block}
@@ -2551,10 +2558,11 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 .tw td .drops{justify-content:flex-end}
 }
 </style></head><body><main>
-<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h1 style="margin:0">Store <span>HQ</span></h1><select id="store" aria-label="Store" style="width:auto;font-weight:700" hidden></select></div>
+<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h1 style="margin:0">Store <span>HQ</span></h1><div style="display:flex;gap:8px;align-items:center"><select id="store" aria-label="Store" style="width:auto;font-weight:700" hidden></select><button type="button" class="alt sm" id="signout" hidden>Sign out</button></div></div>
 <section id="login" hidden><div class="card"><label for="pw">Password</label><input type="password" id="pw" autocomplete="current-password"><button id="lg" style="margin-top:12px;width:100%">Sign in</button><div id="lmsg"></div></div></section>
 <div id="app" hidden>
-<div class="tabs" role="tablist"><button data-v="home" class="on">Home</button><button data-v="day">Shifts</button><button data-v="staff">Staff</button><button data-v="pay">Payroll</button><button data-v="sales">Sales</button><button data-v="pl">P&amp;L</button><button data-v="movers">Movers</button><button data-v="cigs">Cigs</button><button data-v="gas">Gas</button><button data-v="out" style="margin-left:auto">Sign out</button></div>
+<div class="tabs" role="tablist"><button data-v="home" class="on">Today</button><button data-v="day">Shifts</button><button data-v="people">People</button><button data-v="sales">Sales</button><button data-v="pl">Profit</button><button data-v="store">Store</button></div>
+<div class="subnav" id="subnav" hidden></div>
 <section id="v-home"><div id="home"><div class="mute">Loading…</div></div></section>
 <section id="v-day" hidden>
  <div class="bar"><button class="alt sm" id="prev" aria-label="Previous day">‹</button><input type="date" id="date"><button class="alt sm" id="next" aria-label="Next day">›</button><button class="alt sm" id="rf">Refresh</button></div>
@@ -2584,7 +2592,6 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  <div class="ds">
   <div class="nav"><button type="button" id="mprev">‹ Prev</button><b id="mname">Loading…</b><button type="button" id="mnext">Next ›</button></div>
   <p class="sub" id="ssub"></p>
-  <div id="tanksNow"></div>
   <div id="sales"><div class="empty">Loading your days…</div></div>
  </div>
 </section>
@@ -2620,6 +2627,7 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
   <p class="mute" style="margin:10px 0 0;font-size:.85rem">Tap a row for its cost, buydown and where each number came from. Profit is shelf price minus cost after buydown. Carton = 10 packs − $2.50.</p></div>
  </div>
 </section>
+<section id="v-tanks" hidden><div id="tanksNow"></div></section>
 <section id="v-gas" hidden>
  <div class="gasp">
   <div class="card"><h2 id="gsT">Gas prices</h2>
@@ -2672,28 +2680,40 @@ $("invbox").addEventListener("toggle",function(){if(this.open)loadInv()});
 function today(){var d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function addDays(s,n){var d=new Date(s+"T12:00:00");d.setDate(d.getDate()+n);return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function fmtDay(s){var d=new Date(s+"T12:00:00");return d.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}
-function show(signed){$("login").hidden=signed;$("app").hidden=!signed;if(signed){loadStores();var on=document.querySelector(".tabs button.on");if(!on||on.dataset.v==="home")loadHome();else loadDay()}}
+function show(signed){$("login").hidden=signed;$("app").hidden=!signed;$("signout").hidden=!signed;if(signed){loadStores();loadView()}}
 // Phone: tables turn into stacked cards, so each cell carries its column name.
 function labelTables(){document.querySelectorAll(".tw table").forEach(function(t){var hr=t.tHead&&t.tHead.rows[t.tHead.rows.length-1];if(!hr)return;var names=[];
   Array.prototype.forEach.call(hr.cells,function(c){for(var i=0;i<(c.colSpan||1);i++)names.push(c.textContent.trim())});
   Array.prototype.forEach.call(t.tBodies,function(tb){Array.prototype.forEach.call(tb.rows,function(r){var i=0;Array.prototype.forEach.call(r.cells,function(c){if(!c.hasAttribute("data-label")&&names[i])c.setAttribute("data-label",names[i]);i+=c.colSpan||1})})})})}
 new MutationObserver(function(){if(labelTables.p)return;labelTables.p=requestAnimationFrame(function(){labelTables.p=0;labelTables()})}).observe(document.body,{childList:true,subtree:true});
-function goTab(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.click()}
+// Six tabs. Sales and Store have two views each; old names (staff, pay, movers, gas, cigs) still work for links.
+var VIEW={home:{s:["home"]},day:{s:["day"]},people:{s:["staff","pay"]},pl:{s:["pl"]},
+  sales:{sub:[["daily","Daily",["sales"]],["movers","Movers",["movers"]]]},store:{sub:[["fuel","Fuel",["tanks","gas"]],["cigs","Cig prices",["cigs"]]]}};
+var SUB={sales:"daily",store:"fuel"},CUR="home";
+var OLD={staff:["people"],pay:["people"],movers:["sales","movers"],gas:["store","fuel"],cigs:["store","cigs"]};
+function curSections(){var V=VIEW[CUR];if(V.s)return V.s;var sb=V.sub.filter(function(x){return x[0]===SUB[CUR]})[0]||V.sub[0];return sb[2]}
+function loadView(){var sec=curSections();sec.forEach(function(k){({home:loadHome,day:loadDay,staff:loadStaff,pay:loadPay,sales:loadSales,movers:loadMV,pl:loadPL,cigs:loadCG,gas:loadGas,tanks:loadTanks})[k]()})}
+function openView(v,sub){if(OLD[v]){sub=OLD[v][1]||sub;v=OLD[v][0]}if(!VIEW[v])v="home";CUR=v;if(sub)SUB[v]=sub;
+  if(MANAGER&&v==="store")SUB.store="fuel";
+  document.querySelectorAll(".tabs button").forEach(function(x){x.classList.toggle("on",x.dataset.v===v)});
+  var V=VIEW[v],sn=$("subnav");
+  if(V.sub){sn.hidden=false;sn.innerHTML=V.sub.filter(function(x){return !(MANAGER&&x[0]==="cigs")}).map(function(x){return '<button type="button" data-sub="'+x[0]+'" class="'+(SUB[v]===x[0]?"on":"")+'">'+x[1]+'</button>'}).join("");if(sn.children.length<2)sn.hidden=true}else{sn.hidden=true;sn.innerHTML=""}
+  var show=curSections();["home","day","staff","pay","sales","pl","movers","cigs","tanks","gas"].forEach(function(k){$("v-"+k).hidden=show.indexOf(k)<0});
+  $("store").style.visibility=(v==="home"||PARTNER)?"hidden":"";loadView()}
+function goTab(v){openView(v)}
+$("subnav").addEventListener("click",function(e){var b=e.target.closest("button");if(b)openView(CUR,b.dataset.sub)});
+$("signout").addEventListener("click",function(){fetch("/api/logout",{method:"POST"}).then(function(){show(false)})});
 var PARTNER=false,MANAGER=false;
-function applyRole(){["sales","pl","movers","cigs"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER){var on=document.querySelector(".tabs button.on");if(on&&/^(sales|pl|movers|cigs)$/.test(on.dataset.v))goTab("home")}}
+function applyRole(){["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl)$/.test(CUR)||(CUR==="store"&&SUB.store==="cigs")))openView("home");else if(CUR==="store")openView("store")}
 function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
   $("store").innerHTML=L.map(function(s){return '<option value="'+esc(s.store)+'"'+(s.store===STORE?" selected":"")+'>'+esc(s.name)+'</option>'}).join("");$("store").hidden=L.length<2}).catch(function(){})}
 $("store").addEventListener("change",function(){STORE=this.value;try{localStorage.setItem("store",STORE)}catch(e){}
-  var on=document.querySelector(".tabs button.on"),v=on?on.dataset.v:"day";if(v==="staff")loadStaff();else if(v==="pay")loadPay();else if(v==="sales")loadSales();else if(v==="pl")loadPL();else if(v==="movers")loadMV();else if(v==="cigs")loadCG();else if(v==="gas")loadGas();else if(v==="home")loadHome();else loadDay()});
+  loadView()});
 $("lg").addEventListener("click",login);$("pw").addEventListener("keydown",function(e){if(e.key==="Enter")login()});
 function login(){$("lg").disabled=true;fetch("/api/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:$("pw").value})})
   .then(function(r){return r.json().then(function(j){$("lg").disabled=false;if(r.ok){$("pw").value="";show(true)}else $("lmsg").innerHTML='<div class="msg err">'+esc(j.error||"Wrong password.")+'</div>'})})
   .catch(function(){$("lg").disabled=false;$("lmsg").innerHTML='<div class="msg err">No connection.</div>'})}
-document.querySelector(".tabs").addEventListener("click",function(e){var b=e.target.closest("button");if(!b)return;var v=b.dataset.v;
-  if(v==="out"){fetch("/api/logout",{method:"POST"}).then(function(){show(false)});return}
-  document.querySelectorAll(".tabs button").forEach(function(x){x.classList.toggle("on",x===b)});
-  ["home","day","staff","pay","sales","pl","movers","cigs","gas"].forEach(function(k){$("v-"+k).hidden=k!==v});$("store").style.visibility=(v==="home"||PARTNER)?"hidden":"";if(v==="sales")loadSales();if(v==="pl")loadPL();if(v==="movers")loadMV();if(v==="cigs")loadCG();if(v==="gas")loadGas();if(v==="home")loadHome();
-  if(v==="day")loadDay();if(v==="staff")loadStaff();if(v==="pay")loadPay();});
+document.querySelector(".tabs").addEventListener("click",function(e){var b=e.target.closest("button");if(b)openView(b.dataset.v)});
 
 /* ---------- cig prices ---------- */
 var CG={d:null,open:""};
@@ -3117,7 +3137,8 @@ function pushOn(){var m=$("pushMsg");
   .then(function(sub){return api("/api/push/sub",{method:"POST",body:{sub:sub.toJSON()}})})
   .then(function(j){m.textContent="Done. A test notification is on its way.";$("pushOn").textContent="Phone alerts are on (tap to re-check)"})
   .catch(function(e){m.textContent=e.message==="signin"?"":"Couldn’t turn on: "+e.message})}
-function renderSales(){var j=SALES,by={};renderTanks(j.tanks);j.days.forEach(function(d){(by[d.date]=by[d.date]||[]).push(d)});
+function loadTanks(){api("/api/tanks").then(function(j){renderTanks(j.tanks)}).catch(function(){})}
+function renderSales(){var j=SALES,by={};j.days.forEach(function(d){(by[d.date]=by[d.date]||[]).push(d)});
   var X=j.extra||{},rows=Object.keys(by).sort().map(function(k){return dsRow(dsum(by[k]),X[k])});
   var up=j.lastUpload?new Date(j.lastUpload).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}):"never";
   var Y=+salesMonth.slice(0,4),M=+salesMonth.slice(5,7),dim=new Date(Y,M,0).getDate(),filled=rows.length,done=filled>=dim;
