@@ -962,6 +962,18 @@ async function ownerApi(req, env, path, url) {
     await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'pc', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(d), d.at).run();
     return json({ ok: true });
   }
+  if (path === "/api/tank-read" && req.method === "POST") {
+    // Every 6 hours from the store PC (tankread.ps1): a live tank reading the register got from the tank gauge.
+    // Tanks: [name, gallons, room (ullage), water inches, temperature F, fuel height inches]. Failed reads are kept too, so the owner sees why.
+    const b = await readBody(req, 2e4), num = v => (isFinite(Number(v)) ? Math.round(Number(v) * 100) / 100 : null);
+    const tanks = (Array.isArray(b.tanks) ? b.tanks : []).slice(0, 12).map(t => [String((t && t[0]) || "").slice(0, 30), num(t[1]), num(t[2]), num(t[3]), num(t[4]), num(t[5])]);
+    const rec = { at: Date.now(), ok: tanks.length > 0, tanks, err: String(b.err || "").slice(0, 300), how: String(b.how || "").slice(0, 80), ver: Number(b.version) || 0 };
+    const cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tanks'").bind(S).first();
+    let list = []; try { list = cur ? JSON.parse(cur.data) : []; } catch {}
+    list.push(rec); list = list.slice(-120);
+    await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'tanks', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(list), rec.at).run();
+    return json({ ok: true });
+  }
   if (path === "/api/pc-script" && req.method === "GET") {
     // The newest upload script for the store PCs (they update themselves after their nightly run).
     const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pcscript'").first();
@@ -1085,8 +1097,10 @@ async function ownerApi(req, env, path, url) {
     const last = await env.DB.prepare("SELECT MAX(received) AS r FROM vs_day WHERE store = ?").bind(S).first();
     await env.DB.prepare(SALES_EXTRA_SQL).run();
     const ex = {}; ((await env.DB.prepare("SELECT date, p, v FROM sales_extra WHERE store = ? AND date LIKE ?").bind(S, mo + "-%").all()).results || []).forEach(r => (ex[r.date] = { p: r.p, v: r.v }));
+    const tk = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tanks'").bind(S).first();
+    let tanks = []; try { tanks = tk ? JSON.parse(tk.data).slice(-12) : []; } catch {}
     // Rows are stored as JSON already; pass them through without parsing (keeps CPU low).
-    return new Response('{"month":"' + mo + '","lastUpload":' + (last && last.r ? last.r : 0) + ',"extra":' + JSON.stringify(ex) + ',"days":[' + rows.map(r => r.data).join(",") + "]}", { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+    return new Response('{"month":"' + mo + '","lastUpload":' + (last && last.r ? last.r : 0) + ',"tanks":' + JSON.stringify(tanks) + ',"extra":' + JSON.stringify(ex) + ',"days":[' + rows.map(r => r.data).join(",") + "]}", { headers: { "content-type": "application/json", "cache-control": "no-store" } });
   }
   if (path === "/api/pnl" && req.method === "GET") {
     // Everything on the P&L page for one store: bills/rebates, gross profit by month, month-end checklist.
@@ -1936,7 +1950,7 @@ export default {
       if (pStore) { owner = true; req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.set("x-store", pStore); h.set("x-partner", pStore); if (mgr) h.set("x-role", "manager"); else h.delete("x-role"); return h; })() }); url.searchParams.set("store", pStore); }
       else if (req.headers.get("x-role")) { req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.delete("x-role"); return h; })() }); }
       // Nightly pulls: may call ONLY /api/sscs-import and /api/voids-import, with the secret in the x-import-token header.
-      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
+      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
         safeEqual(await hmac("cmp", req.headers.get("x-import-token")), await hmac("cmp", env.SSCS_TOKEN));
       m = /^\/photo\/([a-z0-9]+)$/.exec(path);
       if (m) {
@@ -2354,6 +2368,7 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  <div class="ds">
   <div class="nav"><button type="button" id="mprev">‹ Prev</button><b id="mname">Loading…</b><button type="button" id="mnext">Next ›</button></div>
   <p class="sub" id="ssub"></p>
+  <div id="tanksNow"></div>
   <div id="sales"><div class="empty">Loading your days…</div></div>
  </div>
 </section>
@@ -2793,7 +2808,18 @@ function dsRow(o,x){var cg=0,kg=0;Object.keys(o.grades).forEach(function(k){cg+=
 var CARD_RATES={"V":[1.95,0.17],"M":[1.95,0.17],"MF":[1.95,0.17],"AX":[2.80,0.17],"DS":[2.20,0.20],"DC":[2.40,0.15],"DB":[1.00,0.18],"EB":[1.00,0],"WX":[2.85,0.45],"VG":[2.85,0.45],"SA":[1.87,0.22]},CARD_RATE_DEFAULT=[1.95,0.17];
 function cardFeeEst(per){var f=0,a=0;per.forEach(function(d){(d.cards||[]).forEach(function(c){var r=CARD_RATES[c[0]]||CARD_RATE_DEFAULT;f+=(+c[2]||0)*r[0]/100+(+c[1]||0)*r[1];a+=+c[2]||0})});return a?{f:f,a:a}:null}
 function dsCalc(r){var D=r.c-r.s+r.ob+r.t,cards=r.j+r.k,H=r.g-cards;return {D:D,cards:cards,H:H,W:r.v!==null?r.v-H:null,AB:r.y*0.05+r.z*0.15,AD:r.v!==null?r.m-r.v:null}}
-function renderSales(){var j=SALES,by={};j.days.forEach(function(d){(by[d.date]=by[d.date]||[]).push(d)});
+// Live tank readings (every 6 hours from the store PC). Low = under a quarter full; water 1 inch or more needs a look.
+function renderTanks(L){var el=$("tanksNow");if(!el)return;L=L||[];if(!L.length){el.innerHTML="";return}
+  var ok=L.filter(function(r){return r.ok}),last=ok[ok.length-1],newest=L[L.length-1],h='<div class="card" style="margin:0 0 14px"><h2>Tanks now</h2>';
+  function when(t){return new Date(t).toLocaleString("en-US",{weekday:"short",hour:"numeric",minute:"2-digit"})}
+  if(last){var prev=ok.length>1?ok[ok.length-2]:null;
+    h+='<div class="mute" style="margin:2px 0 8px">Read from the tank gauge '+esc(when(last.at))+(prev?' · change since '+esc(when(prev.at)):'')+'</div><div class="tw"><table style="min-width:0"><thead><tr><th>Tank</th><th class="r">Gallons</th><th class="r">Full</th><th class="r">Room</th><th class="r">Water</th>'+(prev?'<th class="r">Change</th>':'')+'</tr></thead><tbody>';
+    last.tanks.forEach(function(t,i){var g=+t[1]||0,room=+t[2]||0,cap=g+room,pct=cap?Math.round(g/cap*100):0,w=+t[3]||0,p=prev&&prev.tanks[i]&&prev.tanks[i][0]===t[0]?g-(+prev.tanks[i][1]||0):null;
+      h+='<tr><td>'+esc(t[0])+'</td><td class="r num">'+Math.round(g).toLocaleString()+'</td><td class="r num">'+pct+'%'+(pct<25?' <span class="pill bad">Low</span>':'')+'</td><td class="r num">'+Math.round(room).toLocaleString()+'</td><td class="r num">'+w+(w>=1?' <span class="pill bad">Check</span>':'')+'</td>'+(prev?'<td class="r num">'+(p===null?'':(p>0?'+':'')+Math.round(p).toLocaleString()+(p>500?' <span class="pill">Delivery?</span>':''))+'</td>':'')+'</tr>'});
+    h+='</tbody></table></div>'}
+  if(!newest.ok)h+='<div class="msg err" style="margin-top:8px">The last reading at '+esc(when(newest.at))+' didn’t work: '+esc(newest.err||"no tanks in the answer")+'</div>';
+  el.innerHTML=h+'</div>'}
+function renderSales(){var j=SALES,by={};renderTanks(j.tanks);j.days.forEach(function(d){(by[d.date]=by[d.date]||[]).push(d)});
   var X=j.extra||{},rows=Object.keys(by).sort().map(function(k){return dsRow(dsum(by[k]),X[k])});
   var up=j.lastUpload?new Date(j.lastUpload).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}):"never";
   var Y=+salesMonth.slice(0,4),M=+salesMonth.slice(5,7),dim=new Date(Y,M,0).getDate(),filled=rows.length,done=filled>=dim;
