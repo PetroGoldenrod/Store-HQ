@@ -26,3 +26,9 @@ head_sampling_rate = 1
 enabled = true
 head_sampling_rate = 1
 invocation_logs = true
+
+# Store PC scripts are bundled as text so the PCs can update themselves from /api/pc-script.
+[[rules]]
+type = "Text"
+globs = ["**/*.ps1"]
+fallthrough = true

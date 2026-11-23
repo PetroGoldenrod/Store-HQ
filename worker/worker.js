@@ -6,6 +6,8 @@
 // Optional secret: GMAIL_APP_PASSWORD (a Google app password for GMAIL_USER, default petro.goldenrod@gmail.com;
 //   lets the app email invoice files to Sunray by itself)
 import { connect } from "cloudflare:sockets";
+import TANKREAD_PS1 from "../store-pc/tankread.ps1";
+import VSUPLOAD_PS1 from "../store-pc/vsupload.ps1";
 // Optional variables: MODEL (default claude-sonnet-5-5), FLAG_AMOUNT (default 3),
 //   HOURS_PER_SHIFT (default 8), PAY_WEEK_START (0=Sun..6=Sat, default 5 = Friday).
 
@@ -1008,7 +1010,15 @@ async function ownerApi(req, env, path, url) {
     await saveCigDoc(env, S, doc);
     return json({ ok: true });
   }
-  if (path === "/api/tanks" && req.method === "GET") return json({ tanks: await tanksFor(env, S) });
+  if (path === "/api/tanks" && req.method === "GET") { const q = await tankReqDoc(env, S); return json({ tanks: await tanksFor(env, S), req: q, every: TANK_EVERY_MIN }); }
+  if (path === "/api/tanks/readnow" && req.method === "POST") {
+    // "Read now" on the Fuel page: the store PC checks every 5 minutes and reads the tanks right away.
+    const cur = await tankReqDoc(env, S), now = Date.now();
+    if ((cur.status === "waiting" || cur.status === "running") && now - cur.requested < 10 * 60e3) return json({ ok: true, req: cur });
+    const q = { id: String(now), status: "waiting", requested: now, pcSeen: cur.pcSeen || 0, pcVer: cur.pcVer || 0 };
+    await saveTankReq(env, S, q);
+    return json({ ok: true, req: q });
+  }
   if (path === "/api/registers/send" && req.method === "POST") {
     // Owner taps "Send to registers": the store PC (regsend.ps1, every 5 minutes) picks this up and runs VS-Poll /SENDITEMS.
     if (req.headers.get("x-partner")) return json({ error: "Only the owner login can send to the registers." }, 403);
@@ -1059,10 +1069,27 @@ async function ownerApi(req, env, path, url) {
     list.push(rec); list = list.slice(-120);
     await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'tanks', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(list), rec.at).run();
     if (rec.ok) { try { await tankAlerts(env, S, tanks); } catch (e) { console.error("tank alert", e && e.message); } }
+    try { const q = await tankReqDoc(env, S); if ((q.status === "waiting" || q.status === "running") && b.req && String(b.req) === String(q.id)) { q.status = rec.ok ? "done" : "failed"; q.finished = rec.at; q.err = rec.err; await saveTankReq(env, S, q); } } catch {}
     return json({ ok: true });
   }
+  if (path === "/api/pc-tankreq" && req.method === "GET") {
+    // Every 5 minutes from the store PC (tankread.ps1 -Poll): how often to read the tanks, and whether someone tapped "Read now".
+    const cur = await tankReqDoc(env, S), now = Date.now();
+    let read = null;
+    if ((cur.status === "waiting" || cur.status === "running") && now - cur.requested < 30 * 60e3) { read = cur.id; if (cur.status === "waiting") { cur.status = "running"; cur.started = now; } }
+    else if (cur.status === "waiting" || cur.status === "running") cur.status = "expired";
+    cur.pcSeen = now; cur.pcVer = Number(url.searchParams.get("v")) || 0;
+    await saveTankReq(env, S, cur);
+    return json({ read, every: TANK_EVERY_MIN });
+  }
   if (path === "/api/pc-script" && req.method === "GET") {
-    // The newest upload script for the store PCs (they update themselves after their nightly run).
+    // The newest store PC scripts (they update themselves). ?name=tankread for the tank reading script.
+    // Served from the scripts bundled with this deploy (store-pc/*.ps1), so a git push is all it takes to update the PCs.
+    const txt = url.searchParams.get("name") === "tankread" ? TANKREAD_PS1 : VSUPLOAD_PS1, vm = /\$ScriptVersion = (\d+)/.exec(txt);
+    if (vm) {
+      const sha = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(txt)))].map(b => b.toString(16).padStart(2, "0")).join("");
+      return json({ version: +vm[1], sha256: sha, script: txt });
+    }
     const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pcscript'").first();
     if (!r) return json({ error: "none" }, 404);
     return new Response(r.data, { headers: { "content-type": "application/json", "cache-control": "no-store" } });
@@ -1544,7 +1571,7 @@ async function homeAttention(env, S, MGR, st) {
         if (t[6]) A.push({ lvl: "bad", t: t[0] + " is low: " + g.toLocaleString("en-US") + " gal", d: t[7] ? "Alert point is " + t[7].toLocaleString("en-US") + " gal. Read " + when(good.at) + "." : "Read " + when(good.at) + ".", tab: "store", sub: "fuel" });
         if ((Number(t[3]) || 0) >= TANK_WATER) A.push({ lvl: "warn", t: "Water in " + t[0] + ": " + t[3] + " in", d: "Read " + when(good.at) + ".", tab: "store", sub: "fuel" });
       }
-      if (now - good.at > 13 * 36e5) A.push({ lvl: "warn", t: "No tank reading since " + when(good.at), d: last && !last.ok && last.err ? String(last.err).slice(0, 160) : "Readings come every 6 hours from the store PC.", tab: "store", sub: "fuel" });
+      if (now - good.at > 7 * 36e5) A.push({ lvl: "warn", t: "No tank reading since " + when(good.at), d: last && !last.ok && last.err ? String(last.err).slice(0, 160) : "Readings come every 2 hours from the store PC.", tab: "store", sub: "fuel" });
     }
   } catch {}
   if (MGR) return A;
@@ -1581,6 +1608,9 @@ async function homeAttention(env, S, MGR, st) {
   } catch {}
   return A;
 }
+const TANK_EVERY_MIN = 120; // scheduled tank readings: every 2 hours (the store PC follows this number)
+async function tankReqDoc(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tankreq'").bind(S).first(); try { return r ? JSON.parse(r.data) : {}; } catch { return {}; } }
+async function saveTankReq(env, S, d) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'tankreq', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(d), Date.now()).run(); }
 async function regSendDoc(env, S) {
   const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'regsend'").bind(S).first();
   try { return r ? JSON.parse(r.data) : {}; } catch { return {}; }
@@ -2237,7 +2267,7 @@ export default {
       if (pStore) { owner = true; req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.set("x-store", pStore); h.set("x-partner", pStore); if (mgr) h.set("x-role", "manager"); else h.delete("x-role"); return h; })() }); url.searchParams.set("store", pStore); }
       else if (req.headers.get("x-role")) { req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.delete("x-role"); return h; })() }); }
       // Nightly pulls: may call ONLY /api/sscs-import and /api/voids-import, with the secret in the x-import-token header.
-      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/reg-plu" || path === "/api/pc-regsend" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
+      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/pc-tankreq" || path === "/api/reg-plu" || path === "/api/pc-regsend" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
         safeEqual(await hmac("cmp", req.headers.get("x-import-token")), await hmac("cmp", env.SSCS_TOKEN));
       m = /^\/photo\/([a-z0-9]+)$/.exec(path);
       if (m) {
@@ -3208,8 +3238,11 @@ function renderTanks(L){var el=$("tanksNow");if(!el)return;L=L||[];if(!L.length)
       h+='<tr><td>'+esc(t[0])+'</td><td class="r num">'+Math.round(g).toLocaleString()+'</td><td class="r num">'+pct+'%'+((t[6]!==undefined?t[6]:pct<25)?' <span class="pill bad">Low</span>':'')+(t[7]?'<div class="mute" style="font-size:.8em">alert under '+(+t[7]).toLocaleString()+' gal</div>':'')+'</td><td class="r num">'+Math.round(room).toLocaleString()+'</td><td class="r num">'+w+(w>=1?' <span class="pill bad">Check</span>':'')+'</td>'+(prev?'<td class="r num">'+(p===null?'':(p>0?'+':'')+Math.round(p).toLocaleString()+(p>500?' <span class="pill">Delivery?</span>':''))+'</td>':'')+'</tr>'});
     h+='</tbody></table></div>'}
   if(!newest.ok)h+='<div class="msg err" style="margin-top:8px">The last reading at '+esc(when(newest.at))+' didn’t work: '+esc(newest.err||"no tanks in the answer")+'</div>';
+  h+='<div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button type="button" id="tankNow">Read now</button><span class="mute" id="tankNowMsg" style="flex:1;min-width:180px">'+esc(tqText())+'</span></div>';
   h+='<div style="margin-top:10px"><button type="button" class="alt" id="pushOn">Get phone alerts when a tank runs low</button> <span class="mute" id="pushMsg"></span></div>';
   el.innerHTML=h+'</div>';$("pushOn").addEventListener("click",pushOn);
+  $("tankNow").addEventListener("click",function(){var b=this;b.disabled=true;$("tankNowMsg").textContent="Asking the store PC…";
+    api("/api/tanks/readnow",{method:"POST",body:{}}).then(function(j){TQ=j.req||{};tqUntil=Date.now()+12*60e3;$("tankNowMsg").textContent=tqText();b.disabled=false;tqPoll()}).catch(function(e){$("tankNowMsg").textContent="Couldn’t ask the store PC: "+(e.message||e);b.disabled=false})});
   try{if(window.Notification&&Notification.permission==="granted"&&navigator.serviceWorker)navigator.serviceWorker.getRegistration("/").then(function(r){return r&&r.pushManager.getSubscription()}).then(function(s){if(s){$("pushOn").textContent="Phone alerts are on (tap to re-check)";}}).catch(function(){})}catch(e){}}
 function pushOn(){var m=$("pushMsg");
   if(!("serviceWorker" in navigator)||!window.PushManager||!window.Notification){m.textContent=/iPhone|iPad/.test(navigator.userAgent)?"On iPhone: tap Share, then Add to Home Screen, open Store HQ from that icon and tap this again.":"This browser can’t do notifications. Use Chrome on your phone.";return}
@@ -3221,7 +3254,15 @@ function pushOn(){var m=$("pushMsg");
   .then(function(sub){return api("/api/push/sub",{method:"POST",body:{sub:sub.toJSON()}})})
   .then(function(j){m.textContent="Done. A test notification is on its way.";$("pushOn").textContent="Phone alerts are on (tap to re-check)"})
   .catch(function(e){m.textContent=e.message==="signin"?"":"Couldn’t turn on: "+e.message})}
-function loadTanks(){api("/api/tanks").then(function(j){renderTanks(j.tanks)}).catch(function(){})}
+var TQ=null,tqTimer=null,tqUntil=0;
+function loadTanks(){api("/api/tanks").then(function(j){TQ=j.req||{};renderTanks(j.tanks);tqPoll()}).catch(function(){})}
+function tqPoll(){clearTimeout(tqTimer);var busy=TQ&&(TQ.status==="waiting"||TQ.status==="running")&&Date.now()-TQ.requested<30*60e3;if(busy&&Date.now()<tqUntil)tqTimer=setTimeout(function(){if(!$("v-tanks")||$("v-tanks").hidden)return;loadTanks()},20000)}
+function tqText(){var q=TQ||{},ago=function(t){var m=Math.round((Date.now()-t)/60000);return m<1?"just now":m+" min ago"};
+  if((q.status==="waiting"||q.status==="running")&&Date.now()-q.requested<30*60e3)return q.status==="running"?"The store PC is reading the tanks now…":"Asked the store PC "+ago(q.requested)+". The new reading shows here within about 5 minutes.";
+  if(q.status==="done"&&Date.now()-q.finished<15*60e3)return "Fresh reading done "+ago(q.finished)+".";
+  if(q.status==="failed"&&Date.now()-q.finished<60*60e3)return "That reading didn’t work: "+(q.err||"no answer from the register");
+  if(q.status==="expired"&&Date.now()-q.requested<60*60e3)return "The store PC didn’t pick it up. It needs this week’s update; it reads every 2 hours on its own once updated.";
+  return "Reads on its own every 2 hours.";}
 function renderSales(){var j=SALES,by={};j.days.forEach(function(d){(by[d.date]=by[d.date]||[]).push(d)});
   var X=j.extra||{},rows=Object.keys(by).sort().map(function(k){return dsRow(dsum(by[k]),X[k])});
   var up=j.lastUpload?new Date(j.lastUpload).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}):"never";

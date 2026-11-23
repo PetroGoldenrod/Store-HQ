@@ -9,7 +9,7 @@ param(
   [string]$Url = "https://closeout.petro-goldenrod.workers.dev",
   [string]$Token = ""
 )
-$ScriptVersion = 4
+$ScriptVersion = 5
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -163,5 +163,28 @@ try {
     }
   }
 } catch { if ($_.Exception.Message -notmatch "404") { Log ("Update check failed: " + $_.Exception.Message) } }
+
+# Tank reading script: if this PC has tankread.ps1 and Store HQ holds a newer one, install it (same checks as above).
+# The tank script then switches its own schedule on its next run.
+try {
+  $tp = Join-Path $here "tankread.ps1"
+  if (Test-Path $tp) {
+    $cur = 0; $m = Select-String -Path $tp -Pattern '^\$ScriptVersion = (\d+)' | Select-Object -First 1; if ($m) { $cur = [int]$m.Matches[0].Groups[1].Value }
+    $u = Invoke-RestMethod -Method Get -Uri "$Url/api/pc-script?store=$Store&name=tankread" -Headers @{ "x-import-token" = $Token } -TimeoutSec 60
+    if ([int]$u.version -gt $cur) {
+      $txt = [string]$u.script
+      $h = [Security.Cryptography.SHA256]::Create(); $got = ([BitConverter]::ToString($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($txt))) -replace "-", "").ToLower()
+      $ptok = $null; $perr = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($txt, [ref]$ptok, [ref]$perr)
+      if ($got -ne ([string]$u.sha256).ToLower()) { $errors += "Tank script update v$($u.version) skipped: checksum didn't match" }
+      elseif ($txt -notmatch "# StoreHQ-tankread" -or $txt -notmatch ('\$ScriptVersion = ' + [int]$u.version + '\b')) { $errors += "Tank script update v$($u.version) skipped: not a Store HQ tank script" }
+      elseif ($perr -and $perr.Count) { $errors += "Tank script update v$($u.version) skipped: it has a syntax error" }
+      else {
+        Copy-Item -Path $tp -Destination (Join-Path $here "tankread.prev.ps1") -Force
+        [IO.File]::WriteAllText($tp, $txt, (New-Object Text.UTF8Encoding $false))
+        Log ("Tank script updated from v$cur to v$($u.version).")
+      }
+    }
+  }
+} catch { if ($_.Exception.Message -notmatch "404") { Log ("Tank script update check failed: " + $_.Exception.Message) } }
 
 Send-Status ($errors.Count -eq 0)

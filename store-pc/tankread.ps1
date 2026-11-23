@@ -1,21 +1,23 @@
 # Store HQ tank reading
 # StoreHQ-tankread
-# Every 6 hours: asks the Verifone register (Commander) for its current tank report, which it reads live from the
-# Veeder-Root tank gauge, and sends gallons / room / water per tank to Store HQ. Read-only: it changes nothing on the
-# register, in Sunray or in SSCS, and never sends prices.
+# Every 2 hours (Store HQ sets the interval), and right away when someone taps "Read now" on the Fuel page: asks the
+# Verifone register (Commander) for its current tank report, which it reads live from the Veeder-Root tank gauge, and
+# sends gallons / room / water per tank to Store HQ. Read-only: it changes nothing on the register, in Sunray or in SSCS,
+# and never sends prices. A quiet check runs every 5 minutes (-Poll) and only reads the tanks when one is due.
 #
 # First time, on the store PC (in the same folder as vsupload.ps1 and token.txt):
 #   double-click "Setup tank readings.bat"  (or: powershell -ExecutionPolicy Bypass -File tankread.ps1 -Setup)
 # It asks for a register login (typed by the owner, saved encrypted for this Windows user only), tests one reading,
-# and schedules it at 12 AM, 6 AM, 12 PM and 6 PM.
+# and schedules the 5-minute check. Later versions arrive by themselves from Store HQ.
 param(
   [string]$Store = "655675",          # Circle K store number (Goldenrod 655675, Trail 654287)
   [string]$Site = "011",              # VSPoll folder for this store (Goldenrod 011, Trail 004)
   [string]$Register = "",             # register IP; read from the VSPoll setup file when empty
   [string]$Url = "https://closeout.petro-goldenrod.workers.dev",
-  [switch]$Setup
+  [switch]$Setup,
+  [switch]$Poll
 )
-$ScriptVersion = 2
+$ScriptVersion = 3
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -25,6 +27,57 @@ function Log($m) { $l = (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "  " + $m; Ad
 
 $Token = ""; $tf = Join-Path $here "token.txt"; if (Test-Path $tf) { $Token = (Get-Content $tf -Raw).Trim() }
 if (-not $Token) { Log "No upload token: put this script in the same folder as vsupload.ps1 and token.txt."; if ($Setup) { Read-Host "Press Enter to close" }; exit 1 }
+$H = @{ "x-import-token" = $Token }
+$TaskName = "StoreHQ Tank Reading"
+
+# The scheduled task: one quiet check every 5 minutes for this Windows user (the saved register login only works for this user).
+function Register-TankTask {
+  $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $act = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Site ' + $Site + ' -Poll') -WorkingDirectory $here
+  $trg = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+  $set = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+  $pri = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive
+  Register-ScheduledTask -TaskName $TaskName -Action $act -Trigger $trg -Settings $set -Principal $pri -Force | Out-Null
+}
+# Older versions ran at fixed times (12 AM, 6 AM, 12 PM, 6 PM). Switch this PC over to the 5-minute check once.
+function Ensure-TankTask {
+  try {
+    $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $ok = $t -and ($t.Actions | Where-Object { $_.Arguments -match '-Poll' }) -and ($t.Triggers | Where-Object { $_.Repetition.Interval -eq 'PT5M' })
+    if (-not $ok) { Register-TankTask; Log "Tank readings switched to a 5-minute check (reads every 2 hours, or right away on Read now)." }
+  } catch { Log ("Couldn't update the scheduled task: " + $_.Exception.Message) }
+}
+
+# Self-update: Store HQ can hold a newer tank script (checked once a day). It must arrive intact, carry the marker and
+# its version number, and parse as valid PowerShell. The current one is kept as tankread.prev.ps1.
+function Update-Self {
+  $stamp = Join-Path $here "tankread.updcheck"
+  if ((Test-Path $stamp) -and ((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalHours -lt 20) { return }
+  try {
+    Set-Content -Path $stamp -Value (Get-Date -Format s)
+    $u = Invoke-RestMethod -Method Get -Uri "$Url/api/pc-script?store=$Store&name=tankread" -Headers $H -TimeoutSec 60
+    if ([int]$u.version -le $ScriptVersion) { return }
+    $txt = [string]$u.script
+    $hh = [Security.Cryptography.SHA256]::Create(); $got = ([BitConverter]::ToString($hh.ComputeHash([Text.Encoding]::UTF8.GetBytes($txt))) -replace "-", "").ToLower()
+    $ptok = $null; $perr = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($txt, [ref]$ptok, [ref]$perr)
+    if ($got -ne ([string]$u.sha256).ToLower()) { Log "Tank script update skipped: checksum didn't match."; return }
+    if ($txt -notmatch "# StoreHQ-tankread" -or $txt -notmatch ('\$ScriptVersion = ' + [int]$u.version + '\b')) { Log "Tank script update skipped: not a Store HQ tank script."; return }
+    if ($perr -and $perr.Count) { Log "Tank script update skipped: syntax error."; return }
+    Copy-Item -Path $PSCommandPath -Destination (Join-Path $here "tankread.prev.ps1") -Force
+    [IO.File]::WriteAllText($PSCommandPath, $txt, (New-Object Text.UTF8Encoding $false))
+    Log ("Tank script updated from v$ScriptVersion to v$($u.version).")
+  } catch { if ($_.Exception.Message -notmatch "404") { Log ("Tank script update check failed: " + $_.Exception.Message) } }
+}
+
+# ---- Quiet 5-minute check: read only when Store HQ asks (Read now) or the next scheduled reading is due.
+$ReqId = ""; $every = 120
+if ($Poll) { try { $q = Invoke-RestMethod -Uri "$Url/api/pc-tankreq?store=$Store&v=$ScriptVersion" -Headers $H -TimeoutSec 30; if ($q.every -ge 30) { $every = [int]$q.every }; if ($q.read) { $ReqId = [string]$q.read } } catch {} }
+$now = Get-Date
+$slot = $now.ToString("yyyy-MM-dd") + "-" + [string][math]::Floor(($now.Hour * 60 + $now.Minute) / $every)
+$slotFile = Join-Path $here "tankread.slot"
+$lastSlot = if (Test-Path $slotFile) { ([string](Get-Content $slotFile -Raw)).Trim() } else { "" }
+if ($Poll -and -not $ReqId -and $lastSlot -eq $slot) { exit 0 }
+try { Set-Content -Path $slotFile -Value $slot } catch {}
 
 # Register address: the same one SSCS VS-Poll uses (MachineName in its setup file).
 if (-not $Register) {
@@ -52,7 +105,7 @@ public static class StoreHqRegisterCert {
 [StoreHqRegisterCert]::Use($Register)
 
 function Send-Reading($tanks, $err, $how) {
-  $body = [ordered]@{ version = $ScriptVersion; tanks = @($tanks); err = $err; how = $how } | ConvertTo-Json -Depth 5 -Compress
+  $body = [ordered]@{ version = $ScriptVersion; tanks = @($tanks); err = $err; how = $how; req = $ReqId } | ConvertTo-Json -Depth 5 -Compress
   try { Invoke-RestMethod -Method Post -Uri "$Url/api/tank-read?store=$Store" -Headers @{ "x-import-token" = $Token } -ContentType "application/json" -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 60 | Out-Null; return $true }
   catch { Log ("Upload to Store HQ failed: " + $_.Exception.Message); return $false }
 }
@@ -122,20 +175,14 @@ $sent = Send-Reading $tanks $err $how
 
 if ($Setup) {
   if ($tanks.Count) {
-    # Four daily triggers (12 AM, 6 AM, 12 PM, 6 PM) for this Windows user, while signed in (the saved login only works for this user).
-    try {
-      $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
-      $act = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Site ' + $Site) -WorkingDirectory $here
-      $trg = @("00:00", "06:00", "12:00", "18:00") | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ }
-      $set = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
-      $pri = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive
-      Register-ScheduledTask -TaskName "StoreHQ Tank Reading" -Action $act -Trigger $trg -Settings $set -Principal $pri -Force | Out-Null
-      $ok = $true
-    } catch { $ok = $false; Log ("Couldn't create the scheduled task: " + $_.Exception.Message) }
-    if ($ok) { Log "Scheduled: every 6 hours (12 AM, 6 AM, 12 PM, 6 PM) while this Windows user is signed in." ; Write-Host ""; Write-Host "All set. The first reading is already in Store HQ (Sales page)." }
+    try { Register-TankTask; $ok = $true } catch { $ok = $false; Log ("Couldn't create the scheduled task: " + $_.Exception.Message) }
+    if ($ok) { Log "Scheduled: a quiet check every 5 minutes while this Windows user is signed in. Reads every 2 hours, or right away on Read now."; Write-Host ""; Write-Host "All set. The first reading is already in Store HQ (Store > Fuel)." }
   } else {
     Write-Host ""; Write-Host "The test reading didn't work, so nothing was scheduled. Store HQ has the reason; tell Claude."
   }
   Read-Host "Press Enter to close"
+} else {
+  Ensure-TankTask
+  Update-Self
 }
 if ($tanks.Count) { exit 0 } else { exit 1 }
