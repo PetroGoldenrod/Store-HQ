@@ -1605,6 +1605,16 @@ async function vapidKeys(env) {
 }
 async function pushSubs(env) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pushsubs'").first(); try { return r ? JSON.parse(r.data) : []; } catch { return []; } }
 async function savePushSubs(env, list) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES ('*', 'pushsubs', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(JSON.stringify(list.slice(-30)), Date.now()).run(); }
+// Mondays at noon (New York): remind the owner's phones to add the weekly lottery report. Once per Monday; managers' phones don't get it.
+async function lotteryReminder(env) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date()).map(x => [x.type, x.value]));
+  if (p.weekday !== "Mon" || +p.hour !== 12) return;
+  const today = p.year + "-" + p.month + "-" + p.day;
+  const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'lotremind'").first();
+  if (r && JSON.parse(r.data).last === today) return;
+  await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES ('*', 'lotremind', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(JSON.stringify({ last: today }), Date.now()).run();
+  await pushAlert(env, "Weekly lottery report", "It's Monday: add this week's lottery report to Store HQ for Goldenrod and Trail.", "/", "owner");
+}
 async function pushAlert(env, title, body, url, store, onlyEp) {
   // Keep the last 20 messages for phones to fetch, then wake every registered phone.
   const cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'pushmsg'").first();
@@ -2142,6 +2152,7 @@ export default {
   async scheduled(ev, env, ctx) {
     if (env.DB) ctx.waitUntil(invSendReady(env).catch(() => {}));
     if (env.DB) ctx.waitUntil(ensureSchema(env).then(() => dailyMailDue(env)).catch(() => {}));
+    if (env.DB) ctx.waitUntil(lotteryReminder(env).catch(() => {}));
   },
   async fetch(req, env, ctx) {
     const url = new URL(req.url), path = url.pathname;
