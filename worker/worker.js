@@ -480,19 +480,23 @@ function addDays(dateStr, n) { const d = new Date(dateStr + "T00:00:00Z"); d.set
 function weekStartFor(dateStr, weekStart) { const d = new Date(dateStr + "T00:00:00Z"); const back = (d.getUTCDay() - weekStart + 7) % 7; return addDays(dateStr, -back); }
 function payroll(rows, staff, start, hours, ownerAdj) {
   const end = addDays(start, 6), seen = new Set(), by = {}, fullKeys = new Set();
+  // Shift 1 starts the night before (10 PM), so the first day's shift 1 belongs to the previous pay week and the
+  // day after the week's last day contributes its shift 1 (the last night of this week).
+  const inWeek = (date, k) => (date > start && date <= end) || (date === start && String(k) !== "1") || (date === addDays(end, 1) && String(k) === "1");
   // A person with their own shorter hours (e.g. the cook) can mark a day as a full shift when they cover.
   rows.forEach(r => { if (r.kind !== "shift") return; let d = {}; try { d = typeof r.data === "string" ? JSON.parse(r.data) : (r.data || {}); } catch {} if (d && d.full) covers(r.shift).forEach(k => fullKeys.add(r.staff_id + "|" + r.date + "|" + k)); });
   staff.forEach(s => (by[s.id] = { id: s.id, name: s.name, active: !!s.active, rate: s.rate || 0, perShift: s.hours > 0 ? Number(s.hours) : hours, base: 0, shifts: 0, days: [], adj: 0, notes: [] }));
   rows.forEach(r => {
-    if (r.date < start || r.date > end || !r.staff_id || !by[r.staff_id]) return;
+    if (!r.staff_id || !by[r.staff_id]) return;
     covers(r.shift).forEach(k => {
+      if (!inWeek(r.date, k)) return;
       const key = r.staff_id + "|" + r.date + "|" + k; if (seen.has(key)) return; seen.add(key);
       const full = fullKeys.has(key); by[r.staff_id].shifts++; by[r.staff_id].base += full ? hours : by[r.staff_id].perShift; by[r.staff_id].days.push(r.date + " S" + k + (full && by[r.staff_id].perShift !== hours ? " (full shift)" : ""));
     });
   });
   // Cover time moves minutes from the cashier who came late / left early to the one who covered; extra work adds minutes.
   rows.forEach(r => {
-    if (r.kind !== "shift" || r.date < start || r.date > end) return;
+    if (r.kind !== "shift" || !inWeek(r.date, covers(r.shift)[0])) return;
     let d = {}; try { d = typeof r.data === "string" ? JSON.parse(r.data) : (r.data || {}); } catch {}
     const when = r.date + " S" + r.shift, cv = d.cover, ex = d.extra;
     if (cv && cv.minutes > 0) {
@@ -1615,7 +1619,7 @@ async function ownerApi(req, env, path, url) {
   if (path === "/api/payroll" && req.method === "GET") {
     const ref = validDate(url.searchParams.get("date")) ? url.searchParams.get("date") : new Date().toISOString().slice(0, 10);
     const start = weekStartFor(ref, c.weekStart);
-    const rows = (await env.DB.prepare("SELECT id, date, shift, staff_id, staff_name, kind, data FROM closes WHERE store = ? AND date BETWEEN ? AND ?").bind(S, start, addDays(start, 6)).all()).results || [];
+    const rows = (await env.DB.prepare("SELECT id, date, shift, staff_id, staff_name, kind, data FROM closes WHERE store = ? AND date BETWEEN ? AND ?").bind(S, start, addDays(start, 7)).all()).results || [];
     const staff = (await env.DB.prepare("SELECT id, name, active, rate, hours FROM staff WHERE store = ?").bind(S).all()).results || [];
     let adjs = []; try { const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'payadj'").bind(S).first(); adjs = k ? JSON.parse(k.data) : []; } catch {}
     return json({ ...payroll(rows, staff, start, c.hours, adjs), hoursPerShift: c.hours, staffList: staff.filter(x => x.active).map(x => ({ id: x.id, name: x.name })) });
