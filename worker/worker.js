@@ -159,7 +159,7 @@ async function managerCookie(env, store) {
   return "manager=" + store + "." + exp + "." + (await hmac(env["MANAGER_PASSWORD_" + store], "manager|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
 }
 // Pages a manager may not open.
-const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
+const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|cams(\/|$)|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
 async function partnerCookie(env, store) {
   const exp = Date.now() + 30 * 86400000;
   return "partner=" + store + "." + exp + "." + (await hmac(env["PARTNER_PASSWORD_" + store], "partner|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
@@ -1072,6 +1072,50 @@ async function ownerApi(req, env, path, url) {
     try { const q = await tankReqDoc(env, S); if ((q.status === "waiting" || q.status === "running") && b.req && String(b.req) === String(q.id)) { q.status = rec.ok ? "done" : "failed"; q.finished = rec.at; q.err = rec.err; await saveTankReq(env, S, q); } } catch {}
     return json({ ok: true });
   }
+  // ---- Cameras (Hikvision recorder, read through the store PC: camread.ps1). Pictures only; nothing on the recorder changes.
+  if (path === "/api/pc-camreq" && req.method === "GET") {
+    const cur = await camReqDoc(env, S), now = Date.now();
+    let snap = null;
+    if ((cur.status === "waiting" || cur.status === "running") && now - cur.requested < 30 * 60e3) { snap = cur.id; if (cur.status === "waiting") { cur.status = "running"; cur.started = now; } }
+    else if (cur.status === "waiting" || cur.status === "running") cur.status = "expired";
+    cur.pcSeen = now; cur.pcVer = Number(url.searchParams.get("v")) || 0;
+    await saveCamReq(env, S, cur);
+    return json({ snap });
+  }
+  if (path === "/api/cam-upload" && req.method === "POST") {
+    // From the store PC: the recorder's camera list plus one fresh picture per camera (JPEG, base64, already shrunk on the PC).
+    const b = await req.json().catch(() => ({})), now = Date.now();
+    const chans = (Array.isArray(b.channels) ? b.channels : []).slice(0, 64).map(c => ({ ch: String(c.ch || c.id || "").slice(0, 8), name: String(c.name || "").slice(0, 60), ok: !!c.ok, err: String(c.err || "").slice(0, 200) }));
+    let n = 0;
+    for (const sn of (Array.isArray(b.snaps) ? b.snaps : []).slice(0, 64)) {
+      const ch = String(sn.ch || "").replace(/[^0-9A-Za-z]/g, "").slice(0, 8), b64 = String(sn.b64 || "");
+      if (!ch || b64.length < 200 || b64.length > 900000) continue;
+      await env.DB.prepare("INSERT INTO photos (id, created, b64) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET created = excluded.created, b64 = excluded.b64").bind("cam-" + S + "-" + ch, now, b64).run();
+      const c = chans.find(x => x.ch === ch); if (c) { c.at = now; c.ok = true; } n++;
+    }
+    const doc = { at: now, ok: !b.err, err: String(b.err || "").slice(0, 300), recorder: String(b.recorder || "").slice(0, 80), model: String(b.model || "").slice(0, 80), ver: Number(b.version) || 0, channels: chans };
+    await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'cams', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(doc), now).run();
+    try { const q = await camReqDoc(env, S); if ((q.status === "waiting" || q.status === "running") && (!b.req || String(b.req) === String(q.id))) { q.status = n ? "done" : "failed"; q.finished = now; q.err = doc.err; await saveCamReq(env, S, q); } } catch {}
+    return json({ ok: true, saved: n });
+  }
+  if (path === "/api/cams" && req.method === "GET") {
+    const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'cams'").bind(S).first();
+    return json({ cams: r ? JSON.parse(r.data) : null, req: await camReqDoc(env, S) });
+  }
+  if (path === "/api/cams/refresh" && req.method === "POST") {
+    const cur = await camReqDoc(env, S), now = Date.now();
+    if ((cur.status === "waiting" || cur.status === "running") && now - cur.requested < 10 * 60e3) return json({ ok: true, req: cur });
+    const q = { id: String(now), status: "waiting", requested: now, pcSeen: cur.pcSeen || 0, pcVer: cur.pcVer || 0 };
+    await saveCamReq(env, S, q);
+    return json({ ok: true, req: q });
+  }
+  if (path === "/api/cams/img" && req.method === "GET") {
+    const ch = String(url.searchParams.get("ch") || "").replace(/[^0-9A-Za-z]/g, "").slice(0, 8);
+    const r = ch ? await env.DB.prepare("SELECT b64, created FROM photos WHERE id = ?").bind("cam-" + S + "-" + ch).first() : null;
+    if (!r) return new Response("No picture yet", { status: 404 });
+    const bin = Uint8Array.from(atob(r.b64), c => c.charCodeAt(0));
+    return new Response(bin, { headers: { "content-type": "image/jpeg", "cache-control": "private, max-age=60" } });
+  }
   if (path === "/api/pc-tankreq" && req.method === "GET") {
     // Every 5 minutes from the store PC (tankread.ps1 -Poll): how often to read the tanks, and whether someone tapped "Read now".
     const cur = await tankReqDoc(env, S), now = Date.now();
@@ -1609,6 +1653,8 @@ async function homeAttention(env, S, MGR, st) {
   return A;
 }
 const TANK_EVERY_MIN = 120; // scheduled tank readings: every 2 hours (the store PC follows this number)
+async function camReqDoc(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'camreq'").bind(S).first(); try { return r ? JSON.parse(r.data) : {}; } catch { return {}; } }
+async function saveCamReq(env, S, d) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'camreq', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(d), Date.now()).run(); }
 async function tankReqDoc(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tankreq'").bind(S).first(); try { return r ? JSON.parse(r.data) : {}; } catch { return {}; } }
 async function saveTankReq(env, S, d) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'tankreq', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(d), Date.now()).run(); }
 async function regSendDoc(env, S) {
@@ -2267,7 +2313,7 @@ export default {
       if (pStore) { owner = true; req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.set("x-store", pStore); h.set("x-partner", pStore); if (mgr) h.set("x-role", "manager"); else h.delete("x-role"); return h; })() }); url.searchParams.set("store", pStore); }
       else if (req.headers.get("x-role")) { req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.delete("x-role"); return h; })() }); }
       // Nightly pulls: may call ONLY /api/sscs-import and /api/voids-import, with the secret in the x-import-token header.
-      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/pc-tankreq" || path === "/api/reg-plu" || path === "/api/pc-regsend" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script" || path === "/api/pc-regsend" || path === "/api/pc-tankreq") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
+      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/pc-tankreq" || path === "/api/pc-camreq" || path === "/api/cam-upload" || path === "/api/reg-plu" || path === "/api/pc-regsend" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script" || path === "/api/pc-regsend" || path === "/api/pc-tankreq" || path === "/api/pc-camreq") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
         safeEqual(await hmac("cmp", req.headers.get("x-import-token")), await hmac("cmp", env.SSCS_TOKEN));
       m = /^\/photo\/([a-z0-9]+)$/.exec(path);
       if (m) {
@@ -2629,6 +2675,7 @@ table.lg{border-collapse:collapse;font-size:.85rem;width:auto}tr.lgrow td{paddin
 .cg td:first-child{white-space:normal;min-width:170px;max-width:300px}.cg td.r,.cg th.r{text-align:right}.cg td.neg{color:var(--bad);font-weight:700}.cg tr.cgr{cursor:pointer}.cg tr.cgr:hover{background:var(--chip)}
 .cg tr.cgr.bad td:first-child{box-shadow:inset 4px 0 var(--bad)}.cg tr.cgr.blue td:first-child{box-shadow:inset 4px 0 #3b7bd4}.cg tr.cgr.warn td:first-child{box-shadow:inset 4px 0 var(--accent)}
 .cgchip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.78rem;font-weight:600;background:var(--chip);color:var(--muted)}
+.camgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}.camf{margin:0}.camf img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:8px;display:block;background:#111}.camf figcaption{font-size:.85rem;margin-top:4px}.camx{aspect-ratio:16/9;border-radius:8px;background:var(--bad-soft);color:var(--bad);display:flex;align-items:center;justify-content:center;font-size:.8rem;padding:8px;text-align:center}
 .cgchip.bad{background:var(--bad-soft);color:var(--bad)}.cgchip.good{background:var(--good-soft);color:var(--good)}.cgchip.warn{background:var(--accent-soft);color:var(--accent-text)}.cgchip.blue{background:#dfeaf9;color:#1d4f91}
 .cgsum{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.cgsum .cgchip{font-size:.9rem;padding:4px 10px}
 .cgin{width:78px;text-align:right;padding:4px 6px;margin:0}.cgok{width:20px;height:20px;margin:0}
@@ -2737,6 +2784,7 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  </div>
 </section>
 <section id="v-tanks" hidden><div id="tanksNow"></div></section>
+<section id="v-cams" hidden><div class="card"><h2>Cameras</h2><p class="sub" id="camsub">Loading…</p><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0 10px"><button type="button" id="camNow">Get fresh pictures</button><span class="mute" id="camMsg" style="flex:1;min-width:180px"></span></div><div id="camgrid" class="camgrid"></div></div></section>
 <section id="v-gas" hidden>
  <div class="gasp">
   <div class="card"><h2 id="gsT">Gas prices</h2>
@@ -2797,23 +2845,23 @@ function labelTables(){document.querySelectorAll(".tw table").forEach(function(t
 new MutationObserver(function(){if(labelTables.p)return;labelTables.p=requestAnimationFrame(function(){labelTables.p=0;labelTables()})}).observe(document.body,{childList:true,subtree:true});
 // Six tabs. Sales and Store have two views each; old names (staff, pay, movers, gas, cigs) still work for links.
 var VIEW={home:{s:["home"]},day:{s:["day"]},people:{s:["staff","pay"]},pl:{s:["pl"]},
-  sales:{sub:[["daily","Daily",["sales"]],["movers","Movers",["movers"]]]},store:{sub:[["fuel","Fuel",["tanks","gas"]],["cigs","Cig prices",["cigs"]]]}};
+  sales:{sub:[["daily","Daily",["sales"]],["movers","Movers",["movers"]]]},store:{sub:[["fuel","Fuel",["tanks","gas"]],["cigs","Cig prices",["cigs"]],["cams","Cameras",["cams"]]]}};
 var SUB={sales:"daily",store:"fuel"},CUR="home";
 var OLD={staff:["people"],pay:["people"],movers:["sales","movers"],gas:["store","fuel"],cigs:["store","cigs"]};
 function curSections(){var V=VIEW[CUR];if(V.s)return V.s;var sb=V.sub.filter(function(x){return x[0]===SUB[CUR]})[0]||V.sub[0];return sb[2]}
-function loadView(){var sec=curSections();sec.forEach(function(k){({home:loadHome,day:loadDay,staff:loadStaff,pay:loadPay,sales:loadSales,movers:loadMV,pl:loadPL,cigs:loadCG,gas:loadGas,tanks:loadTanks})[k]()})}
+function loadView(){var sec=curSections();sec.forEach(function(k){({home:loadHome,day:loadDay,staff:loadStaff,pay:loadPay,sales:loadSales,movers:loadMV,pl:loadPL,cigs:loadCG,gas:loadGas,tanks:loadTanks,cams:loadCams})[k]()})}
 function openView(v,sub){if(OLD[v]){sub=OLD[v][1]||sub;v=OLD[v][0]}if(!VIEW[v])v="home";CUR=v;if(sub)SUB[v]=sub;
   if(MANAGER&&v==="store")SUB.store="fuel";
   document.querySelectorAll(".tabs button").forEach(function(x){x.classList.toggle("on",x.dataset.v===v)});
   var V=VIEW[v],sn=$("subnav");
-  if(V.sub){sn.hidden=false;sn.innerHTML=V.sub.filter(function(x){return !(MANAGER&&x[0]==="cigs")}).map(function(x){return '<button type="button" data-sub="'+x[0]+'" class="'+(SUB[v]===x[0]?"on":"")+'">'+x[1]+'</button>'}).join("");if(sn.children.length<2)sn.hidden=true}else{sn.hidden=true;sn.innerHTML=""}
-  var show=curSections();["home","day","staff","pay","sales","pl","movers","cigs","tanks","gas"].forEach(function(k){$("v-"+k).hidden=show.indexOf(k)<0});
+  if(V.sub){sn.hidden=false;sn.innerHTML=V.sub.filter(function(x){return !(MANAGER&&(x[0]==="cigs"||x[0]==="cams"))}).map(function(x){return '<button type="button" data-sub="'+x[0]+'" class="'+(SUB[v]===x[0]?"on":"")+'">'+x[1]+'</button>'}).join("");if(sn.children.length<2)sn.hidden=true}else{sn.hidden=true;sn.innerHTML=""}
+  var show=curSections();["home","day","staff","pay","sales","pl","movers","cigs","tanks","gas","cams"].forEach(function(k){$("v-"+k).hidden=show.indexOf(k)<0});
   $("store").style.visibility=(v==="home"||PARTNER)?"hidden":"";loadView()}
 function goTab(v){openView(v)}
 $("subnav").addEventListener("click",function(e){var b=e.target.closest("button");if(b)openView(CUR,b.dataset.sub)});
 $("signout").addEventListener("click",function(){fetch("/api/logout",{method:"POST"}).then(function(){show(false)})});
 var PARTNER=false,MANAGER=false;
-function applyRole(){var pc=$("chkCard");if(pc)pc.hidden=MANAGER;["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl)$/.test(CUR)||(CUR==="store"&&SUB.store==="cigs")))openView("home");else if(CUR==="store")openView("store")}
+function applyRole(){var pc=$("chkCard");if(pc)pc.hidden=MANAGER;["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl)$/.test(CUR)||(CUR==="store"&&(SUB.store==="cigs"||SUB.store==="cams"))))openView("home");else if(CUR==="store")openView("store")}
 function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(location.hash==="#fuel"){try{history.replaceState(null,"",location.pathname)}catch(e){}openView("store","fuel")}if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
   $("store").innerHTML=L.map(function(s){return '<option value="'+esc(s.store)+'"'+(s.store===STORE?" selected":"")+'>'+esc(s.name)+'</option>'}).join("");$("store").hidden=L.length<2}).catch(function(){})}
 $("store").addEventListener("change",function(){STORE=this.value;try{localStorage.setItem("store",STORE)}catch(e){}
@@ -3254,6 +3302,20 @@ function pushOn(){var m=$("pushMsg");
   .then(function(sub){return api("/api/push/sub",{method:"POST",body:{sub:sub.toJSON()}})})
   .then(function(j){m.textContent="Done. A test notification is on its way.";$("pushOn").textContent="Phone alerts are on (tap to re-check)"})
   .catch(function(e){m.textContent=e.message==="signin"?"":"Couldn’t turn on: "+e.message})}
+var CQ=null,cqTimer=null,cqUntil=0,camBound=false;
+function loadCams(){if(!camBound){camBound=true;$("camNow").addEventListener("click",function(){var b=this;b.disabled=true;$("camMsg").textContent="Asking the store PC…";
+    api("/api/cams/refresh",{method:"POST",body:{}}).then(function(j){CQ=j.req||{};cqUntil=Date.now()+12*60e3;camText();b.disabled=false;cqPoll()}).catch(function(e){$("camMsg").textContent="Couldn’t ask the store PC: "+(e.message||e);b.disabled=false})})}
+  api("/api/cams").then(function(j){CQ=j.req||{};var c=j.cams;camText();
+    if(!c){$("camsub").textContent="Not connected yet. Run “Setup cameras” on this store’s PC once; the pictures show up here.";$("camgrid").innerHTML="";return}
+    $("camsub").textContent=(c.model?c.model+" · ":"")+(c.channels||[]).length+" camera(s) · pictures from "+new Date(c.at).toLocaleString([], {weekday:"short",hour:"numeric",minute:"2-digit"})+(c.err?" · "+c.err:"");
+    $("camgrid").innerHTML=(c.channels||[]).map(function(x){return '<figure class="camf">'+(x.at?'<a href="/api/cams/img?ch='+encodeURIComponent(x.ch)+'&t='+x.at+'" target="_blank"><img loading="lazy" src="/api/cams/img?ch='+encodeURIComponent(x.ch)+'&t='+x.at+'" alt=""></a>':'<div class="camx">'+esc(x.err||"No picture")+'</div>')+'<figcaption>'+esc(x.name||("Camera "+x.ch))+'</figcaption></figure>'}).join("");cqPoll()}).catch(function(e){$("camsub").textContent="Couldn’t load: "+(e.message||e)})}
+function cqPoll(){clearTimeout(cqTimer);var busy=CQ&&(CQ.status==="waiting"||CQ.status==="running")&&Date.now()-CQ.requested<30*60e3;if(busy&&Date.now()<cqUntil)cqTimer=setTimeout(function(){if($("v-cams").hidden)return;loadCams()},15000)}
+function camText(){var q=CQ||{},ago=function(t){var m=Math.round((Date.now()-t)/60000);return m<1?"just now":m+" min ago"},t="Pictures update when you tap the button.";
+  if((q.status==="waiting"||q.status==="running")&&Date.now()-q.requested<30*60e3)t=q.status==="running"?"The store PC is getting the pictures now…":"Asked the store PC "+ago(q.requested)+". New pictures show here within about 5 minutes.";
+  else if(q.status==="done"&&Date.now()-q.finished<15*60e3)t="Fresh pictures "+ago(q.finished)+".";
+  else if(q.status==="failed"&&Date.now()-q.finished<60*60e3)t="That didn’t work: "+(q.err||"no pictures came back");
+  else if(q.status==="expired"&&Date.now()-q.requested<60*60e3)t="The store PC didn’t pick it up. Is it on and signed in?";
+  $("camMsg").textContent=t}
 var TQ=null,tqTimer=null,tqUntil=0;
 function loadTanks(){api("/api/tanks").then(function(j){TQ=j.req||{};renderTanks(j.tanks);tqPoll()}).catch(function(){})}
 function tqPoll(){clearTimeout(tqTimer);var busy=TQ&&(TQ.status==="waiting"||TQ.status==="running")&&Date.now()-TQ.requested<30*60e3;if(busy&&Date.now()<tqUntil)tqTimer=setTimeout(function(){if(!$("v-tanks")||$("v-tanks").hidden)return;loadTanks()},20000)}
