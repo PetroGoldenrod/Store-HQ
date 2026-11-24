@@ -8,6 +8,7 @@
 import { connect } from "cloudflare:sockets";
 import TANKREAD_PS1 from "../store-pc/tankread.ps1";
 import VSUPLOAD_PS1 from "../store-pc/vsupload.ps1";
+import CAMREAD_PS1 from "../store-pc/camread.ps1";
 // Optional variables: MODEL (default claude-sonnet-5-5), FLAG_AMOUNT (default 3),
 //   HOURS_PER_SHIFT (default 8), PAY_WEEK_START (0=Sun..6=Sat, default 5 = Friday).
 
@@ -1129,7 +1130,7 @@ async function ownerApi(req, env, path, url) {
   if (path === "/api/pc-script" && req.method === "GET") {
     // The newest store PC scripts (they update themselves). ?name=tankread for the tank reading script.
     // Served from the scripts bundled with this deploy (store-pc/*.ps1), so a git push is all it takes to update the PCs.
-    const txt = url.searchParams.get("name") === "tankread" ? TANKREAD_PS1 : VSUPLOAD_PS1, vm = /\$ScriptVersion = (\d+)/.exec(txt);
+    const nm0 = url.searchParams.get("name"), txt = nm0 === "tankread" ? TANKREAD_PS1 : nm0 === "camread" ? CAMREAD_PS1 : VSUPLOAD_PS1, vm = /\$ScriptVersion = (\d+)/.exec(txt);
     if (vm) {
       const sha = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(txt)))].map(b => b.toString(16).padStart(2, "0")).join("");
       return json({ version: +vm[1], sha256: sha, script: txt });

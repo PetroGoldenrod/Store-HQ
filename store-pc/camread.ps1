@@ -16,7 +16,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 2
+$ScriptVersion = 3
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -182,16 +182,17 @@ foreach ($b in @("http://$Recorder", "https://$Recorder")) {
 $chans = @(); $snaps = @()
 if ($base) {
   $err = ""
-  # NVR with IP cameras: InputProxy channels. Older/analog recorders: Video inputs.
-  foreach ($p in @("/ISAPI/ContentMgmt/InputProxy/channels", "/ISAPI/System/Video/inputs/channels")) {
+  # Hybrid recorders have both: analog cameras (Video inputs, channels 1..n) and IP cameras (InputProxy, often 33 and up).
+  $seen = @{}
+  foreach ($p in @("/ISAPI/System/Video/inputs/channels", "/ISAPI/ContentMgmt/InputProxy/channels")) {
     try {
       $x = [xml]([Text.Encoding]::UTF8.GetString((RecGet $base $p $cred 20).bytes))
       foreach ($n in $x.SelectNodes("//*[local-name()='InputProxyChannel' or local-name()='VideoInputChannel']")) {
         $id = [string]$n.SelectSingleNode("*[local-name()='id']").InnerText
-        $nm = $n.SelectSingleNode("*[local-name()='name']"); $nm = if ($nm) { [string]$nm.InnerText } else { "Camera $id" }
-        if ($id) { $chans += [ordered]@{ ch = $id; name = $nm; ok = $false; err = "" } }
+        $en = $n.SelectSingleNode("*[local-name()='videoInputEnabled']"); if ($en -and [string]$en.InnerText -eq "false") { continue }
+        $nm = $n.SelectSingleNode("*[local-name()='name']"); $nm = if ($nm -and [string]$nm.InnerText) { [string]$nm.InnerText } else { "Camera $id" }
+        if ($id -and -not $seen[$id]) { $seen[$id] = 1; $chans += [ordered]@{ ch = $id; name = $nm; ok = $false; err = "" } }
       }
-      if ($chans.Count) { break }
     } catch {}
   }
   if (-not $chans.Count) { for ($i = 1; $i -le 16; $i++) { $chans += [ordered]@{ ch = [string]$i; name = "Camera $i"; ok = $false; err = "" } } }
@@ -205,6 +206,23 @@ if ($base) {
   # Without a camera list, keep only the channels that answered.
   if (($chans | Where-Object { $_.ok }).Count -and -not ($chans | Where-Object { $_.name -notmatch '^Camera \d+$' })) { $chans = @($chans | Where-Object { $_.ok }) }
   if (-not $snaps.Count -and -not $err) { $err = "The recorder answered but gave no pictures." }
+}
+# Self-update: Store HQ can hold a newer camera script (checked once a day, same checks as the other store PC scripts).
+function Update-Self {
+  $stamp = Join-Path $here "camread.updcheck"
+  if ((Test-Path $stamp) -and ((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalHours -lt 20) { return }
+  try {
+    Set-Content -Path $stamp -Value (Get-Date -Format s)
+    $u = Invoke-RestMethod -Method Get -Uri "$Url/api/pc-script?store=$Store&name=camread" -Headers $H -TimeoutSec 60
+    if ([int]$u.version -le $ScriptVersion) { return }
+    $txt = [string]$u.script
+    $hh = [Security.Cryptography.SHA256]::Create(); $got = ([BitConverter]::ToString($hh.ComputeHash([Text.Encoding]::UTF8.GetBytes($txt))) -replace "-", "").ToLower()
+    $ptok = $null; $perr = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($txt, [ref]$ptok, [ref]$perr)
+    if ($got -ne ([string]$u.sha256).ToLower() -or $txt -notmatch "# StoreHQ-camread" -or $txt -notmatch ('\$ScriptVersion = ' + [int]$u.version + '\b') -or ($perr -and $perr.Count)) { Log "Camera script update skipped: it didn't pass the checks."; return }
+    Copy-Item -Path $PSCommandPath -Destination (Join-Path $here "camread.prev.ps1") -Force
+    [IO.File]::WriteAllText($PSCommandPath, $txt, (New-Object Text.UTF8Encoding $false))
+    Log ("Camera script updated from v$ScriptVersion to v$($u.version).")
+  } catch {}
 }
 $sent = $false
 try { Send @{ version = $ScriptVersion; recorder = $Recorder; model = $model.Trim(); err = $err; req = $ReqId; channels = @($chans); snaps = @($snaps) }; $sent = $true } catch { Log ("Upload to Store HQ failed: " + $_.Exception.Message) }
@@ -225,4 +243,5 @@ if ($Setup) {
   } else { Write-Host ""; Write-Host "No pictures came back, so nothing was scheduled. Store HQ has the reason; tell Claude." }
   Read-Host "Press Enter to close"
 }
+if (-not $Setup) { Update-Self }
 if ($snaps.Count) { exit 0 } else { exit 1 }
