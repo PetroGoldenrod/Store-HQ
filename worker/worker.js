@@ -160,7 +160,7 @@ async function managerCookie(env, store) {
   return "manager=" + store + "." + exp + "." + (await hmac(env["MANAGER_PASSWORD_" + store], "manager|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
 }
 // Pages a manager may not open.
-const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|cams(\/|$)|clip$|promos$|kkc-weeks$|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
+const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|cams(\/|$)|clip$|promos$|kkc-weeks$|items-import$|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
 async function partnerCookie(env, store) {
   const exp = Date.now() + 30 * 86400000;
   return "partner=" + store + "." + exp + "." + (await hmac(env["PARTNER_PASSWORD_" + store], "partner|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
@@ -1388,6 +1388,17 @@ async function ownerApi(req, env, path, url) {
       out.push({ ...p, upto: end, per, items });
     }
     return json({ promos: out, depts: await deptNames(env, S) });
+  }
+  if (path === "/api/items-import" && req.method === "POST") {
+    // Item sales by day from the SSCS website (history for promo results): { days: { "YYYY-MM-DD": { desc: [qty, amount, dept] } }, replace }.
+    const b = await readBody(req, 6e6); let n = 0;
+    for (const [d, items] of Object.entries(b.days || {}).slice(0, 120)) {
+      if (!validDate(d) || !items || typeof items !== "object") continue;
+      const clean = {}; for (const [k, v] of Object.entries(items).slice(0, 5000)) if (Array.isArray(v)) clean[String(k).slice(0, 60)] = [Number(v[0]) || 0, r2(Number(v[1]) || 0), String(v[2] || "").slice(0, 6)];
+      const sql = b.replace ? "INSERT INTO store_kv (store, k, data, updated) VALUES (?, ?, ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated" : "INSERT OR IGNORE INTO store_kv (store, k, data, updated) VALUES (?, ?, ?, ?)";
+      await env.DB.prepare(sql).bind(S, "items:" + d, JSON.stringify(clean), Date.now()).run(); n++;
+    }
+    return json({ ok: true, days: n });
   }
   if (path === "/api/promos" && req.method === "POST") {
     const b = await readBody(req, 2e4); let list = await promoList(env, S);
