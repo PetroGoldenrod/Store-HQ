@@ -160,7 +160,7 @@ async function managerCookie(env, store) {
   return "manager=" + store + "." + exp + "." + (await hmac(env["MANAGER_PASSWORD_" + store], "manager|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
 }
 // Pages a manager may not open.
-const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|cams(\/|$)|clip$|promos$|kkc-weeks$|items-import$|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
+const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|cams(\/|$)|clip$|promos$|kkc-weeks$|licenses(\/|$)|items-import$|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
 async function partnerCookie(env, store) {
   const exp = Date.now() + 30 * 86400000;
   return "partner=" + store + "." + exp + "." + (await hmac(env["PARTNER_PASSWORD_" + store], "partner|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
@@ -200,7 +200,8 @@ async function askClaude(env, prompt, images) {
   const content = [];
   images.forEach((b64, i) => {
     if (images.length > 1) content.push({ type: "text", text: "Image " + (i + 1) + ":" });
-    content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
+    if (b64 && b64.pdf) content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64.pdf } });
+    else content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
   });
   content.push({ type: "text", text: prompt });
   const base = env.ANTHROPIC_BASE_URL || "https://api.anthropic.com";
@@ -1417,6 +1418,48 @@ async function ownerApi(req, env, path, url) {
     return json({ ok: true });
   }
   // ---- Chicken profit by week: chicken sales (dept 79) vs chicken invoices (Sysco, Restaurant Depot) by invoice date.
+  // ---- Licenses and permits: a copy of each one (photo or PDF) with its expiration date. Files live in KV with no expiry.
+  if (path === "/api/licenses" && req.method === "GET") return json({ list: await licDoc(env, S), today: nyToday() });
+  if (path === "/api/licenses/add" && req.method === "POST") {
+    if (!env.CLIPS) return json({ error: "File storage is not set up" }, 500);
+    const b = await req.json().catch(() => ({})), type = b.type === "pdf" ? "pdf" : "jpg", b64 = String(b.b64 || "");
+    if (b64.length < 500) return json({ error: "That file looks empty" }, 400);
+    if (b64.length > 16e6) return json({ error: "That file is too big (12 MB max)" }, 400);
+    let bytes; try { bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0)); } catch { return json({ error: "Could not read that file" }, 400); }
+    const id = rid(10);
+    await env.CLIPS.put("lic:" + S + ":" + id, bytes, { metadata: { type } });
+    const L = { id, name: String(b.fileName || "").replace(/\.[a-z0-9]+$/i, "").replace(/^(image|img[_-]?\d*|photo|scan)$/i, "").slice(0, 80) || "License", number: "", issuer: "", expires: "", type, size: bytes.length, added: Date.now() };
+    try {
+      const r = await askClaude(env, LIC_PROMPT, [type === "pdf" ? { pdf: b64 } : b64]);
+      if (r.name) L.name = String(r.name).slice(0, 80);
+      L.issuer = String(r.issuer || "").slice(0, 80); L.number = String(r.number || "").slice(0, 60);
+      if (validDate(String(r.expires || ""))) L.expires = r.expires;
+    } catch (e) { L.unread = true; }
+    const list = await licDoc(env, S); list.push(L); await saveLic(env, S, list);
+    return json({ ok: true, lic: L });
+  }
+  if (path === "/api/licenses/edit" && req.method === "POST") {
+    const b = await req.json().catch(() => ({})), list = await licDoc(env, S), L = list.find(x => x.id === b.id);
+    if (!L) return json({ error: "Not found" }, 404);
+    const ex = String(b.expires || "");
+    if (ex && !validDate(ex)) return json({ error: "Pick a valid date" }, 400);
+    L.name = String(b.name || "").trim().slice(0, 80) || L.name; L.number = String(b.number || "").trim().slice(0, 60); L.issuer = String(b.issuer || "").trim().slice(0, 80); L.expires = ex; delete L.unread;
+    await saveLic(env, S, list);
+    return json({ ok: true });
+  }
+  if (path === "/api/licenses/delete" && req.method === "POST") {
+    const b = await req.json().catch(() => ({})), list = await licDoc(env, S), L = list.find(x => x.id === b.id);
+    if (!L) return json({ error: "Not found" }, 404);
+    await saveLic(env, S, list.filter(x => x.id !== L.id));
+    try { await env.CLIPS.delete("lic:" + S + ":" + L.id); } catch {}
+    return json({ ok: true });
+  }
+  if (path === "/api/licenses/file" && req.method === "GET") {
+    const id = String(url.searchParams.get("id") || "").replace(/[^a-z0-9]/g, ""), L = (await licDoc(env, S)).find(x => x.id === id);
+    const o = L && env.CLIPS ? await env.CLIPS.get("lic:" + S + ":" + id, { type: "arrayBuffer" }) : null;
+    if (!o) return new Response("License file not found", { status: 404 });
+    return new Response(o, { headers: { "content-type": L.type === "pdf" ? "application/pdf" : "image/jpeg", "content-disposition": 'inline; filename="' + (L.name.replace(/[^A-Za-z0-9 _-]/g, "").trim() || "license") + (L.type === "pdf" ? ".pdf" : ".jpg") + '"', "cache-control": "private, max-age=600" } });
+  }
   if (path === "/api/kkc-weeks" && req.method === "GET") {
     const tz = env.TIMEZONE || "America/New_York", today = localDate(Date.now(), tz), n = Math.min(26, Math.max(4, Number(url.searchParams.get("weeks")) || 10));
     const dow = (new Date(today + "T12:00:00Z").getUTCDay() + 6) % 7, mon = addDays(today, -dow), first = addDays(mon, -7 * (n - 1));
@@ -1721,6 +1764,30 @@ async function cigShelf(env, S, doc) {
   return { shelf, regAt };
 }
 // The Today page's "Needs attention" list for one store: [{lvl:"bad"|"warn", t:title, d:detail, tab, sub, date}]. Same rules as the pages they link to.
+const LIC_PROMPT = 'This is a business license, permit, registration or certificate for a gas station and convenience store. Return only JSON: {"name": a short plain name for what it is, for example "Tobacco retail permit", "Beer and wine license", "Lottery retailer certificate", "Business tax receipt", "Food permit", "Fuel dispenser inspection"; "issuer": the agency or company that issued it, short; "number": the license or permit number, or ""; "expires": the expiration date as YYYY-MM-DD, or "" if no expiration date is printed}. Do not guess a date that is not printed.';
+function nyToday() { return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" }); }
+function licDays(L, today) { return L.expires ? Math.round((Date.parse(L.expires + "T12:00:00Z") - Date.parse(today + "T12:00:00Z")) / 864e5) : null; }
+async function licDoc(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'licenses'").bind(S).first(); try { const d = r ? JSON.parse(r.data) : []; return Array.isArray(d) ? d : []; } catch { return []; } }
+async function saveLic(env, S, list) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'licenses', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(list), Date.now()).run(); }
+// Every morning at 10 (New York): tell the owner's phones about licenses that expire in 60, 30, 14, 7, 3 or 1 days, today, or are already expired (weekly).
+async function licenseReminder(env) {
+  const hour = +new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", hourCycle: "h23" }).format(new Date());
+  if (hour !== 10) return;
+  const today = nyToday(), r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = '*' AND k = 'licremind'").first();
+  if (r && JSON.parse(r.data).last === today) return;
+  await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES ('*', 'licremind', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(JSON.stringify({ last: today }), Date.now()).run();
+  const names = { [DEF_STORE]: "Goldenrod Shell" };
+  try { ((await env.DB.prepare("SELECT store, data FROM inv_store").all()).results || []).forEach(x => { names[x.store] = JSON.parse(x.data).name || x.store; }); } catch {}
+  const out = [];
+  for (const row of (await env.DB.prepare("SELECT store, data FROM store_kv WHERE k = 'licenses'").all()).results || []) {
+    let list = []; try { list = JSON.parse(row.data) || []; } catch {}
+    for (const L of list) {
+      const d = licDays(L, today); if (d == null) continue;
+      if ([60, 30, 14, 7, 3, 1, 0].includes(d) || (d < 0 && d % 7 === 0)) out.push(L.name + " (" + (names[row.store] || row.store) + ") " + (d > 0 ? "expires in " + d + " day" + (d === 1 ? "" : "s") : d === 0 ? "expires today" : "expired " + (-d) + " days ago"));
+    }
+  }
+  if (out.length) await pushAlert(env, out.length === 1 ? "License to renew" : out.length + " licenses to renew", out.join(" · "), "/#licenses", "owner");
+}
 async function homeAttention(env, S, MGR, st) {
   const A = [], now = Date.now(), when = t => new Date(t).toLocaleString("en-US", { timeZone: env.TIMEZONE || "America/New_York", weekday: "short", hour: "numeric", minute: "2-digit" });
   // Store PC and nightly upload
@@ -1746,6 +1813,13 @@ async function homeAttention(env, S, MGR, st) {
     }
   } catch {}
   if (MGR) return A;
+  try {
+    const today = nyToday();
+    for (const L of await licDoc(env, S)) {
+      const d = licDays(L, today); if (d == null || d > 30) continue;
+      A.push({ lvl: d < 0 ? "bad" : "warn", t: d < 0 ? L.name + " expired " + (-d) + " day" + (d === -1 ? "" : "s") + " ago" : L.name + (d === 0 ? " expires today" : " expires in " + d + " day" + (d === 1 ? "" : "s")), d: "Renew it, then add the new one under Licenses.", tab: "licenses" });
+    }
+  } catch {}
   // Cig prices (owner only)
   try {
     const doc = await cigDoc(env, S);
@@ -2382,6 +2456,7 @@ export default {
     if (env.DB) ctx.waitUntil(invSendReady(env).catch(() => {}));
     if (env.DB) ctx.waitUntil(ensureSchema(env).then(() => dailyMailDue(env)).catch(() => {}));
     if (env.DB) ctx.waitUntil(lotteryReminder(env).catch(() => {}));
+    if (env.DB) ctx.waitUntil(licenseReminder(env).catch(() => {}));
   },
   async fetch(req, env, ctx) {
     const url = new URL(req.url), path = url.pathname;
@@ -2869,10 +2944,10 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 .tw td .drops{justify-content:flex-end}
 }
 </style></head><body><main>
-<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h1 style="margin:0">Store <span>HQ</span></h1><div style="display:flex;gap:8px;align-items:center"><select id="store" aria-label="Store" style="width:auto;font-weight:700" hidden></select><div style="position:relative"><button type="button" class="alt sm" id="setupBtn" aria-label="Menu" aria-haspopup="true" hidden>☰</button><div id="setupBox" hidden style="position:absolute;right:0;top:calc(100% + 6px);z-index:30;min-width:170px;background:var(--paper);border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.14);overflow:hidden"><button type="button" id="menuStaff" style="display:block;width:100%;margin:0;border:0;border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Cashiers</button><button type="button" id="signout" style="display:block;width:100%;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Log out</button></div></div></div></div>
+<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h1 style="margin:0">Store <span>HQ</span></h1><div style="display:flex;gap:8px;align-items:center"><select id="store" aria-label="Store" style="width:auto;font-weight:700" hidden></select><div style="position:relative"><button type="button" class="alt sm" id="setupBtn" aria-label="Menu" aria-haspopup="true" hidden>☰</button><div id="setupBox" hidden style="position:absolute;right:0;top:calc(100% + 6px);z-index:30;min-width:170px;background:var(--paper);border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.14);overflow:hidden"><button type="button" id="menuStaff" style="display:block;width:100%;margin:0;border:0;border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Cashiers</button><button type="button" id="menuLic" style="display:block;width:100%;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Licenses</button><button type="button" id="menuPL" style="display:block;width:100%;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Profit</button><button type="button" id="signout" style="display:block;width:100%;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Log out</button></div></div></div></div>
 <section id="login" hidden><div class="card"><label for="pw">Password</label><input type="password" id="pw" autocomplete="current-password"><button id="lg" style="margin-top:12px;width:100%">Sign in</button><div id="lmsg"></div></div></section>
 <div id="app" hidden>
-<div class="tabs" role="tablist"><button data-v="home" class="on">Today</button><button data-v="day">Shifts</button><button data-v="people">Payroll</button><button data-v="sales">Sales</button><button data-v="pl">Profit</button><button data-v="store">Store</button></div>
+<div class="tabs" role="tablist"><button data-v="home" class="on">Today</button><button data-v="day">Shifts</button><button data-v="people">Payroll</button><button data-v="sales">Sales</button><button data-v="store">Store</button></div>
 <div class="subnav" id="subnav" hidden></div>
 <section id="v-home"><div id="home"><div class="mute">Loading…</div></div></section>
 <section id="v-day" hidden>
@@ -2893,6 +2968,12 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  </details>
  <div id="day"><div class="mute">Loading…</div></div>
 </section>
+<section id="v-lic" hidden>
+ <div class="card"><h2>Licenses</h2><div class="mute">Keep a copy of every license and permit here so you can open or print it any time. The app reads the name and the expiration date for you. You get a phone reminder 60, 30, 14, 7, 3 and 1 days before one expires, and it shows on Today in its last 30 days.</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Take a photo<input type="file" id="liccam" accept="image/*" capture="environment" hidden></label><label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Upload photos or PDFs<input type="file" id="licfile" accept="image/*,application/pdf,.pdf" multiple hidden></label></div>
+  <div id="licmsg" style="margin-top:8px"></div></div>
+ <div id="liclist"></div>
+</section>
 <section id="v-staff" hidden>
  <div class="card"><h2>Add a cashier</h2><div class="row"><div><label for="nn">Name</label><input id="nn" autocomplete="off"></div><div><label for="nr">Hourly rate ($)</label><input id="nr" inputmode="decimal"></div></div><button id="add" style="margin-top:12px">Add and make link</button><div id="smsg"></div></div>
  <div class="mute" style="margin:0 0 8px">Send each cashier their own link. Turn a cashier off and their link stops working right away.</div>
@@ -2904,6 +2985,7 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
   <div class="nav"><button type="button" id="mprev">‹ Prev</button><b id="mname">Loading…</b><button type="button" id="mnext">Next ›</button></div>
   <p class="sub" id="ssub"></p>
   <div id="sales"><div class="empty">Loading your days…</div></div>
+  <div class="card"><h2>Chicken by week</h2><p class="sub">Chicken sales (register) against chicken invoices from Sysco and Restaurant Depot on the Invoice Desk, by invoice date. Weeks run Monday to Sunday.</p><div id="kkcw"><div class="mute">Loading…</div></div></div>
  </div>
 </section>
 <section id="v-pl" hidden>
@@ -2911,7 +2993,6 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
   <div class="nav"><button type="button" id="lprev">‹ Prev</button><b id="lname">Loading…</b><button type="button" id="lnext">Next ›</button></div>
   <p class="sub" id="lsub"></p>
   <div class="card"><h2 id="lstT">Net profit</h2><div class="plst" id="lst"><div class="mute">Loading…</div></div><div class="warn-line" id="lstN" hidden style="margin-top:10px">Gross profit for this month isn't in yet. Enter it below, or ask Claude to fill it from the Sunray month-end reports.</div></div>
-  <div class="card"><h2>Chicken by week</h2><p class="sub">Chicken sales (register) against chicken invoices from Sysco and Restaurant Depot on the Invoice Desk, by invoice date. Weeks run Monday to Sunday.</p><div id="kkcw"><div class="mute">Loading…</div></div></div>
   <div class="card"><h2>Gross profit from Sunray</h2><div class="mute" style="margin-bottom:10px">Merchandise sales and the cost of what sold, from the Sunray Sales Gross Profit report. Enter the expFOODSERVICE (3002) total as KKC food cost.</div>
    <div class="plg"><div><label for="gSales">Merchandise sales</label><input id="gSales" inputmode="decimal" placeholder="0.00"></div><div><label for="gCost">Cost of goods sold</label><input id="gCost" inputmode="decimal" placeholder="0.00"></div><div><label for="gFood">KKC food cost (3002)</label><input id="gFood" inputmode="decimal" placeholder="0.00"></div><div><label for="gFuel">Fuel gross profit</label><input id="gFuel" inputmode="decimal" placeholder="0.00"></div></div>
    <button id="gSave" style="margin-top:12px">Save gross profit</button><div class="mute" id="gNote" style="margin-top:8px"></div></div>
@@ -3005,25 +3086,25 @@ function labelTables(){document.querySelectorAll(".tw table").forEach(function(t
   Array.prototype.forEach.call(t.tBodies,function(tb){Array.prototype.forEach.call(tb.rows,function(r){var i=0;Array.prototype.forEach.call(r.cells,function(c){if(!c.hasAttribute("data-label")&&names[i])c.setAttribute("data-label",names[i]);i+=c.colSpan||1})})})})}
 new MutationObserver(function(){if(labelTables.p)return;labelTables.p=requestAnimationFrame(function(){labelTables.p=0;labelTables()})}).observe(document.body,{childList:true,subtree:true});
 // Six tabs. Sales and Store have two views each; old names (staff, pay, movers, gas, cigs) still work for links.
-var VIEW={home:{s:["home"]},day:{s:["day"]},people:{s:["pay"]},cashiers:{s:["staff"]},pl:{s:["pl"]},
+var VIEW={home:{s:["home"]},day:{s:["day"]},people:{s:["pay"]},cashiers:{s:["staff"]},licenses:{s:["lic"]},pl:{s:["pl"]},
   sales:{sub:[["daily","Daily",["sales"]],["movers","Movers",["movers"]]]},store:{sub:[["fuel","Fuel",["tanks","gas"]],["cigs","Cig prices",["cigs"]],["cams","Cameras",["cams"]]]}};
 var SUB={sales:"daily",store:"fuel"},CUR="home";
 var OLD={staff:["cashiers"],pay:["people"],movers:["sales","movers"],gas:["store","fuel"],cigs:["store","cigs"]};
 function curSections(){var V=VIEW[CUR];if(V.s)return V.s;var sb=V.sub.filter(function(x){return x[0]===SUB[CUR]})[0]||V.sub[0];return sb[2]}
-function loadView(){var sec=curSections();sec.forEach(function(k){({home:loadHome,day:loadDay,staff:loadStaff,pay:loadPay,sales:loadSales,movers:loadMV,pl:loadPL,cigs:loadCG,gas:loadGas,tanks:loadTanks,cams:loadCams})[k]()})}
+function loadView(){var sec=curSections();sec.forEach(function(k){({home:loadHome,day:loadDay,staff:loadStaff,lic:loadLic,pay:loadPay,sales:loadSales,movers:loadMV,pl:loadPL,cigs:loadCG,gas:loadGas,tanks:loadTanks,cams:loadCams})[k]()})}
 function openView(v,sub){if(OLD[v]){sub=OLD[v][1]||sub;v=OLD[v][0]}if(!VIEW[v])v="home";CUR=v;if(sub)SUB[v]=sub;
   if(MANAGER&&v==="store")SUB.store="fuel";
   document.querySelectorAll(".tabs button").forEach(function(x){x.classList.toggle("on",x.dataset.v===v)});
   var V=VIEW[v],sn=$("subnav");
   if(V.sub){sn.hidden=false;sn.innerHTML=V.sub.filter(function(x){return !(MANAGER&&(x[0]==="cigs"||x[0]==="cams"))}).map(function(x){return '<button type="button" data-sub="'+x[0]+'" class="'+(SUB[v]===x[0]?"on":"")+'">'+x[1]+'</button>'}).join("");if(sn.children.length<2)sn.hidden=true}else{sn.hidden=true;sn.innerHTML=""}
-  var show=curSections();["home","day","staff","pay","sales","pl","movers","cigs","tanks","gas","cams"].forEach(function(k){$("v-"+k).hidden=show.indexOf(k)<0});
+  var show=curSections();["home","day","staff","lic","pay","sales","pl","movers","cigs","tanks","gas","cams"].forEach(function(k){$("v-"+k).hidden=show.indexOf(k)<0});
   $("store").style.visibility=(v==="home"||PARTNER)?"hidden":"";loadView()}
 function goTab(v){openView(v)}
 $("subnav").addEventListener("click",function(e){var b=e.target.closest("button");if(b)openView(CUR,b.dataset.sub)});
-$("setupBtn").addEventListener("click",function(e){e.stopPropagation();var b=$("setupBox");b.hidden=!b.hidden});document.addEventListener("click",function(){$("setupBox").hidden=true});$("menuStaff").addEventListener("click",function(){openView("cashiers");window.scrollTo(0,0)});$("signout").addEventListener("click",function(){fetch("/api/logout",{method:"POST"}).then(function(){show(false)})});
+$("setupBtn").addEventListener("click",function(e){e.stopPropagation();var b=$("setupBox");b.hidden=!b.hidden});document.addEventListener("click",function(){$("setupBox").hidden=true});$("menuStaff").addEventListener("click",function(){openView("cashiers");window.scrollTo(0,0)});$("menuLic").addEventListener("click",function(){openView("licenses");window.scrollTo(0,0)});$("menuPL").addEventListener("click",function(){openView("pl");window.scrollTo(0,0)});$("signout").addEventListener("click",function(){fetch("/api/logout",{method:"POST"}).then(function(){show(false)})});
 var PARTNER=false,MANAGER=false;
-function applyRole(){var pc=$("chkCard");if(pc)pc.hidden=MANAGER;["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl)$/.test(CUR)||(CUR==="store"&&(SUB.store==="cigs"||SUB.store==="cams"))))openView("home");else if(CUR==="store")openView("store")}
-function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(location.hash==="#fuel"){try{history.replaceState(null,"",location.pathname)}catch(e){}openView("store","fuel")}if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
+function applyRole(){var pc=$("chkCard");if(pc)pc.hidden=MANAGER;$("menuLic").hidden=MANAGER;$("menuPL").hidden=MANAGER;["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl|licenses)$/.test(CUR)||(CUR==="store"&&(SUB.store==="cigs"||SUB.store==="cams"))))openView("home");else if(CUR==="store")openView("store")}
+function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(location.hash==="#licenses"&&!MANAGER){try{history.replaceState(null,"",location.pathname)}catch(e){}openView("licenses")}if(location.hash==="#fuel"){try{history.replaceState(null,"",location.pathname)}catch(e){}openView("store","fuel")}if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
   $("store").innerHTML=L.map(function(s){return '<option value="'+esc(s.store)+'"'+(s.store===STORE?" selected":"")+'>'+esc(s.name)+'</option>'}).join("");$("store").hidden=L.length<2}).catch(function(){})}
 $("store").addEventListener("change",function(){STORE=this.value;try{localStorage.setItem("store",STORE)}catch(e){}
   loadView()});
@@ -3198,6 +3279,31 @@ function plNum(v){var n=parseFloat(String(v==null?"":v).replace(/[$,\\s]/g,""));
 function plKind(c){for(var i=0;i<PL_CATS.length;i++)if(PL_CATS[i][1]===c)return PL_CATS[i][0];return "out"}
 $("eCat").innerHTML='<optgroup label="Money in">'+PL_CATS.filter(function(c){return c[0]==="in"}).map(function(c){return '<option>'+esc(c[1])+'</option>'}).join("")+'</optgroup><optgroup label="Money out">'+PL_CATS.filter(function(c){return c[0]==="out"}).map(function(c){return '<option>'+esc(c[1])+'</option>'}).join("")+'</optgroup>';
 $("eCat").value="Rent";
+var LIC={ed:null,del:null,list:[],today:"",busy:false};
+function loadLic(){api("/api/licenses").then(function(j){LIC.list=j.list||[];LIC.today=j.today;renderLic()}).catch(function(e){if(e.message!=="signin")$("liclist").innerHTML='<div class="mute">'+esc(e.message)+'</div>'})}
+function licLeft(x){return x.expires?Math.round((Date.parse(x.expires+"T12:00:00Z")-Date.parse(LIC.today+"T12:00:00Z"))/864e5):null}
+function licDate(s){return new Date(s+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}
+function renderLic(){var L=LIC.list.slice().sort(function(a,b){return (a.expires||"9999").localeCompare(b.expires||"9999")}),B='class="alt sm" style="width:auto;margin:0"';
+  $("liclist").innerHTML=L.length?L.map(function(x){var d=licLeft(x),pill=d==null?'<span class="pill warn">No date yet</span>':d<0?'<span class="pill bad">Expired</span>':d<=60?'<span class="pill warn">'+(d===0?"Expires today":d+" day"+(d===1?"":"s")+" left")+'</span>':'<span class="pill good">Good</span>';
+    var h='<div class="card" data-id="'+esc(x.id)+'"><div><b>'+esc(x.name)+'</b> '+pill+'</div><div class="mute" style="margin-top:4px">'+esc([x.issuer,x.number?"No. "+x.number:"",x.expires?"Expires "+licDate(x.expires):"No expiration date saved"].filter(Boolean).join(" · "))+'</div>';
+    if(x.unread)h+='<div class="mute" style="margin-top:4px">The app could not read this one. Tap Edit to type the name and date.</div>';
+    if(LIC.ed===x.id)h+='<div style="margin-top:10px"><label>Name</label><input data-f="name" value="'+esc(x.name)+'"><div class="row" style="margin-top:8px"><div><label>Number</label><input data-f="number" value="'+esc(x.number||"")+'"></div><div><label>Expires</label><input type="date" data-f="expires" value="'+esc(x.expires||"")+'"></div></div><label style="margin-top:8px;display:block">Issued by</label><input data-f="issuer" value="'+esc(x.issuer||"")+'"><div style="display:flex;gap:8px;margin-top:10px"><button type="button" data-a="save" style="width:auto;margin:0">Save</button><button type="button" data-a="cancel" '+B+'>Cancel</button></div></div>';
+    else h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><a class="alt" style="display:inline-block;padding:7px 12px;border-radius:10px;border:1px solid var(--line);text-decoration:none;color:var(--ink);font-weight:600;background:var(--paper)" target="_blank" rel="noopener" href="/api/licenses/file?id='+esc(x.id)+'&store='+encodeURIComponent(STORE)+'">Open / Print</a><button type="button" data-a="edit" '+B+'>Edit</button><button type="button" data-a="del" '+B+'>'+(LIC.del===x.id?"Tap again to delete":"Delete")+'</button></div>';
+    return h+'</div>'}).join(""):'<div class="mute">No licenses saved for this store yet.</div>'}
+$("liclist").addEventListener("click",function(e){var b=e.target.closest("button[data-a]");if(!b)return;var c=b.closest("[data-id]"),id=c.dataset.id,a=b.dataset.a;
+  if(a==="edit"){LIC.ed=id;LIC.del=null;renderLic()}else if(a==="cancel"){LIC.ed=null;renderLic()}
+  else if(a==="del"){if(LIC.del!==id){LIC.del=id;renderLic();return}b.disabled=true;api("/api/licenses/delete",{method:"POST",body:{id:id}}).then(function(){LIC.del=null;loadLic()}).catch(function(x){b.disabled=false;$("licmsg").innerHTML='<div class="msg err">'+esc(x.message)+'</div>'})}
+  else if(a==="save"){var o={id:id};c.querySelectorAll("[data-f]").forEach(function(i){o[i.dataset.f]=i.value});b.disabled=true;api("/api/licenses/edit",{method:"POST",body:o}).then(function(){LIC.ed=null;loadLic()}).catch(function(x){b.disabled=false;$("licmsg").innerHTML='<div class="msg err">'+esc(x.message)+'</div>'})}});
+function licB64(f){return new Promise(function(res,rej){var pdf=f.type==="application/pdf"||/[.]pdf$/i.test(f.name||"");
+  if(pdf){var r=new FileReader();r.onload=function(){res({type:"pdf",b64:String(r.result).split(",")[1]})};r.onerror=function(){rej(new Error("Could not read "+f.name))};r.readAsDataURL(f);return}
+  var img=new Image(),u=URL.createObjectURL(f);img.onload=function(){var k=Math.min(1,2400/Math.max(img.width,img.height)),c=document.createElement("canvas");c.width=Math.round(img.width*k);c.height=Math.round(img.height*k);c.getContext("2d").drawImage(img,0,0,c.width,c.height);URL.revokeObjectURL(u);res({type:"jpg",b64:c.toDataURL("image/jpeg",0.9).split(",")[1]})};
+  img.onerror=function(){rej(new Error("Could not open "+(f.name||"that photo")))};img.src=u})}
+function licSend(files){if(LIC.busy||!files.length)return;LIC.busy=true;var F=[].slice.call(files),i=0,bad=[],nodate=0;
+  function next(){if(i>=F.length){LIC.busy=false;$("licmsg").innerHTML='<div class="msg '+(bad.length?"err":"ok")+'">'+esc((F.length-bad.length)+" of "+F.length+" saved."+(nodate?" "+nodate+" had no expiration date the app could read: tap Edit to add it.":" Check that each name and date is right.")+(bad.length?" Problems: "+bad.join("; "):""))+'</div>';loadLic();return}
+    var f=F[i++];$("licmsg").innerHTML='<div class="msg info">Reading '+i+' of '+F.length+'…</div>';
+    licB64(f).then(function(o){o.fileName=f.name||"";return api("/api/licenses/add",{method:"POST",body:o})}).then(function(j){if(!j.lic.expires)nodate++;next()}).catch(function(e){bad.push((f.name||"file")+": "+e.message);next()})}
+  next()}
+["liccam","licfile"].forEach(function(id){$(id).addEventListener("change",function(){var f=this.files;licSend(f);this.value=""})});
 function loadKW(){api("/api/kkc-weeks").then(function(j){var W=(j.weeks||[]).slice().reverse(),h='<div class="tw"><table><thead><tr><th>Week</th><th class="r">Chicken sales</th><th class="r">Chicken invoices</th><th class="r">Food cost</th><th class="r">Left after food</th></tr></thead><tbody>';
   W.forEach(function(w){var pc=w.sales&&w.cost?Math.round(w.cost/w.sales*100):null,cur=w.to>=j.today;
     h+='<tr><td>'+esc(fmtShort(w.from))+' – '+esc(fmtShort(w.to))+(cur?' <span class="mute">(so far)</span>':'')+'</td><td class="r num">'+money(w.sales)+'</td><td class="r num">'+(w.invoices.length?money(w.cost)+'<div class="mute" style="font-size:.75rem">'+w.invoices.length+' invoice'+(w.invoices.length>1?"s":"")+'</div>':'<span class="mute">none entered</span>')+'</td><td class="r num">'+(pc==null?"—":'<span class="cgchip '+(pc<=50?"good":pc>=60?"bad":"")+'">'+pc+'%</span>')+'</td><td class="r num">'+(w.invoices.length?money(w.sales-w.cost):"—")+'</td></tr>'});
@@ -3205,7 +3311,7 @@ function loadKW(){api("/api/kkc-weeks").then(function(j){var W=(j.weeks||[]).sli
   h+='</tbody></table></div>'+(n?'<div style="margin-top:8px"><b>Last '+n+' full week'+(n>1?"s":"")+' with invoices:</b> food cost '+Math.round(tC/tS*100)+'% · '+money(tS-tC)+' left after food'+'</div>':'<div class="mute" style="margin-top:8px">Food cost shows once Sysco and Restaurant Depot invoices go through the Invoice Desk. One week can swing with delivery timing; the 4-week line is the one to trust.</div>');
   $("kkcw").innerHTML=h}).catch(function(e){$("kkcw").innerHTML='<div class="mute">'+esc(e.message||e)+'</div>'})}
 function fmtShort(d){var x=new Date(d+"T12:00:00");return x.toLocaleDateString([], {month:"short",day:"numeric"})}
-function loadPL(){loadKW();if(PL.store!==STORE){PL.d=null;PL.store=STORE}if(!PL.d)$("lst").innerHTML='<div class="mute">Loading…</div><div></div>';
+function loadPL(){if(PL.store!==STORE){PL.d=null;PL.store=STORE}if(!PL.d)$("lst").innerHTML='<div class="mute">Loading…</div><div></div>';
   api("/api/pnl").then(function(j){PL.d=j;renderPL()}).catch(function(x){if(x.message!=="signin")$("lst").innerHTML='<div class="mute">Couldn\\'t load: '+esc(x.message)+'</div><div></div>'})}
 function plTot(m){var d=PL.d||{entries:[],gross:{},check:{}},es=d.entries.filter(function(e){return e.month===m}),g=d.gross[m]||{};
   var gross=plNum(g.sales)-plNum(g.cost)-plNum(g.food)+plNum(g.fuel),inc=0,exp=0;
@@ -3450,7 +3556,7 @@ function dsum(list){var o={date:list[0].date,n:list.length,net:0,fuel:0,merch:0,
     (d.cards||[]).forEach(function(c){var e=o.cardList[c[0]]||(o.cardList[c[0]]={n:c[0],c:0,a:0});e.c+=c[1];e.a+=c[2]})});
   return o}
 function gal(v){return (Math.round(v*10)/10).toLocaleString("en-US",{minimumFractionDigits:1,maximumFractionDigits:1})}
-function loadSales(){var d=new Date(salesMonth+"-15T12:00:00");$("mname").textContent=d.toLocaleDateString("en-US",{month:"long",year:"numeric"});
+function loadSales(){loadKW();var d=new Date(salesMonth+"-15T12:00:00");$("mname").textContent=d.toLocaleDateString("en-US",{month:"long",year:"numeric"});
   $("mnext").disabled=salesMonth>=today().slice(0,7);
   api("/api/sales?month="+salesMonth).then(function(j){SALES=j;renderSales()}).catch(function(e){if(e.message!=="signin")$("sales").innerHTML='<div class="empty">Couldn’t load. '+esc(e.message)+'</div>'})}
 function usd0(v){return (v<0?"−$":"$")+Math.abs(v).toLocaleString("en-US",{maximumFractionDigits:0})}
