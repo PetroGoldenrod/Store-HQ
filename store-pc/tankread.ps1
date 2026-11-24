@@ -17,7 +17,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 3
+$ScriptVersion = 4
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -32,19 +32,29 @@ $TaskName = "StoreHQ Tank Reading"
 
 # The scheduled task: one quiet check every 5 minutes for this Windows user (the saved register login only works for this user).
 function Register-TankTask {
+  # Started through a tiny hidden launcher (wscript), so no window flashes on the screen every 5 minutes.
   $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
-  $act = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Site ' + $Site + ' -Poll') -WorkingDirectory $here
+  $ws = Join-Path $env:WINDIR "System32\wscript.exe"
+  $cmd = '"' + $ps + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Site ' + $Site + ' -Poll'
+  if (Test-Path $ws) {
+    $vbs = Join-Path $here "tankread-quiet.vbs"
+    Set-Content -Path $vbs -Encoding ASCII -Value ('CreateObject("WScript.Shell").Run "' + $cmd.Replace('"', '""') + '", 0, True')
+    $act = New-ScheduledTaskAction -Execute $ws -Argument ('//B //Nologo "' + $vbs + '"') -WorkingDirectory $here
+  } else {
+    $act = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Site ' + $Site + ' -Poll') -WorkingDirectory $here
+  }
   $trg = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::FromDays(3650))
   $set = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
   $pri = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive
   Register-ScheduledTask -TaskName $TaskName -Action $act -Trigger $trg -Settings $set -Principal $pri -Force | Out-Null
 }
-# Older versions ran at fixed times (12 AM, 6 AM, 12 PM, 6 PM). Switch this PC over to the 5-minute check once.
+# Keeps this PC's task current: a 5-minute check, started without a window popping up.
 function Ensure-TankTask {
   try {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    $ok = $t -and ($t.Actions | Where-Object { $_.Arguments -match '-Poll' }) -and ($t.Triggers | Where-Object { $_.Repetition.Interval -eq 'PT5M' })
-    if (-not $ok) { Register-TankTask; Log "Tank readings switched to a 5-minute check (reads every 2 hours, or right away on Read now)." }
+    $quiet = (-not (Test-Path (Join-Path $env:WINDIR "System32\wscript.exe"))) -or ($t -and ($t.Actions | Where-Object { $_.Execute -match 'wscript' }))
+    $ok = $t -and $quiet -and ($t.Triggers | Where-Object { $_.Repetition.Interval -eq 'PT5M' })
+    if (-not $ok) { Register-TankTask; Log "Tank task updated: a 5-minute check that runs without a window popping up." }
   } catch { Log ("Couldn't update the scheduled task: " + $_.Exception.Message) }
 }
 

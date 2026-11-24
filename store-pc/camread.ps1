@@ -16,7 +16,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 4
+$ScriptVersion = 5
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -267,6 +267,31 @@ function Run-ClipJobs($jobs, $base, $hostPort, $cred) {
 }
 
 # Self-update: Store HQ can hold a newer camera script (checked once a day, same checks as the other store PC scripts).
+# The scheduled task: a check every 5 minutes, started through a tiny hidden launcher (wscript) so no window flashes on the screen.
+function Register-CamTask {
+  $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $ws = Join-Path $env:WINDIR "System32\wscript.exe"
+  $cmd = '"' + $ps + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Poll'
+  if (Test-Path $ws) {
+    $vbs = Join-Path $here "camread-quiet.vbs"
+    Set-Content -Path $vbs -Encoding ASCII -Value ('CreateObject("WScript.Shell").Run "' + $cmd.Replace('"', '""') + '", 0, True')
+    $act = New-ScheduledTaskAction -Execute $ws -Argument ('//B //Nologo "' + $vbs + '"') -WorkingDirectory $here
+  } else {
+    $act = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Poll') -WorkingDirectory $here
+  }
+  $trg = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+  $set = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+  $pri = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive
+  Register-ScheduledTask -TaskName $TaskName -Action $act -Trigger $trg -Settings $set -Principal $pri -Force | Out-Null
+}
+# Older versions started PowerShell directly, which flashed a window every 5 minutes. Switch this PC over once.
+function Ensure-CamTask {
+  try {
+    if (-not (Test-Path (Join-Path $env:WINDIR "System32\wscript.exe"))) { return }
+    $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($t -and -not ($t.Actions | Where-Object { $_.Execute -match 'wscript' })) { Register-CamTask; Log "Camera task updated: it now runs without a window popping up." }
+  } catch { Log ("Couldn't update the scheduled task: " + $_.Exception.Message) }
+}
 function Update-Self {
   $stamp = Join-Path $here "camread.updcheck"
   if ((Test-Path $stamp) -and ((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalHours -lt 20) { return }
@@ -290,7 +315,7 @@ foreach ($b in @("http://$Recorder", "https://$Recorder")) {
   catch { $m = $_.Exception.Message; if ($m -match '401') { $err = "The recorder refused the login (wrong username or password). Run Setup cameras again and type it again." } elseif (-not $err) { $err = "Couldn't reach the recorder at $b : $m" } }
 }
 if ($Poll -and $base -and $Jobs -and $Jobs.items -and @($Jobs.items).Count) { Run-ClipJobs $Jobs $base ($base -replace '^https?://', '') $cred }
-if ($Poll -and -not $ReqId) { Update-Self; exit 0 }
+if ($Poll -and -not $ReqId) { Ensure-CamTask; Update-Self; exit 0 }
 $chans = @(); $snaps = @()
 if ($base) {
   $err = ""
@@ -326,12 +351,7 @@ Log ("Pictures: " + $snaps.Count + " of " + $chans.Count + " camera(s)" + $(if (
 if ($Setup) {
   if ($snaps.Count) {
     try {
-      $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
-      $act = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Poll') -WorkingDirectory $here
-      $trg = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::FromDays(3650))
-      $set = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
-      $pri = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive
-      Register-ScheduledTask -TaskName $TaskName -Action $act -Trigger $trg -Settings $set -Principal $pri -Force | Out-Null
+      Register-CamTask
       Log "Scheduled: a quiet check every 5 minutes; it only gets pictures when you tap Get fresh pictures in Store HQ."
       Write-Host ""; Write-Host "All set. The pictures are in Store HQ (Store > Cameras)."
     } catch { Log ("Couldn't create the scheduled task: " + $_.Exception.Message) }
