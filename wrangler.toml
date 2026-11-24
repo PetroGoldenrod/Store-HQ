@@ -32,3 +32,8 @@ invocation_logs = true
 type = "Text"
 globs = ["**/*.ps1"]
 fallthrough = true
+
+# Short camera clips around voids / no-sales (kept 30 days, set per clip).
+[[kv_namespaces]]
+binding = "CLIPS"
+id = "6114cf3ad7534b10855c0c5407b559d9"

@@ -160,7 +160,7 @@ async function managerCookie(env, store) {
   return "manager=" + store + "." + exp + "." + (await hmac(env["MANAGER_PASSWORD_" + store], "manager|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
 }
 // Pages a manager may not open.
-const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|cams(\/|$)|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
+const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|cams(\/|$)|clip$|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
 async function partnerCookie(env, store) {
   const exp = Date.now() + 30 * 86400000;
   return "partner=" + store + "." + exp + "." + (await hmac(env["PARTNER_PASSWORD_" + store], "partner|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
@@ -895,7 +895,9 @@ async function ownerApi(req, env, path, url) {
   if (path === "/api/day" && req.method === "GET") {
     const date = url.searchParams.get("date");
     if (!validDate(date)) return json({ error: "date" }, 400);
-    return json(await dayDataFull(env, S, date, c));
+    const dd = await dayDataFull(env, S, date, c);
+    if (!MGR && dd.voids) { try { const ix = await clipIndex(env, S); for (const [sh, v] of Object.entries(dd.voids)) for (const i of (v && v.items) || []) { if (!clipWorth(i)) continue; const k = clipKey(clipDate(date, i, sh), i), c = ix[k]; i.clip = c && c.size ? { key: k, fmt: c.fmt } : c && c.tries >= 3 ? { err: c.err || "no video" } : { wait: 1 }; } } catch {} }
+    return json(dd);
   }
   if (path === "/api/recent" && req.method === "GET") {
     const since = addDays(new Date().toISOString().slice(0, 10), -14);
@@ -1094,7 +1096,8 @@ async function ownerApi(req, env, path, url) {
       await env.DB.prepare("INSERT INTO photos (id, created, b64) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET created = excluded.created, b64 = excluded.b64").bind("cam-" + S + "-" + ch, now, b64).run();
       const c = chans.find(x => x.ch === ch); if (c) { c.at = now; c.ok = true; } n++;
     }
-    const doc = { at: now, ok: !b.err, err: String(b.err || "").slice(0, 300), recorder: String(b.recorder || "").slice(0, 80), model: String(b.model || "").slice(0, 80), ver: Number(b.version) || 0, channels: chans };
+    const prevCams = await camsDoc(env, S);
+    const doc = { clipCh: prevCams && prevCams.clipCh || "", at: now, ok: !b.err, err: String(b.err || "").slice(0, 300), recorder: String(b.recorder || "").slice(0, 80), model: String(b.model || "").slice(0, 80), ver: Number(b.version) || 0, channels: chans };
     await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'cams', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(doc), now).run();
     try { const q = await camReqDoc(env, S); if ((q.status === "waiting" || q.status === "running") && (!b.req || String(b.req) === String(q.id))) { q.status = n ? "done" : "failed"; q.finished = now; q.err = doc.err; await saveCamReq(env, S, q); } } catch {}
     return json({ ok: true, saved: n });
@@ -1116,6 +1119,59 @@ async function ownerApi(req, env, path, url) {
     if (!r) return new Response("No picture yet", { status: 404 });
     const bin = Uint8Array.from(atob(r.b64), c => c.charCodeAt(0));
     return new Response(bin, { headers: { "content-type": "image/jpeg", "cache-control": "private, max-age=60" } });
+  }
+  // ---- Void / no-sale clips: the store PC cuts ~25 s from the recorder around each one and uploads it (kept 30 days).
+  if (path === "/api/pc-clipjobs" && req.method === "GET") {
+    const cams = await camsDoc(env, S); if (!cams || !(cams.channels || []).length) return json({ items: [] });
+    const ch = cams.clipCh || (cams.channels.find(c => c.ok) || cams.channels[0]).ch;
+    const ix = await clipIndex(env, S), out = [], today = ymdNY(new Date());
+    const rows = await env.DB.prepare("SELECT date, shift, data FROM vf_voids WHERE store = ? AND date >= ? ORDER BY date DESC, shift DESC").bind(S, ymdNY(new Date(Date.now() - 3 * 864e5))).all();
+    for (const r of rows.results || []) {
+      let d; try { d = JSON.parse(r.data); } catch { continue; }
+      for (const i of d.items || []) {
+        if (!clipWorth(i)) continue;
+        const date = clipDate(r.date, i, r.shift), k = clipKey(date, i), have = ix[k];
+        if (have && (have.size || (have.tries || 0) >= 3)) continue;
+        out.push({ key: k, date, sec: i.sec, before: 10, after: 15 });
+        if (out.length >= 6) break;
+      }
+      if (out.length >= 6) break;
+    }
+    return json({ ch, items: out, today });
+  }
+  if (path === "/api/clip-upload" && req.method === "POST") {
+    const k = String(url.searchParams.get("key") || ""); if (!/^\d{4}-\d\d-\d\d_[0-9A-Za-z_]{4,60}$/.test(k)) return json({ error: "key" }, 400);
+    const ix = await clipIndex(env, S), cur = ix[k] || {}, err = String(url.searchParams.get("err") || "").slice(0, 200);
+    if (err) { ix[k] = { ...cur, err, tries: (cur.tries || 0) + 1, at: Date.now() }; await saveClipIndex(env, S, ix); return json({ ok: true }); }
+    const buf = await req.arrayBuffer();
+    if (buf.byteLength < 1000 || buf.byteLength > 24e6) { ix[k] = { ...cur, err: "bad size " + buf.byteLength, tries: (cur.tries || 0) + 1, at: Date.now() }; await saveClipIndex(env, S, ix); return json({ error: "size" }, 400); }
+    const fmt = url.searchParams.get("fmt") === "mp4" ? "mp4" : "ps";
+    await env.CLIPS.put("clip:" + S + ":" + k, buf, { expirationTtl: 30 * 86400, metadata: { fmt } });
+    ix[k] = { size: buf.byteLength, fmt, at: Date.now() };
+    await saveClipIndex(env, S, ix);
+    return json({ ok: true });
+  }
+  if (path === "/api/clip" && req.method === "GET") {
+    const k = String(url.searchParams.get("key") || "");
+    const o = await env.CLIPS.getWithMetadata("clip:" + S + ":" + k, { type: "arrayBuffer" });
+    if (!o || !o.value) return new Response("Clip not found (clips are kept 30 days)", { status: 404 });
+    const all = new Uint8Array(o.value), fmt = (o.metadata && o.metadata.fmt) || "mp4", type = fmt === "mp4" ? "video/mp4" : "video/mp2p";
+    const h = { "content-type": type, "accept-ranges": "bytes", "cache-control": "private, max-age=86400" };
+    if (fmt !== "mp4") h["content-disposition"] = 'attachment; filename="' + k + '.mp4"';
+    const m = /bytes=(\d*)-(\d*)/.exec(req.headers.get("range") || "");
+    if (m) {
+      let a = m[1] ? +m[1] : all.length - +m[2], b = m[1] && m[2] ? +m[2] : all.length - 1; if (!m[1]) b = all.length - 1;
+      a = Math.max(0, a); b = Math.min(all.length - 1, b);
+      return new Response(all.slice(a, b + 1), { status: 206, headers: { ...h, "content-range": "bytes " + a + "-" + b + "/" + all.length, "content-length": String(b - a + 1) } });
+    }
+    return new Response(all, { headers: { ...h, "content-length": String(all.length) } });
+  }
+  if (path === "/api/cams/clipcam" && req.method === "POST") {
+    const b = await req.json().catch(() => ({})), r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'cams'").bind(S).first();
+    if (!r) return json({ error: "No cameras yet" }, 400);
+    const d = JSON.parse(r.data); d.clipCh = String(b.ch || "");
+    await env.DB.prepare("UPDATE store_kv SET data = ? WHERE store = ? AND k = 'cams'").bind(JSON.stringify(d), S).run();
+    return json({ ok: true });
   }
   if (path === "/api/pc-tankreq" && req.method === "GET") {
     // Every 5 minutes from the store PC (tankread.ps1 -Poll): how often to read the tanks, and whether someone tapped "Read now".
@@ -1654,6 +1710,18 @@ async function homeAttention(env, S, MGR, st) {
   return A;
 }
 const TANK_EVERY_MIN = 120; // scheduled tank readings: every 2 hours (the store PC follows this number)
+async function camsDoc(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'cams'").bind(S).first(); try { return r ? JSON.parse(r.data) : null; } catch { return null; } }
+async function clipIndex(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'clips'").bind(S).first(); try { return r ? JSON.parse(r.data) : {}; } catch { return {}; } }
+async function saveClipIndex(env, S, ix) {
+  const cut = Date.now() - 31 * 864e5; for (const k of Object.keys(ix)) if ((ix[k].at || 0) < cut) delete ix[k];
+  await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'clips', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(ix), Date.now()).run();
+}
+// Which register events get a clip: no-sales, refunds, voided items, flagged ones, and voided tickets that aren't just a pump prepay.
+function clipWorth(i) { if (!i || !/^\d\d:\d\d:\d\d$/.test(i.sec || "")) return false; if (i.flag || i.kind === "No sale" || i.kind === "Refund" || i.kind === "Voided item") return true; return i.kind === "Voided ticket" && !/^(PREPAY CA #\d+[, ]*)+$/i.test(String(i.what || "").trim()); }
+// Shift 1 starts the evening before, so an event's calendar date can be the day before the business date.
+function clipDate(bizDate, i, shift) { const hh = +String(i.sec).slice(0, 2); if (+shift === 1 && hh >= 12) { const d = new Date(bizDate + "T12:00:00Z"); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); } return bizDate; }
+function clipKey(date, i) { return date + "_" + String(i.reg || "0").replace(/\W/g, "") + "_" + String(i.sec).replace(/:/g, "") + "_" + ({ "No sale": "N", "Refund": "R", "Voided item": "V", "Voided ticket": "T" }[i.kind] || "X"); }
+function ymdNY(d) { return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d); }
 async function camReqDoc(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'camreq'").bind(S).first(); try { return r ? JSON.parse(r.data) : {}; } catch { return {}; } }
 async function saveCamReq(env, S, d) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'camreq', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(d), Date.now()).run(); }
 async function tankReqDoc(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'tankreq'").bind(S).first(); try { return r ? JSON.parse(r.data) : {}; } catch { return {}; } }
@@ -2086,7 +2154,7 @@ const VL = (() => {
       seen[t.type + "|" + (t.reg || "") + "|" + (t.seq || tag(t.hdr, "uniqueID"))] = t;
     }
     const ev = [];
-    const base = t => ({ ts: t.date.slice(0, 16), reg: t.reg, cashier: t.cashier ? t.cashier.replace(/\b\w/g, c => c.toUpperCase()).replace(/\B\w+/g, w => w.toLowerCase()) : "" });
+    const base = t => ({ ts: t.date.slice(0, 16), sec: /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d/.test(t.date) ? t.date.slice(11, 19) : "", reg: t.reg, cashier: t.cashier ? t.cashier.replace(/\b\w/g, c => c.toUpperCase()).replace(/\B\w+/g, w => w.toLowerCase()) : "" });
     for (const t of Object.values(seen)) {
       if (t.type === "nosale") { ev.push({ ...base(t), kind: "No sale", amount: 0, what: "" }); continue; }
       if (t.type === "void") {
@@ -2113,7 +2181,7 @@ const VL = (() => {
       if (same.length) e.flag = "Same item voided " + (same.length + 1) + " times in 10 min";
     }
     return [1, 2, 3].map(sh => {
-      const items = ev.filter(e => shiftOf(e.ts) === sh).map(e => ({ time: e.ts.slice(11, 16), reg: e.reg, cashier: e.cashier, kind: e.kind, amount: r2(e.amount), what: e.what.slice(0, 90), flag: e.flag }));
+      const items = ev.filter(e => shiftOf(e.ts) === sh).map(e => ({ time: e.ts.slice(11, 16), sec: e.sec || "", reg: e.reg, cashier: e.cashier, kind: e.kind, amount: r2(e.amount), what: e.what.slice(0, 90), flag: e.flag }));
       return { shift: sh, cashiers: [...new Set(items.map(i => i.cashier).filter(Boolean))].sort(), items };
     });
   }
@@ -2314,7 +2382,7 @@ export default {
       if (pStore) { owner = true; req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.set("x-store", pStore); h.set("x-partner", pStore); if (mgr) h.set("x-role", "manager"); else h.delete("x-role"); return h; })() }); url.searchParams.set("store", pStore); }
       else if (req.headers.get("x-role")) { req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.delete("x-role"); return h; })() }); }
       // Nightly pulls: may call ONLY /api/sscs-import and /api/voids-import, with the secret in the x-import-token header.
-      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/pc-tankreq" || path === "/api/pc-camreq" || path === "/api/cam-upload" || path === "/api/reg-plu" || path === "/api/pc-regsend" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script" || path === "/api/pc-regsend" || path === "/api/pc-tankreq" || path === "/api/pc-camreq") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
+      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/pc-tankreq" || path === "/api/pc-camreq" || path === "/api/cam-upload" || path === "/api/pc-clipjobs" || path === "/api/clip-upload" || path === "/api/reg-plu" || path === "/api/pc-regsend" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script" || path === "/api/pc-regsend" || path === "/api/pc-tankreq" || path === "/api/pc-camreq" || path === "/api/pc-clipjobs") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
         safeEqual(await hmac("cmp", req.headers.get("x-import-token")), await hmac("cmp", env.SSCS_TOKEN));
       m = /^\/photo\/([a-z0-9]+)$/.exec(path);
       if (m) {
@@ -2676,6 +2744,7 @@ table.lg{border-collapse:collapse;font-size:.85rem;width:auto}tr.lgrow td{paddin
 .cg td:first-child{white-space:normal;min-width:170px;max-width:300px}.cg td.r,.cg th.r{text-align:right}.cg td.neg{color:var(--bad);font-weight:700}.cg tr.cgr{cursor:pointer}.cg tr.cgr:hover{background:var(--chip)}
 .cg tr.cgr.bad td:first-child{box-shadow:inset 4px 0 var(--bad)}.cg tr.cgr.blue td:first-child{box-shadow:inset 4px 0 #3b7bd4}.cg tr.cgr.warn td:first-child{box-shadow:inset 4px 0 var(--accent)}
 .cgchip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.78rem;font-weight:600;background:var(--chip);color:var(--muted)}
+.clipbtn{display:inline-block;margin-left:6px;padding:1px 8px;border-radius:999px;background:var(--accent,#2563eb);color:#fff;font-size:.78rem;font-weight:600;text-decoration:none}
 .camgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}.camf{margin:0}.camf img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:8px;display:block;background:#111}.camf figcaption{font-size:.85rem;margin-top:4px}.camx{aspect-ratio:16/9;border-radius:8px;background:var(--bad-soft);color:var(--bad);display:flex;align-items:center;justify-content:center;font-size:.8rem;padding:8px;text-align:center}
 .cgchip.bad{background:var(--bad-soft);color:var(--bad)}.cgchip.good{background:var(--good-soft);color:var(--good)}.cgchip.warn{background:var(--accent-soft);color:var(--accent-text)}.cgchip.blue{background:#dfeaf9;color:#1d4f91}
 .cgsum{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.cgsum .cgchip{font-size:.9rem;padding:4px 10px}
@@ -3159,8 +3228,11 @@ function voidsHtml(g){var V=(DAY&&DAY.voids)||{},items=[],got=false,pulled="";
   var head='Voids &amp; no-sales <span class="mute" style="font-weight:500">· '+vd.length+' void'+(vd.length===1?"":"s")+' '+money(tot)+' · '+ns+' no sale'+(ns===1?"":"s")+'</span>'+(fl?' <span class="pill warn">'+fl+' to check on camera</span>':' <span class="pill good">Nothing unusual</span>');
   if(!items.length)return '<details class="vd"><summary>'+head+'</summary><div class="mute" style="padding:0 12px 10px">No voids, refunds or no-sales from Verifone for this shift.</div></details>';
   var h='<details class="vd"'+(fl?" open":"")+'><summary>'+head+'</summary><div class="tw"><table><thead><tr><th>Time</th><th>Reg</th><th>Cashier</th><th>What</th><th class="r">Amount</th></tr></thead><tbody>';
-  items.forEach(function(i){h+='<tr'+(i.flag?' class="vflag"':'')+'><td class="num">'+esc(i.time)+'</td><td>'+esc(i.reg)+'</td><td>'+esc(i.cashier||"—")+'</td><td>'+esc(i.kind)+(i.what?': '+esc(i.what):'')+(i.flag?'<span class="s">'+esc(i.flag)+'</span>':'')+'</td><td class="r num">'+(i.kind==="No sale"?"—":money(i.amount))+'</td></tr>'});
+  items.forEach(function(i){h+='<tr'+(i.flag?' class="vflag"':'')+'><td class="num">'+esc(i.time)+'</td><td>'+esc(i.reg)+'</td><td>'+esc(i.cashier||"—")+'</td><td>'+esc(i.kind)+(i.what?': '+esc(i.what):'')+(i.flag?'<span class="s">'+esc(i.flag)+'</span>':'')+(i.clip?(i.clip.key?'<a class="clipbtn" href="/api/clip?key='+encodeURIComponent(i.clip.key)+'" data-clip="'+esc(i.clip.key)+'" data-fmt="'+esc(i.clip.fmt||"mp4")+'">▶ Clip</a>':i.clip.err?'<span class="s">No clip: '+esc(i.clip.err)+'</span>':'<span class="s">Clip coming overnight</span>'):'')+'</td><td class="r num">'+(i.kind==="No sale"?"—":money(i.amount))+'</td></tr>'});
   return h+'</tbody></table></div></details>';}
+$("day").addEventListener("click",function(e){var a=e.target.closest("[data-clip]");if(!a||a.dataset.fmt!=="mp4")return;e.preventDefault();var tr=a.closest("tr"),nx=tr.nextElementSibling;
+  if(nx&&nx.classList.contains("cliprow")){nx.remove();return}
+  tr.insertAdjacentHTML("afterend",'<tr class="cliprow"><td colspan="5"><video controls autoplay playsinline preload="auto" src="'+a.getAttribute("href")+'" style="width:100%;max-width:640px;border-radius:8px;background:#000"></video></td></tr>')});
 function dropsOf(id){var out=null;DAY.groups.forEach(function(g){g.registers.forEach(function(r){if(r.closeId===id)out=r.drops.slice()})});return out||[]}
 function saveDrops(id,list){api("/api/drops",{method:"POST",body:{closeId:id,amounts:list}}).then(loadDay).catch(function(e){alertLine(e.message)})}
 function alertLine(t){$("day").insertAdjacentHTML("afterbegin",'<div class="msg err">'+esc(t)+'</div>')}
@@ -3309,7 +3381,8 @@ function loadCams(){if(!camBound){camBound=true;$("camNow").addEventListener("cl
   api("/api/cams").then(function(j){CQ=j.req||{};var c=j.cams;camText();
     if(!c){$("camsub").textContent="Not connected yet. Run “Setup cameras” on this store’s PC once; the pictures show up here.";$("camgrid").innerHTML="";return}
     $("camsub").textContent=(c.model?c.model+" · ":"")+(c.channels||[]).length+" camera(s) · pictures from "+new Date(c.at).toLocaleString([], {weekday:"short",hour:"numeric",minute:"2-digit"})+(c.err?" · "+c.err:"");
-    $("camgrid").innerHTML=(c.channels||[]).map(function(x){return '<figure class="camf">'+(x.at?'<a href="/api/cams/img?ch='+encodeURIComponent(x.ch)+'&t='+x.at+'" target="_blank"><img loading="lazy" src="/api/cams/img?ch='+encodeURIComponent(x.ch)+'&t='+x.at+'" alt=""></a>':'<div class="camx">'+esc(x.err||"No picture")+'</div>')+'<figcaption>'+esc(x.name||("Camera "+x.ch))+'</figcaption></figure>'}).join("");cqPoll()}).catch(function(e){$("camsub").textContent="Couldn’t load: "+(e.message||e)})}
+    $("camgrid").innerHTML=(c.channels||[]).map(function(x){return '<figure class="camf">'+(x.at?'<a href="/api/cams/img?ch='+encodeURIComponent(x.ch)+'&t='+x.at+'" target="_blank"><img loading="lazy" src="/api/cams/img?ch='+encodeURIComponent(x.ch)+'&t='+x.at+'" alt=""></a>':'<div class="camx">'+esc(x.err||"No picture")+'</div>')+'<figcaption>'+esc(x.name||("Camera "+x.ch))+' '+(String(c.clipCh||(c.channels[0]||{}).ch)===String(x.ch)?'<span class="cgchip good">Used for void clips</span>':(x.at?'<button type="button" class="chip" data-clipcam="'+esc(x.ch)+'">Use for void clips</button>':''))+'</figcaption></figure>'}).join("");cqPoll()}).catch(function(e){$("camsub").textContent="Couldn’t load: "+(e.message||e)})}
+document.addEventListener("click",function(e){var b=e.target.closest("[data-clipcam]");if(!b)return;b.disabled=true;api("/api/cams/clipcam",{method:"POST",body:{ch:b.dataset.clipcam}}).then(loadCams).catch(function(x){b.disabled=false;alert(x.message)})});
 function cqPoll(){clearTimeout(cqTimer);var busy=CQ&&(CQ.status==="waiting"||CQ.status==="running")&&Date.now()-CQ.requested<30*60e3;if(busy&&Date.now()<cqUntil)cqTimer=setTimeout(function(){if($("v-cams").hidden)return;loadCams()},15000)}
 function camText(){var q=CQ||{},ago=function(t){var m=Math.round((Date.now()-t)/60000);return m<1?"just now":m+" min ago"},t="Pictures update when you tap the button.";
   if((q.status==="waiting"||q.status==="running")&&Date.now()-q.requested<30*60e3)t=q.status==="running"?"The store PC is getting the pictures now…":"Asked the store PC "+ago(q.requested)+". New pictures show here within about 5 minutes.";

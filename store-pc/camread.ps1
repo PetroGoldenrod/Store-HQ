@@ -16,7 +16,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 3
+$ScriptVersion = 4
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -45,11 +45,12 @@ public static class StoreHqCamCert {
 "@
 }
 
-# ---- Quiet 5-minute check: only works when someone asked for pictures.
-$ReqId = ""
+# ---- Quiet 5-minute check: pictures when someone asked for them, and clips for new voids / no-sales.
+$ReqId = ""; $Jobs = $null
 if ($Poll) {
   try { $q = Invoke-RestMethod -Uri "$Url/api/pc-camreq?store=$Store&v=$ScriptVersion" -Headers $H -TimeoutSec 30; if ($q.snap) { $ReqId = [string]$q.snap } } catch {}
-  if (-not $ReqId) { exit 0 }
+  try { $Jobs = Invoke-RestMethod -Uri "$Url/api/pc-clipjobs?store=$Store&v=$ScriptVersion" -Headers $H -TimeoutSec 30 } catch {}
+  if (-not $ReqId -and -not ($Jobs -and $Jobs.items -and @($Jobs.items).Count)) { exit 0 }
 }
 
 function Get-Cred {
@@ -173,12 +174,123 @@ $cred = Get-Cred
 if (-not $Recorder -or -not $cred) { Log "Not set up yet: run 'Setup cameras.bat' once."; try { Send @{ version = $ScriptVersion; err = "Cameras aren't set up on the store PC yet (run Setup cameras once)"; req = $ReqId; channels = @(); snaps = @() } } catch {}; exit 1 }
 [StoreHqCamCert]::Use(($Recorder -split ':')[0])
 
+# HTTP with Digest login over a plain socket. Needed because the recorder's download call is a GET that carries an XML body,
+# which .NET's web classes refuse to send. Writes the answer body to $outFile; returns @{ code; type }.
+function Md5Hex($t) { $m = [Security.Cryptography.MD5]::Create(); return ([BitConverter]::ToString($m.ComputeHash([Text.Encoding]::UTF8.GetBytes($t))) -replace "-", "").ToLower() }
+function RawHttp($hostPort, $method, $path, $body, $auth, $outFile) {
+  $hp = $hostPort.Split(':'); $h0 = $hp[0]; $port = if ($hp.Count -gt 1) { [int]$hp[1] } else { 80 }
+  $cl = New-Object Net.Sockets.TcpClient; $cl.ReceiveTimeout = 60000; $cl.SendTimeout = 30000; $cl.Connect($h0, $port)
+  try {
+    $ns = $cl.GetStream(); $bb = [Text.Encoding]::UTF8.GetBytes([string]$body)
+    $hd = "$method $path HTTP/1.1`r`nHost: $hostPort`r`nConnection: close`r`nContent-Type: application/xml`r`nContent-Length: " + $bb.Length + "`r`n"
+    if ($auth) { $hd += "Authorization: " + $auth + "`r`n" }
+    $hd += "`r`n"; $hb = [Text.Encoding]::ASCII.GetBytes($hd); $ns.Write($hb, 0, $hb.Length); if ($bb.Length) { $ns.Write($bb, 0, $bb.Length) }
+    # headers
+    $hdr = New-Object Text.StringBuilder; $last4 = ""
+    while ($true) { $b = $ns.ReadByte(); if ($b -lt 0) { break }; [void]$hdr.Append([char]$b); $last4 = ($last4 + [char]$b); if ($last4.Length -gt 4) { $last4 = $last4.Substring($last4.Length - 4) }; if ($last4 -eq "`r`n`r`n") { break } }
+    $ht = $hdr.ToString(); $code = 0; if ($ht -match '^HTTP/1\.[01] (\d+)') { $code = [int]$matches[1] }
+    $type = if ($ht -match '(?im)^Content-Type:\s*([^\r\n;]+)') { $matches[1].Trim() } else { "" }
+    $wa = if ($ht -match '(?im)^WWW-Authenticate:\s*Digest\s+([^\r\n]+)') { $matches[1] } else { "" }
+    $chunked = $ht -match '(?im)^Transfer-Encoding:\s*chunked'
+    $len = if ($ht -match '(?im)^Content-Length:\s*(\d+)') { [long]$matches[1] } else { -1 }
+    $fs = [IO.File]::Create($outFile)
+    try {
+      $buf = New-Object byte[] 65536
+      if ($chunked) {
+        while ($true) {
+          $line = ""; while ($true) { $b = $ns.ReadByte(); if ($b -lt 0) { break }; if ($b -eq 10) { break }; if ($b -ne 13) { $line += [char]$b } }
+          $sz = [Convert]::ToInt64((($line -split ';')[0]).Trim(), 16); if ($sz -le 0) { break }
+          $left = $sz; while ($left -gt 0) { $n = $ns.Read($buf, 0, [int][Math]::Min($buf.Length, $left)); if ($n -le 0) { break }; $fs.Write($buf, 0, $n); $left -= $n }
+          [void]$ns.ReadByte(); [void]$ns.ReadByte()
+        }
+      } else {
+        $left = $len; while ($left -ne 0) { $want = if ($left -lt 0) { $buf.Length } else { [int][Math]::Min($buf.Length, $left) }; $n = $ns.Read($buf, 0, $want); if ($n -le 0) { break }; $fs.Write($buf, 0, $n); if ($left -gt 0) { $left -= $n } }
+      }
+    } finally { $fs.Close() }
+    return @{ code = $code; type = $type; www = $wa }
+  } finally { $cl.Close() }
+}
+function DigestHeader($www, $method, $path, $cred) {
+  $p = @{}; foreach ($m in [regex]::Matches($www, '(\w+)="?([^",]*)"?')) { $p[$m.Groups[1].Value] = $m.Groups[2].Value }
+  $nc = "00000001"; $cn = [Guid]::NewGuid().ToString("N").Substring(0, 16)
+  $u = $cred.UserName; $pw = $cred.GetNetworkCredential().Password
+  $ha1 = Md5Hex ($u + ":" + $p["realm"] + ":" + $pw); $ha2 = Md5Hex ($method + ":" + $path)
+  if ($p["qop"]) { $resp = Md5Hex ($ha1 + ":" + $p["nonce"] + ":" + $nc + ":" + $cn + ":auth:" + $ha2); $q = ', qop=auth, nc=' + $nc + ', cnonce="' + $cn + '"' } else { $resp = Md5Hex ($ha1 + ":" + $p["nonce"] + ":" + $ha2); $q = "" }
+  $pw = $null
+  return 'Digest username="' + $u + '", realm="' + $p["realm"] + '", nonce="' + $p["nonce"] + '", uri="' + $path + '", response="' + $resp + '"' + $q + $(if ($p["opaque"]) { ', opaque="' + $p["opaque"] + '"' } else { "" })
+}
+function AuthedRaw($hostPort, $method, $path, $body, $cred, $outFile) {
+  $r = RawHttp $hostPort $method $path $body $null $outFile
+  if ($r.code -eq 401 -and $r.www) { $r = RawHttp $hostPort $method $path $body (DigestHeader $r.www $method $path $cred) $outFile }
+  return $r
+}
+function RecPost($base, $path, $xml, $cred, [int]$timeout = 30) {
+  $req = [Net.HttpWebRequest]::Create($base + $path); $req.Method = "POST"; $req.ContentType = "application/xml"
+  $req.Credentials = $cred.GetNetworkCredential(); $req.Timeout = $timeout * 1000; $req.ReadWriteTimeout = $timeout * 1000
+  $bb = [Text.Encoding]::UTF8.GetBytes($xml); $req.ContentLength = $bb.Length; $st = $req.GetRequestStream(); $st.Write($bb, 0, $bb.Length); $st.Close()
+  $resp = $req.GetResponse(); try { $sr = New-Object IO.StreamReader($resp.GetResponseStream()); return $sr.ReadToEnd() } finally { $resp.Close() }
+}
+# One clip: find the recording that covers the moment, then download just those seconds (sub-stream first, it's smaller).
+function Get-Clip($base, $hostPort, $ch, $date, $sec, [int]$before, [int]$after, $cred, $outFile) {
+  $t = [datetime]::ParseExact($date + " " + $sec, "yyyy-MM-dd HH:mm:ss", $null)
+  $a = $t.AddSeconds(-$before); $b = $t.AddSeconds($after)
+  foreach ($track in @(([int]$ch * 100 + 2), ([int]$ch * 100 + 1))) {
+    $xml = '<?xml version="1.0" encoding="UTF-8"?><CMSearchDescription><searchID>' + [Guid]::NewGuid().ToString().ToUpper() + '</searchID><trackList><trackID>' + $track + '</trackID></trackList><timeSpanList><timeSpan><startTime>' + $a.ToString("yyyy-MM-ddTHH:mm:ssZ") + '</startTime><endTime>' + $b.ToString("yyyy-MM-ddTHH:mm:ssZ") + '</endTime></timeSpan></timeSpanList><maxResults>5</maxResults><searchResultPostion>0</searchResultPostion><metadataList><metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor></metadataList></CMSearchDescription>'
+    try { $res = [xml](RecPost $base "/ISAPI/ContentMgmt/search" $xml $cred 30) } catch { continue }
+    $uri = $res.SelectSingleNode("//*[local-name()='playbackURI']"); if (-not $uri) { continue }
+    $pu = [string]$uri.InnerText
+    $pu = $pu -replace 'starttime=[0-9TZ]+', ('starttime=' + $a.ToString("yyyyMMddTHHmmssZ")) -replace 'endtime=[0-9TZ]+', ('endtime=' + $b.ToString("yyyyMMddTHHmmssZ"))
+    $dl = '<?xml version="1.0" encoding="UTF-8"?><downloadRequest><playbackURI>' + [Security.SecurityElement]::Escape($pu) + '</playbackURI></downloadRequest>'
+    $r = AuthedRaw $hostPort "GET" "/ISAPI/ContentMgmt/download" $dl $cred $outFile
+    if ($r.code -eq 200 -and (Get-Item $outFile).Length -gt 20000) {
+      $fsx = [IO.File]::OpenRead($outFile); $hb = New-Object byte[] 12; [void]$fsx.Read($hb, 0, 12); $fsx.Close()
+      $fmt = if ([Text.Encoding]::ASCII.GetString($hb, 4, 4) -eq "ftyp") { "mp4" } else { "ps" }
+      return @{ ok = $true; fmt = $fmt; track = $track }
+    }
+  }
+  return @{ ok = $false; err = "No recording found for that moment" }
+}
+function Run-ClipJobs($jobs, $base, $hostPort, $cred) {
+  $done = 0
+  foreach ($j in @($jobs.items)) {
+    $f = Join-Path $env:TEMP ("storehq-clip-" + $j.key + ".bin")
+    try {
+      $r = Get-Clip $base $hostPort $jobs.ch $j.date $j.sec ([int]$j.before) ([int]$j.after) $cred $f
+      if ($r.ok) {
+        Invoke-RestMethod -Method Post -Uri ("$Url/api/clip-upload?store=$Store&key=" + [Uri]::EscapeDataString($j.key) + "&fmt=" + $r.fmt) -Headers $H -ContentType "application/octet-stream" -InFile $f -TimeoutSec 180 | Out-Null
+        $done++
+      } else { Invoke-RestMethod -Method Post -Uri ("$Url/api/clip-upload?store=$Store&key=" + [Uri]::EscapeDataString($j.key) + "&err=" + [Uri]::EscapeDataString($r.err)) -Headers $H -TimeoutSec 30 | Out-Null }
+    } catch { try { Invoke-RestMethod -Method Post -Uri ("$Url/api/clip-upload?store=$Store&key=" + [Uri]::EscapeDataString($j.key) + "&err=" + [Uri]::EscapeDataString(($_.Exception.Message).Substring(0, [Math]::Min(150, $_.Exception.Message.Length)))) -Headers $H -TimeoutSec 30 | Out-Null } catch {} }
+    finally { Remove-Item $f -ErrorAction SilentlyContinue }
+  }
+  if (@($jobs.items).Count) { Log ("Clips: " + $done + " of " + @($jobs.items).Count + " uploaded.") }
+}
+
+# Self-update: Store HQ can hold a newer camera script (checked once a day, same checks as the other store PC scripts).
+function Update-Self {
+  $stamp = Join-Path $here "camread.updcheck"
+  if ((Test-Path $stamp) -and ((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalHours -lt 20) { return }
+  try {
+    Set-Content -Path $stamp -Value (Get-Date -Format s)
+    $u = Invoke-RestMethod -Method Get -Uri "$Url/api/pc-script?store=$Store&name=camread" -Headers $H -TimeoutSec 60
+    if ([int]$u.version -le $ScriptVersion) { return }
+    $txt = [string]$u.script
+    $hh = [Security.Cryptography.SHA256]::Create(); $got = ([BitConverter]::ToString($hh.ComputeHash([Text.Encoding]::UTF8.GetBytes($txt))) -replace "-", "").ToLower()
+    $ptok = $null; $perr = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($txt, [ref]$ptok, [ref]$perr)
+    if ($got -ne ([string]$u.sha256).ToLower() -or $txt -notmatch "# StoreHQ-camread" -or $txt -notmatch ('\$ScriptVersion = ' + [int]$u.version + '\b') -or ($perr -and $perr.Count)) { Log "Camera script update skipped: it didn't pass the checks."; return }
+    Copy-Item -Path $PSCommandPath -Destination (Join-Path $here "camread.prev.ps1") -Force
+    [IO.File]::WriteAllText($PSCommandPath, $txt, (New-Object Text.UTF8Encoding $false))
+    Log ("Camera script updated from v$ScriptVersion to v$($u.version).")
+  } catch {}
+}
 # ---- Read: camera list + one picture each
 $base = ""; $err = ""; $model = ""
 foreach ($b in @("http://$Recorder", "https://$Recorder")) {
   try { $r = RecGet $b "/ISAPI/System/deviceInfo" $cred 15; $base = $b; $x = [xml]([Text.Encoding]::UTF8.GetString($r.bytes)); $model = [string]$x.DeviceInfo.model + " " + [string]$x.DeviceInfo.deviceName; break }
   catch { $m = $_.Exception.Message; if ($m -match '401') { $err = "The recorder refused the login (wrong username or password). Run Setup cameras again and type it again." } elseif (-not $err) { $err = "Couldn't reach the recorder at $b : $m" } }
 }
+if ($Poll -and $base -and $Jobs -and $Jobs.items -and @($Jobs.items).Count) { Run-ClipJobs $Jobs $base ($base -replace '^https?://', '') $cred }
+if ($Poll -and -not $ReqId) { Update-Self; exit 0 }
 $chans = @(); $snaps = @()
 if ($base) {
   $err = ""
@@ -206,23 +318,6 @@ if ($base) {
   # Without a camera list, keep only the channels that answered.
   if (($chans | Where-Object { $_.ok }).Count -and -not ($chans | Where-Object { $_.name -notmatch '^Camera \d+$' })) { $chans = @($chans | Where-Object { $_.ok }) }
   if (-not $snaps.Count -and -not $err) { $err = "The recorder answered but gave no pictures." }
-}
-# Self-update: Store HQ can hold a newer camera script (checked once a day, same checks as the other store PC scripts).
-function Update-Self {
-  $stamp = Join-Path $here "camread.updcheck"
-  if ((Test-Path $stamp) -and ((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalHours -lt 20) { return }
-  try {
-    Set-Content -Path $stamp -Value (Get-Date -Format s)
-    $u = Invoke-RestMethod -Method Get -Uri "$Url/api/pc-script?store=$Store&name=camread" -Headers $H -TimeoutSec 60
-    if ([int]$u.version -le $ScriptVersion) { return }
-    $txt = [string]$u.script
-    $hh = [Security.Cryptography.SHA256]::Create(); $got = ([BitConverter]::ToString($hh.ComputeHash([Text.Encoding]::UTF8.GetBytes($txt))) -replace "-", "").ToLower()
-    $ptok = $null; $perr = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($txt, [ref]$ptok, [ref]$perr)
-    if ($got -ne ([string]$u.sha256).ToLower() -or $txt -notmatch "# StoreHQ-camread" -or $txt -notmatch ('\$ScriptVersion = ' + [int]$u.version + '\b') -or ($perr -and $perr.Count)) { Log "Camera script update skipped: it didn't pass the checks."; return }
-    Copy-Item -Path $PSCommandPath -Destination (Join-Path $here "camread.prev.ps1") -Force
-    [IO.File]::WriteAllText($PSCommandPath, $txt, (New-Object Text.UTF8Encoding $false))
-    Log ("Camera script updated from v$ScriptVersion to v$($u.version).")
-  } catch {}
 }
 $sent = $false
 try { Send @{ version = $ScriptVersion; recorder = $Recorder; model = $model.Trim(); err = $err; req = $ReqId; channels = @($chans); snaps = @($snaps) }; $sent = $true } catch { Log ("Upload to Store HQ failed: " + $_.Exception.Message) }
