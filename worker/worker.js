@@ -2869,15 +2869,10 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 .tw td .drops{justify-content:flex-end}
 }
 </style></head><body><main>
-<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h1 style="margin:0">Store <span>HQ</span></h1><div style="display:flex;gap:8px;align-items:center"><select id="store" aria-label="Store" style="width:auto;font-weight:700" hidden></select><button type="button" class="alt sm" id="setupBtn" aria-label="Setup" title="Setup" hidden>⚙</button></div></div>
+<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h1 style="margin:0">Store <span>HQ</span></h1><div style="display:flex;gap:8px;align-items:center"><select id="store" aria-label="Store" style="width:auto;font-weight:700" hidden></select><div style="position:relative"><button type="button" class="alt sm" id="setupBtn" aria-label="Menu" aria-haspopup="true" hidden>☰</button><div id="setupBox" hidden style="position:absolute;right:0;top:calc(100% + 6px);z-index:30;min-width:170px;background:var(--paper);border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.14);overflow:hidden"><button type="button" id="menuStaff" style="display:block;width:100%;margin:0;border:0;border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Cashiers</button><button type="button" id="signout" style="display:block;width:100%;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Log out</button></div></div></div></div>
 <section id="login" hidden><div class="card"><label for="pw">Password</label><input type="password" id="pw" autocomplete="current-password"><button id="lg" style="margin-top:12px;width:100%">Sign in</button><div id="lmsg"></div></div></section>
 <div id="app" hidden>
-<div class="tabs" role="tablist"><button data-v="home" class="on">Today</button><button data-v="day">Shifts</button><button data-v="people">People</button><button data-v="sales">Sales</button><button data-v="pl">Profit</button><button data-v="store">Store</button></div>
-<div id="setupBox" hidden>
- <div class="card"><h2>Add a cashier</h2><div class="row"><div><label for="nn">Name</label><input id="nn" autocomplete="off"></div><div><label for="nr">Hourly rate ($)</label><input id="nr" inputmode="decimal"></div></div><button id="add" style="margin-top:12px">Add and make link</button><div id="smsg"></div></div>
- <div class="card" id="chkCard"><h2>Photo reader</h2><div class="mute">Checks that your Claude API key works.</div><button id="chk" class="alt" style="margin-top:10px">Test photo reader</button><div id="cmsg"></div></div>
- <div style="margin:0 0 14px;text-align:right"><button type="button" class="alt" id="signout" hidden>Sign out</button></div>
-</div>
+<div class="tabs" role="tablist"><button data-v="home" class="on">Today</button><button data-v="day">Shifts</button><button data-v="people">Payroll</button><button data-v="sales">Sales</button><button data-v="pl">Profit</button><button data-v="store">Store</button></div>
 <div class="subnav" id="subnav" hidden></div>
 <section id="v-home"><div id="home"><div class="mute">Loading…</div></div></section>
 <section id="v-day" hidden>
@@ -2899,8 +2894,10 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  <div id="day"><div class="mute">Loading…</div></div>
 </section>
 <section id="v-staff" hidden>
+ <div class="card"><h2>Add a cashier</h2><div class="row"><div><label for="nn">Name</label><input id="nn" autocomplete="off"></div><div><label for="nr">Hourly rate ($)</label><input id="nr" inputmode="decimal"></div></div><button id="add" style="margin-top:12px">Add and make link</button><div id="smsg"></div></div>
  <div class="mute" style="margin:0 0 8px">Send each cashier their own link. Turn a cashier off and their link stops working right away.</div>
  <div class="staff" id="staff"></div>
+ <div class="card" id="chkCard"><h2>Photo reader</h2><div class="mute">Checks that your Claude API key works.</div><button id="chk" class="alt" style="margin-top:10px">Test photo reader</button><div id="cmsg"></div></div>
 </section>
 <section id="v-sales" hidden>
  <div class="ds">
@@ -3001,17 +2998,17 @@ $("invbox").addEventListener("toggle",function(){if(this.open)loadInv()});
 function today(){var d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function addDays(s,n){var d=new Date(s+"T12:00:00");d.setDate(d.getDate()+n);return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function fmtDay(s){var d=new Date(s+"T12:00:00");return d.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})}
-function show(signed){$("login").hidden=signed;$("app").hidden=!signed;$("signout").hidden=!signed;$("setupBtn").hidden=!signed;if(!signed)$("setupBox").hidden=true;if(signed){loadStores();loadView()}}
+function show(signed){$("login").hidden=signed;$("app").hidden=!signed;$("setupBtn").hidden=!signed;$("setupBox").hidden=true;if(signed){loadStores();loadView()}}
 // Phone: tables turn into stacked cards, so each cell carries its column name.
 function labelTables(){document.querySelectorAll(".tw table").forEach(function(t){var hr=t.tHead&&t.tHead.rows[t.tHead.rows.length-1];if(!hr)return;var names=[];
   Array.prototype.forEach.call(hr.cells,function(c){for(var i=0;i<(c.colSpan||1);i++)names.push(c.textContent.trim())});
   Array.prototype.forEach.call(t.tBodies,function(tb){Array.prototype.forEach.call(tb.rows,function(r){var i=0;Array.prototype.forEach.call(r.cells,function(c){if(!c.hasAttribute("data-label")&&names[i])c.setAttribute("data-label",names[i]);i+=c.colSpan||1})})})})}
 new MutationObserver(function(){if(labelTables.p)return;labelTables.p=requestAnimationFrame(function(){labelTables.p=0;labelTables()})}).observe(document.body,{childList:true,subtree:true});
 // Six tabs. Sales and Store have two views each; old names (staff, pay, movers, gas, cigs) still work for links.
-var VIEW={home:{s:["home"]},day:{s:["day"]},people:{s:["staff","pay"]},pl:{s:["pl"]},
+var VIEW={home:{s:["home"]},day:{s:["day"]},people:{s:["pay"]},cashiers:{s:["staff"]},pl:{s:["pl"]},
   sales:{sub:[["daily","Daily",["sales"]],["movers","Movers",["movers"]]]},store:{sub:[["fuel","Fuel",["tanks","gas"]],["cigs","Cig prices",["cigs"]],["cams","Cameras",["cams"]]]}};
 var SUB={sales:"daily",store:"fuel"},CUR="home";
-var OLD={staff:["people"],pay:["people"],movers:["sales","movers"],gas:["store","fuel"],cigs:["store","cigs"]};
+var OLD={staff:["cashiers"],pay:["people"],movers:["sales","movers"],gas:["store","fuel"],cigs:["store","cigs"]};
 function curSections(){var V=VIEW[CUR];if(V.s)return V.s;var sb=V.sub.filter(function(x){return x[0]===SUB[CUR]})[0]||V.sub[0];return sb[2]}
 function loadView(){var sec=curSections();sec.forEach(function(k){({home:loadHome,day:loadDay,staff:loadStaff,pay:loadPay,sales:loadSales,movers:loadMV,pl:loadPL,cigs:loadCG,gas:loadGas,tanks:loadTanks,cams:loadCams})[k]()})}
 function openView(v,sub){if(OLD[v]){sub=OLD[v][1]||sub;v=OLD[v][0]}if(!VIEW[v])v="home";CUR=v;if(sub)SUB[v]=sub;
@@ -3023,7 +3020,7 @@ function openView(v,sub){if(OLD[v]){sub=OLD[v][1]||sub;v=OLD[v][0]}if(!VIEW[v])v
   $("store").style.visibility=(v==="home"||PARTNER)?"hidden":"";loadView()}
 function goTab(v){openView(v)}
 $("subnav").addEventListener("click",function(e){var b=e.target.closest("button");if(b)openView(CUR,b.dataset.sub)});
-$("setupBtn").addEventListener("click",function(){var b=$("setupBox");b.hidden=!b.hidden;if(!b.hidden)window.scrollTo(0,0)});$("signout").addEventListener("click",function(){fetch("/api/logout",{method:"POST"}).then(function(){show(false)})});
+$("setupBtn").addEventListener("click",function(e){e.stopPropagation();var b=$("setupBox");b.hidden=!b.hidden});document.addEventListener("click",function(){$("setupBox").hidden=true});$("menuStaff").addEventListener("click",function(){openView("cashiers");window.scrollTo(0,0)});$("signout").addEventListener("click",function(){fetch("/api/logout",{method:"POST"}).then(function(){show(false)})});
 var PARTNER=false,MANAGER=false;
 function applyRole(){var pc=$("chkCard");if(pc)pc.hidden=MANAGER;["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl)$/.test(CUR)||(CUR==="store"&&(SUB.store==="cigs"||SUB.store==="cams"))))openView("home");else if(CUR==="store")openView("store")}
 function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(location.hash==="#fuel"){try{history.replaceState(null,"",location.pathname)}catch(e){}openView("store","fuel")}if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
