@@ -1381,7 +1381,7 @@ async function ownerApi(req, env, path, url) {
         items = { before: { days: 0, q: 0, amt: 0 }, after: { days: 0, q: 0, amt: 0 }, names: {} };
         for (const r of rows.results || []) {
           const dt = r.k.slice(6), w = dt < p.start ? items.before : items.after; w.days++;
-          for (const [desc, v] of Object.entries(JSON.parse(r.data))) if (rx.test(desc)) { w.q += v[0]; w.amt += v[1]; items.names[desc] = (items.names[desc] || 0) + v[0]; }
+          for (const [desc, v] of Object.entries(JSON.parse(r.data))) if (rx.test(desc) && (!(p.depts || []).length || !v[2] || p.depts.includes(String(v[2])))) { w.q += v[0]; w.amt += v[1]; items.names[desc] = (items.names[desc] || 0) + v[0]; }
         }
         items.first = (rows.results || []).length ? rows.results[0].k.slice(6) : null;
       }
