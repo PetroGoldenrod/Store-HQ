@@ -1376,7 +1376,8 @@ async function ownerApi(req, env, path, url) {
       }
       let items = null;
       if ((p.words || []).length) {
-        const rx = new RegExp(p.words.map(x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "i");
+        const esc_ = x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), inc = p.words.filter(x => !x.startsWith("-")), exc = p.words.filter(x => x.startsWith("-")).map(x => x.slice(1)).filter(Boolean);
+        const rxIn = new RegExp(inc.map(esc_).join("|") || "$^", "i"), rxOut = exc.length ? new RegExp(exc.map(esc_).join("|"), "i") : null, rx = { test: t => rxIn.test(t) && !(rxOut && rxOut.test(t)) };
         const rows = await env.DB.prepare("SELECT k, data FROM store_kv WHERE store = ? AND k BETWEEN ? AND ?").bind(S, "items:" + b0, "items:" + end).all();
         items = { before: { days: 0, q: 0, amt: 0 }, after: { days: 0, q: 0, amt: 0 }, names: {} };
         for (const r of rows.results || []) {
