@@ -1537,7 +1537,7 @@ async function ownerApi(req, env, path, url) {
     for (const sh of b.shifts.slice(0, 3)) {
       const k = Number(sh && sh.shift); if (![1, 2, 3].includes(k)) continue;
       const items = (Array.isArray(sh.items) ? sh.items : []).slice(0, 300).map(i => ({
-        time: clean(i.time).slice(0, 5), reg: clean(i.reg).slice(0, 8), cashier: clean(i.cashier).slice(0, 40), kind: clean(i.kind).slice(0, 30),
+        time: clean(i.time).slice(0, 5), sec: /^\d\d:\d\d:\d\d$/.test(String(i.sec || "")) ? String(i.sec) : "", reg: clean(i.reg).slice(0, 8), cashier: clean(i.cashier).slice(0, 40), kind: clean(i.kind).slice(0, 30),
         amount: r2(Number(i.amount) || 0), what: clean(i.what), flag: clean(i.flag).slice(0, 60) }));
       const data = { items, cashiers: (Array.isArray(sh.cashiers) ? sh.cashiers : []).slice(0, 10).map(x => clean(x).slice(0, 40)),
         noSales: items.filter(i => i.kind === "No sale").length };
