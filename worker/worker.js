@@ -160,7 +160,7 @@ async function managerCookie(env, store) {
   return "manager=" + store + "." + exp + "." + (await hmac(env["MANAGER_PASSWORD_" + store], "manager|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
 }
 // Pages a manager may not open.
-const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|cams(\/|$)|clip$|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
+const MANAGER_BLOCKED = /^\/api\/(pnl(\/|$)|movers$|cigs(\/|$)|cams(\/|$)|clip$|promos$|kkc-weeks$|registers\/|sales$|sales-extra$|daily-preview$|desk\/|inv\/)/;
 async function partnerCookie(env, store) {
   const exp = Date.now() + 30 * 86400000;
   return "partner=" + store + "." + exp + "." + (await hmac(env["PARTNER_PASSWORD_" + store], "partner|" + store + "|" + exp)) + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" + 30 * 86400;
@@ -1209,6 +1209,7 @@ async function ownerApi(req, env, path, url) {
       if (!d.sessions.length) continue;
       const a = await sub("/api/vfcash-import", { date: d.date, pulledAt, sessions: d.sessions });
       const v = await sub("/api/voids-import", { date: d.date, pulledAt, shifts: d.voids });
+      try { if (d.items && Object.keys(d.items).length) await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, ?, ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, "items:" + d.date, JSON.stringify(d.items), Date.now()).run(); } catch (e) { console.error("items", e && e.message); }
       res.push({ date: d.date, sessions: a.saved || 0, voidShifts: v.saved || 0 });
     }
     return json({ ok: true, store: S, days: res });
@@ -1360,6 +1361,59 @@ async function ownerApi(req, env, path, url) {
     const d = { reg: n(b.reg), dsl: n(b.dsl) };
     await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'gas', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(d), Date.now()).run();
     return json({ ok: true });
+  }
+  // ---- Promo results (Sales > Movers): each promo = start date + departments and/or item words. Before = the 28 days before it started.
+  if (path === "/api/promos" && req.method === "GET") {
+    const list = await promoList(env, S), out = [];
+    const today = localDate(Date.now(), env.TIMEZONE || "America/New_York"), yday = addDays(today, -1);
+    for (const p of list) {
+      const end = p.end && p.end < yday ? p.end : yday, b0 = addDays(p.start, -28), b1 = addDays(p.start, -1);
+      const day = await env.DB.prepare("SELECT date, SUM(json_extract(data,'$.sales.customers')) cust, SUM(json_extract(data,'$.sales.merch')) merch, json_group_array(json_extract(data,'$.depts')) depts FROM vs_day WHERE store = ? AND date BETWEEN ? AND ? GROUP BY date").bind(S, b0, end).all();
+      const per = { before: { days: 0, cust: 0, merch: 0, q: 0, amt: 0 }, after: { days: 0, cust: 0, merch: 0, q: 0, amt: 0 } };
+      for (const r of day.results || []) {
+        const w = r.date < p.start ? per.before : per.after; w.days++; w.cust += r.cust || 0; w.merch += r.merch || 0;
+        if ((p.depts || []).length) for (const arr of JSON.parse(r.depts || "[]")) for (const d of (typeof arr === "string" ? JSON.parse(arr) : arr) || []) if (p.depts.includes(String(d[0]))) { w.q += Number(d[2]) || 0; w.amt += Number(d[3]) || 0; }
+      }
+      let items = null;
+      if ((p.words || []).length) {
+        const rx = new RegExp(p.words.map(x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "i");
+        const rows = await env.DB.prepare("SELECT k, data FROM store_kv WHERE store = ? AND k BETWEEN ? AND ?").bind(S, "items:" + b0, "items:" + end).all();
+        items = { before: { days: 0, q: 0, amt: 0 }, after: { days: 0, q: 0, amt: 0 }, names: {} };
+        for (const r of rows.results || []) {
+          const dt = r.k.slice(6), w = dt < p.start ? items.before : items.after; w.days++;
+          for (const [desc, v] of Object.entries(JSON.parse(r.data))) if (rx.test(desc)) { w.q += v[0]; w.amt += v[1]; items.names[desc] = (items.names[desc] || 0) + v[0]; }
+        }
+        items.first = (rows.results || []).length ? rows.results[0].k.slice(6) : null;
+      }
+      out.push({ ...p, upto: end, per, items });
+    }
+    return json({ promos: out, depts: await deptNames(env, S) });
+  }
+  if (path === "/api/promos" && req.method === "POST") {
+    const b = await readBody(req, 2e4); let list = await promoList(env, S);
+    if (b.del) list = list.filter(x => x.id !== b.del);
+    else {
+      if (!validDate(b.start) || !String(b.name || "").trim()) return json({ error: "Give the promo a name and a start date." }, 400);
+      const p = { id: b.id || Date.now().toString(36), name: String(b.name).trim().slice(0, 60), start: b.start, end: validDate(b.end) ? b.end : "", depts: (Array.isArray(b.depts) ? b.depts : []).map(String).filter(x => /^\d{1,4}$/.test(x)).slice(0, 10), words: (Array.isArray(b.words) ? b.words : String(b.words || "").split(",")).map(x => String(x).trim()).filter(Boolean).slice(0, 10), note: String(b.note || "").slice(0, 200) };
+      list = list.filter(x => x.id !== p.id); list.push(p);
+    }
+    await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'promos', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(list), Date.now()).run();
+    return json({ ok: true });
+  }
+  // ---- Chicken profit by week: chicken sales (dept 79) vs chicken invoices (Sysco, Restaurant Depot) by invoice date.
+  if (path === "/api/kkc-weeks" && req.method === "GET") {
+    const tz = env.TIMEZONE || "America/New_York", today = localDate(Date.now(), tz), n = Math.min(26, Math.max(4, Number(url.searchParams.get("weeks")) || 10));
+    const dow = (new Date(today + "T12:00:00Z").getUTCDay() + 6) % 7, mon = addDays(today, -dow), first = addDays(mon, -7 * (n - 1));
+    const kv = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'kkcvendors'").bind(S).first();
+    const vend = kv ? JSON.parse(kv.data) : ["SYSCO", "RDEPOT"];
+    const sales = await env.DB.prepare("SELECT date, SUM((SELECT SUM(json_extract(value,'$[3]')) FROM json_each(data,'$.depts') WHERE json_extract(value,'$[0]')='79')) amt FROM vs_day WHERE store = ? AND date >= ? GROUP BY date").bind(S, first).all();
+    const inv = await env.DB.prepare("SELECT json_extract(data,'$.date') d, json_extract(data,'$.code') c, json_extract(data,'$.vendor') v, json_extract(data,'$.total') t, json_extract(data,'$.number') no FROM inv_job WHERE store = ? AND json_extract(data,'$.date') >= ? AND status NOT LIKE '%del%'").bind(S, first).all();
+    const W = []; for (let i = 0; i < n; i++) { const a = addDays(first, 7 * i); W.push({ from: a, to: addDays(a, 6), sales: 0, days: 0, cost: 0, invoices: [] }); }
+    const wk = d => W.find(w => d >= w.from && d <= w.to);
+    for (const r of sales.results || []) { const w = wk(r.date); if (w) { w.sales += r.amt || 0; w.days++; } }
+    for (const r of inv.results || []) { if (!vend.includes(String(r.c || "").toUpperCase())) continue; const w = wk(r.d); if (w) { w.cost += Number(r.t) || 0; w.invoices.push({ vendor: r.v, date: r.d, total: Number(r.t) || 0, number: r.no }); } }
+    for (const w of W) { w.sales = r2(w.sales); w.cost = r2(w.cost); }
+    return json({ weeks: W, vendors: vend, today });
   }
   if (path === "/api/movers" && req.method === "GET") {
     // Saved snapshot: { cur, prev, rows: [[plu, dept, unitsNow, unitsBefore]] }. Names and shelf prices come from the store's price book.
@@ -1710,6 +1764,8 @@ async function homeAttention(env, S, MGR, st) {
   return A;
 }
 const TANK_EVERY_MIN = 120; // scheduled tank readings: every 2 hours (the store PC follows this number)
+async function promoList(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'promos'").bind(S).first(); try { return r ? JSON.parse(r.data) : []; } catch { return []; } }
+async function deptNames(env, S) { try { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'movers'").bind(S).first(); return r ? JSON.parse(r.data).depts || {} : {}; } catch { return {}; } }
 async function camsDoc(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'cams'").bind(S).first(); try { return r ? JSON.parse(r.data) : null; } catch { return null; } }
 async function clipIndex(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'clips'").bind(S).first(); try { return r ? JSON.parse(r.data) : {}; } catch { return {}; } }
 async function saveClipIndex(env, S, ix) {
@@ -2067,6 +2123,18 @@ const VL = (() => {
     while ((m = re.exec(body))) P.push({ type: m[1], dup: /duplicate="true"/.test(m[2]), name: unesc(tag(m[3], "trpPaycode")).toUpperCase(), amt: num(tag(m[3], "trpAmt")) });
     return P;
   }
+  // Items sold that day (by register description): { desc: [qty, amount, dept] }. Used for promo results.
+  function buildItems(log) {
+    const acc = {}; if (!log) return acc;
+    for (const t of log.trans) {
+      if (t.suspended || !/^(sale|network sale)$/.test(t.type)) continue;
+      for (const l of lines(t.body)) {
+        if (!l.desc || l.type.startsWith("void") || l.netVoid || (l.sign || "").startsWith("-")) continue;
+        const a = acc[l.desc] || (acc[l.desc] = [0, 0, l.dept]); a[0] += l.qty || 1; a[1] = r2(a[1] + (l.tot || 0));
+      }
+    }
+    return acc;
+  }
   const shiftOf = iso => { const h = +iso.slice(11, 13); return (h >= 22 || h < 6) ? 1 : (h < 14 ? 2 : 3); };
 
   // Build sessions from one or more day logs (pass yesterday's and today's so sessions crossing the day close are whole).
@@ -2217,7 +2285,7 @@ const VL = (() => {
         drawerExpected: s.drawerExpected, drawerEntered: s.drawerEntered, overShort: s.overShort, noSales: s.noSales, voidAmt: s.voidAmt, voidCount: s.voidCount,
         lotto: s.lotto, note: s.note || "" }));
       const log = logs.find(l => l.date === d);
-      out.push({ date: d, sessions, voids: buildVoids(log) });
+      out.push({ date: d, sessions, voids: buildVoids(log), items: buildItems(log) });
     }
     return out;
   }
@@ -2745,6 +2813,7 @@ table.lg{border-collapse:collapse;font-size:.85rem;width:auto}tr.lgrow td{paddin
 .cg tr.cgr.bad td:first-child{box-shadow:inset 4px 0 var(--bad)}.cg tr.cgr.blue td:first-child{box-shadow:inset 4px 0 #3b7bd4}.cg tr.cgr.warn td:first-child{box-shadow:inset 4px 0 var(--accent)}
 .cgchip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.78rem;font-weight:600;background:var(--chip);color:var(--muted)}
 .clipbtn{display:inline-block;margin-left:6px;padding:1px 8px;border-radius:999px;background:var(--accent,#2563eb);color:#fff;font-size:.78rem;font-weight:600;text-decoration:none}
+.prm{border-top:1px solid var(--line,#e5e7eb);padding-top:10px;margin-top:10px}.prm:first-child{border-top:0;margin-top:0;padding-top:0}
 .camgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}.camf{margin:0}.camf img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:8px;display:block;background:#111}.camf figcaption{font-size:.85rem;margin-top:4px}.camx{aspect-ratio:16/9;border-radius:8px;background:var(--bad-soft);color:var(--bad);display:flex;align-items:center;justify-content:center;font-size:.8rem;padding:8px;text-align:center}
 .cgchip.bad{background:var(--bad-soft);color:var(--bad)}.cgchip.good{background:var(--good-soft);color:var(--good)}.cgchip.warn{background:var(--accent-soft);color:var(--accent-text)}.cgchip.blue{background:#dfeaf9;color:#1d4f91}
 .cgsum{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.cgsum .cgchip{font-size:.9rem;padding:4px 10px}
@@ -2826,6 +2895,7 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
   <div class="nav"><button type="button" id="lprev">‹ Prev</button><b id="lname">Loading…</b><button type="button" id="lnext">Next ›</button></div>
   <p class="sub" id="lsub"></p>
   <div class="card"><h2 id="lstT">Net profit</h2><div class="plst" id="lst"><div class="mute">Loading…</div></div><div class="warn-line" id="lstN" hidden style="margin-top:10px">Gross profit for this month isn't in yet. Enter it below, or ask Claude to fill it from the Sunray month-end reports.</div></div>
+  <div class="card"><h2>Chicken by week</h2><p class="sub">Chicken sales (register) against chicken invoices from Sysco and Restaurant Depot on the Invoice Desk, by invoice date. Weeks run Monday to Sunday.</p><div id="kkcw"><div class="mute">Loading…</div></div></div>
   <div class="card"><h2>Gross profit from Sunray</h2><div class="mute" style="margin-bottom:10px">Merchandise sales and the cost of what sold, from the Sunray Sales Gross Profit report. Enter the expFOODSERVICE (3002) total as KKC food cost.</div>
    <div class="plg"><div><label for="gSales">Merchandise sales</label><input id="gSales" inputmode="decimal" placeholder="0.00"></div><div><label for="gCost">Cost of goods sold</label><input id="gCost" inputmode="decimal" placeholder="0.00"></div><div><label for="gFood">KKC food cost (3002)</label><input id="gFood" inputmode="decimal" placeholder="0.00"></div><div><label for="gFuel">Fuel gross profit</label><input id="gFuel" inputmode="decimal" placeholder="0.00"></div></div>
    <button id="gSave" style="margin-top:12px">Save gross profit</button><div class="mute" id="gNote" style="margin-top:8px"></div></div>
@@ -2839,6 +2909,11 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 </section>
 <section id="v-movers" hidden>
  <div class="ds mv">
+  <div class="card" id="promoCard"><h2>Promos</h2><p class="sub">How each promo is doing: the days since it started against the 28 days before it.</p><div id="promoList"><div class="mute">Loading…</div></div>
+   <details style="margin-top:10px"><summary><b>Add a promo</b></summary>
+    <div class="plg" style="margin-top:8px"><div><label for="prName">Name</label><input id="prName" placeholder="99¢ coffee"></div><div><label for="prStart">Started</label><input id="prStart" type="date"></div><div><label for="prEnd">Ended (optional)</label><input id="prEnd" type="date"></div>
+    <div><label for="prDept">Department</label><select id="prDept"><option value="">—</option></select></div><div><label for="prWords">Item names contain (comma-separated)</label><input id="prWords" placeholder="coffee"></div></div>
+    <button type="button" id="prAdd" style="margin-top:10px">Add promo</button> <span class="mute" id="prMsg"></span></details></div>
   <p class="sub" id="mvsub">Loading…</p>
   <div id="mvbody"></div>
  </div>
@@ -3006,7 +3081,25 @@ function alertMsg(x){if(x&&x.message!=="signin")$("cgsub").textContent="Couldn't
 var MV_DEPT={"2":"Cigarettes","3":"Other tobacco","4":"Beer","5":"Wine","6":"Liquor","7":"Packaged beverages","8":"Candy","9":"Fluid milk","10":"Other dairy & deli","11":"Sandwiches & meat snacks","12":"Ice cream","15":"Salty snacks","16":"Sweet snacks","17":"Alternative snacks","18":"Refrigerated snacks","19":"Edible grocery","20":"Non-edible grocery","21":"Health & beauty","22":"General merchandise","24":"Automotive","29":"Boiled peanuts","31":"Store brand drinks","32":"Frozen dispensed","67":"Vapor","79":"KKC"};
 var MV={d:null,store:"",metric:"u",dept:"",all:{up:false,dn:false},min:5,q:""};
 function mvName(k){var D=MV.d&&MV.d.depts;if(D&&D[k])return D[k].charAt(0)+D[k].slice(1).toLowerCase();return MV_DEPT[k]||("Department "+k)}
-function loadMV(){if(MV.store!==STORE){MV.d=null;MV.store=STORE;MV.dept=""}$("mvsub").textContent="Loading…";
+var PR={bound:false};
+function loadPromos(){if(!PR.bound){PR.bound=true;$("prAdd").addEventListener("click",function(){var b={name:$("prName").value,start:$("prStart").value,end:$("prEnd").value,depts:$("prDept").value?[$("prDept").value]:[],words:$("prWords").value};
+    $("prMsg").textContent="Saving…";api("/api/promos",{method:"POST",body:b}).then(function(){$("prMsg").textContent="Added.";$("prName").value="";$("prWords").value="";loadPromos()}).catch(function(e){$("prMsg").textContent=e.message||e})});
+  $("promoList").addEventListener("click",function(e){var x=e.target.closest("[data-prdel]");if(!x)return;if(x.dataset.sure!=="1"){x.dataset.sure="1";x.textContent="Tap again to remove";return}api("/api/promos",{method:"POST",body:{del:x.dataset.prdel}}).then(loadPromos)})}
+  api("/api/promos").then(function(j){var D=j.depts||{},sel=$("prDept");if(sel.options.length<2)Object.keys(D).sort(function(a,b){return a-b}).forEach(function(k){var o=document.createElement("option");o.value=k;o.textContent=k+" · "+D[k];sel.appendChild(o)});
+    var L=j.promos||[];if(!L.length){$("promoList").innerHTML='<div class="mute">No promos yet. Add one below with the day it started.</div>';return}
+    $("promoList").innerHTML=L.slice().sort(function(a,b){return a.start<b.start?1:-1}).map(prHtml).join("")}).catch(function(e){$("promoList").innerHTML='<div class="mute">'+esc(e.message||e)+'</div>'})}
+function prHtml(p){var B=p.per.before,A=p.per.after,f=function(v,n){return n?v/n:null},row=function(lbl,b,a,m){if(b==null&&a==null)return"";var ch=b&&a!=null?Math.round((a-b)/b*100):null;
+    return '<tr><td>'+lbl+'</td><td class="r num">'+(b==null?"—":m(b))+'</td><td class="r num">'+(a==null?"—":m(a))+'</td><td class="r num">'+(ch==null?"":'<span class="cgchip '+(ch>=3?"good":ch<=-3?"bad":"")+'">'+(ch>0?"+":"")+ch+'%</span>')+'</td></tr>'};
+  var m$=function(v){return money(v)},mn=function(v){return (Math.round(v*10)/10).toLocaleString()},dn=(p.depts||[]).map(function(d){return d}).join(", ");
+  var h='<div class="prm"><div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline"><b>'+esc(p.name)+'</b><button type="button" class="chip" data-prdel="'+esc(p.id)+'">Remove</button></div><div class="mute" style="font-size:.85rem">Since '+esc(p.start)+(p.end?" to "+esc(p.end):"")+' · '+A.days+' day'+(A.days===1?"":"s")+' in'+(A.days<7?" (early, give it a week)":"")+'</div>';
+  h+='<div class="tw"><table style="min-width:0"><thead><tr><th>Per day</th><th class="r">Before</th><th class="r">Since</th><th class="r">Change</th></tr></thead><tbody>';
+  h+=row("Customers",f(B.cust,B.days),f(A.cust,A.days),mn)+row("Inside sales",f(B.merch,B.days),f(A.merch,A.days),m$);
+  if((p.depts||[]).length)h+=row("Dept "+esc(dn)+" sales",f(B.amt,B.days),f(A.amt,A.days),m$)+row("Dept "+esc(dn)+" items",f(B.q,B.days),f(A.q,A.days),mn);
+  if(p.items){var I=p.items;h+=row("“"+esc((p.words||[]).join(", "))+"” sold",f(I.before.q,I.before.days),f(I.after.q,I.after.days),mn)+row("“"+esc((p.words||[]).join(", "))+"” $",f(I.before.amt,I.before.days),f(I.after.amt,I.after.days),m$)}
+  h+='</tbody></table></div>';
+  if(p.items&&!p.items.before.days)h+='<div class="mute" style="font-size:.8rem">Item counts start '+(p.items.first||"tonight")+', so there’s no “before” for items; the department line covers before.</div>';
+  return h+'</div>'}
+function loadMV(){loadPromos();if(MV.store!==STORE){MV.d=null;MV.store=STORE;MV.dept=""}$("mvsub").textContent="Loading…";
   api("/api/movers").then(function(j){MV.d=j;renderMV()}).catch(function(x){if(x.message!=="signin")$("mvsub").textContent="Couldn't load: "+x.message})}
 function mvVal(r,i){return MV.metric==="u"?r[i]:r[i]*r[5]}
 function mvFmt(n){return MV.metric==="u"?Math.round(n).toLocaleString():"$"+Math.round(n).toLocaleString()}
@@ -3089,7 +3182,14 @@ function plNum(v){var n=parseFloat(String(v==null?"":v).replace(/[$,\\s]/g,""));
 function plKind(c){for(var i=0;i<PL_CATS.length;i++)if(PL_CATS[i][1]===c)return PL_CATS[i][0];return "out"}
 $("eCat").innerHTML='<optgroup label="Money in">'+PL_CATS.filter(function(c){return c[0]==="in"}).map(function(c){return '<option>'+esc(c[1])+'</option>'}).join("")+'</optgroup><optgroup label="Money out">'+PL_CATS.filter(function(c){return c[0]==="out"}).map(function(c){return '<option>'+esc(c[1])+'</option>'}).join("")+'</optgroup>';
 $("eCat").value="Rent";
-function loadPL(){if(PL.store!==STORE){PL.d=null;PL.store=STORE}if(!PL.d)$("lst").innerHTML='<div class="mute">Loading…</div><div></div>';
+function loadKW(){api("/api/kkc-weeks").then(function(j){var W=(j.weeks||[]).slice().reverse(),h='<div class="tw"><table><thead><tr><th>Week</th><th class="r">Chicken sales</th><th class="r">Chicken invoices</th><th class="r">Food cost</th><th class="r">Left after food</th></tr></thead><tbody>';
+  W.forEach(function(w){var pc=w.sales&&w.cost?Math.round(w.cost/w.sales*100):null,cur=w.to>=j.today;
+    h+='<tr><td>'+esc(fmtShort(w.from))+' – '+esc(fmtShort(w.to))+(cur?' <span class="mute">(so far)</span>':'')+'</td><td class="r num">'+money(w.sales)+'</td><td class="r num">'+(w.invoices.length?money(w.cost)+'<div class="mute" style="font-size:.75rem">'+w.invoices.length+' invoice'+(w.invoices.length>1?"s":"")+'</div>':'<span class="mute">none entered</span>')+'</td><td class="r num">'+(pc==null?"—":'<span class="cgchip '+(pc<=50?"good":pc>=60?"bad":"")+'">'+pc+'%</span>')+'</td><td class="r num">'+(w.invoices.length?money(w.sales-w.cost):"—")+'</td></tr>'});
+  var tS=0,tC=0,n=0;W.forEach(function(w){if(w.invoices.length&&w.to<j.today&&n<4){tS+=w.sales;tC+=w.cost;n++}});
+  h+='</tbody></table></div>'+(n?'<div style="margin-top:8px"><b>Last '+n+' full week'+(n>1?"s":"")+' with invoices:</b> food cost '+Math.round(tC/tS*100)+'% · '+money(tS-tC)+' left after food'+'</div>':'<div class="mute" style="margin-top:8px">Food cost shows once Sysco and Restaurant Depot invoices go through the Invoice Desk. One week can swing with delivery timing; the 4-week line is the one to trust.</div>');
+  $("kkcw").innerHTML=h}).catch(function(e){$("kkcw").innerHTML='<div class="mute">'+esc(e.message||e)+'</div>'})}
+function fmtShort(d){var x=new Date(d+"T12:00:00");return x.toLocaleDateString([], {month:"short",day:"numeric"})}
+function loadPL(){loadKW();if(PL.store!==STORE){PL.d=null;PL.store=STORE}if(!PL.d)$("lst").innerHTML='<div class="mute">Loading…</div><div></div>';
   api("/api/pnl").then(function(j){PL.d=j;renderPL()}).catch(function(x){if(x.message!=="signin")$("lst").innerHTML='<div class="mute">Couldn\\'t load: '+esc(x.message)+'</div><div></div>'})}
 function plTot(m){var d=PL.d||{entries:[],gross:{},check:{}},es=d.entries.filter(function(e){return e.month===m}),g=d.gross[m]||{};
   var gross=plNum(g.sales)-plNum(g.cost)-plNum(g.food)+plNum(g.fuel),inc=0,exp=0;
