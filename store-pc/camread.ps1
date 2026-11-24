@@ -11,11 +11,12 @@
 param(
   [string]$Store = "655675",          # Goldenrod 655675, Trail 654287
   [string]$Recorder = "",             # recorder address (ip or ip:port); found automatically when empty
+  [string]$Fallback = "",             # address to try if none is found on the store network (the one Hik-Connect shows)
   [string]$Url = "https://closeout.petro-goldenrod.workers.dev",
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 1
+$ScriptVersion = 2
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -68,15 +69,23 @@ function RecGet($base, $path, $cred, [int]$timeout = 20) {
 # Find the recorder: the address saved at setup, else scan this PC's own network for a Hikvision web interface.
 function Find-Recorder {
   $cands = @()
-  $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and $_.PrefixOrigin -ne 'WellKnown' }
-  foreach ($ip in $ips) {
-    $p = $ip.IPAddress.Split('.'); $net = $p[0] + "." + $p[1] + "." + $p[2] + "."
+  $mine = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and $_.PrefixOrigin -ne 'WellKnown' } | ForEach-Object { $_.IPAddress })
+  # Also the register's network (from the VSPoll setup file) and the usual home-router networks.
+  $nets = @(); foreach ($a in $mine) { $p = $a.Split('.'); $nets += ($p[0] + "." + $p[1] + "." + $p[2] + ".") }
+  foreach ($d in (Get-ChildItem -Path "C:\VSPoll", "C:\VSPOLL2" -Directory -ErrorAction SilentlyContinue)) {
+    foreach ($sf in (Get-ChildItem -Path $d.FullName -Filter "SETUP.*" -ErrorAction SilentlyContinue)) {
+      $m = Select-String -Path $sf.FullName -Pattern '^\s*MachineName\s*=\s*(\d+\.\d+\.\d+)\.\d+' | Select-Object -First 1
+      if ($m) { $nets += ($m.Matches[0].Groups[1].Value + ".") }
+    }
+  }
+  $nets += @("192.168.1.", "192.168.0.", "192.168.254.", "10.0.0.")
+  foreach ($net in ($nets | Select-Object -Unique)) {
     Write-Host ("Looking for the camera recorder on " + $net + "x ...")
     $jobs = @()
     foreach ($port in @(80, 801, 8080)) {
       for ($i = 1; $i -le 254; $i++) {
         $addr = $net + $i
-        if ($addr -eq $ip.IPAddress) { continue }
+        if ($mine -contains $addr) { continue }
         $c = New-Object Net.Sockets.TcpClient
         $jobs += [pscustomobject]@{ Addr = $addr; Port = $port; Client = $c; Task = $c.ConnectAsync($addr, $port) }
       }
@@ -126,6 +135,10 @@ if ($Setup) {
   $found = @()
   if (-not $Recorder) {
     $found = @(Find-Recorder)
+    if ($found.Count -eq 0 -and $Fallback) {
+      Write-Host ("Not on the store network; trying the recorder's internet address " + $Fallback + " ...")
+      try { $req = [Net.HttpWebRequest]::Create("http://" + $Fallback + "/ISAPI/System/deviceInfo"); $req.Timeout = 8000; try { $r = $req.GetResponse(); $r.Close(); $found = @($Fallback) } catch [Net.WebException] { $r = $_.Exception.Response; if ($r -and [int]$r.StatusCode -eq 401) { $found = @($Fallback) } else { Log ("No answer from " + $Fallback + ": " + $_.Exception.Message) } } } catch {}
+    }
     if ($found.Count -eq 0) { Log "Couldn't find a Hikvision recorder on this PC's network. Tell Claude (a photo of the recorder's Network screen helps)."; Read-Host "Press Enter to close"; exit 1 }
     Log ("Hikvision device(s) found: " + ($found -join ", "))
   }
