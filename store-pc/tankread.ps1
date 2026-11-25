@@ -17,7 +17,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 4
+$ScriptVersion = 5
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -86,7 +86,7 @@ $now = Get-Date
 $slot = $now.ToString("yyyy-MM-dd") + "-" + [string][math]::Floor(($now.Hour * 60 + $now.Minute) / $every)
 $slotFile = Join-Path $here "tankread.slot"
 $lastSlot = if (Test-Path $slotFile) { ([string](Get-Content $slotFile -Raw)).Trim() } else { "" }
-if ($Poll -and -not $ReqId -and $lastSlot -eq $slot) { exit 0 }
+if ($Poll -and -not $ReqId -and $lastSlot -eq $slot) { Ensure-TankTask; exit 0 }
 try { Set-Content -Path $slotFile -Value $slot } catch {}
 
 # Register address: the same one SSCS VS-Poll uses (MachineName in its setup file).
