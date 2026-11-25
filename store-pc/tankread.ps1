@@ -17,7 +17,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 5
+$ScriptVersion = 6
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -48,6 +48,26 @@ function Register-TankTask {
   $pri = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive
   Register-ScheduledTask -TaskName $TaskName -Action $act -Trigger $trg -Settings $set -Principal $pri -Force | Out-Null
 }
+# Any other Store HQ task that still starts PowerShell directly (for example "StoreHQ Send To Registers", which can't update
+# itself) flashes a window each time it runs. Start those through the same hidden launcher too. Runs once a day at most.
+function Quiet-OtherTasks {
+  $mark = Join-Path $here "tankread.quiet"
+  if ((Test-Path $mark) -and ((Get-Date) - (Get-Item $mark).LastWriteTime).TotalHours -lt 20) { return }
+  Set-Content -Path $mark -Value (Get-Date -Format s)
+  $ws = Join-Path $env:WINDIR "System32\wscript.exe"; if (-not (Test-Path $ws)) { return }
+  foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "StoreHQ*" -and $_.TaskName -ne $TaskName })) {
+    try {
+      $a = @($t.Actions)[0]; if (-not $a -or $a.Execute -notmatch 'powershell') { continue }
+      $dir = if ($a.WorkingDirectory) { [string]$a.WorkingDirectory } else { $here }
+      $vbs = Join-Path $dir (($t.TaskName -replace '[^A-Za-z0-9]+', '-').Trim('-') + "-quiet.vbs")
+      $cmd = '"' + $a.Execute.Trim('"') + '" ' + [string]$a.Arguments
+      Set-Content -Path $vbs -Encoding ASCII -Value ('CreateObject("WScript.Shell").Run "' + $cmd.Replace('"', '""') + '", 0, True')
+      $na = New-ScheduledTaskAction -Execute $ws -Argument ('//B //Nologo "' + $vbs + '"') -WorkingDirectory $dir
+      Set-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Action $na | Out-Null
+      Log ("Task '" + $t.TaskName + "' now starts without a window popping up.")
+    } catch { Log ("Couldn't quiet task '" + $t.TaskName + "': " + $_.Exception.Message) }
+  }
+}
 # Keeps this PC's task current: a 5-minute check, started without a window popping up.
 function Ensure-TankTask {
   try {
@@ -56,6 +76,7 @@ function Ensure-TankTask {
     $ok = $t -and $quiet -and ($t.Triggers | Where-Object { $_.Repetition.Interval -eq 'PT5M' })
     if (-not $ok) { Register-TankTask; Log "Tank task updated: a 5-minute check that runs without a window popping up." }
   } catch { Log ("Couldn't update the scheduled task: " + $_.Exception.Message) }
+  try { Quiet-OtherTasks } catch {}
 }
 
 # Self-update: Store HQ can hold a newer tank script (checked once a day). It must arrive intact, carry the marker and
