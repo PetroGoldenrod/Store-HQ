@@ -1901,6 +1901,11 @@ async function homeAttention(env, S, MGR, st) {
     }
   } catch {}
   if (MGR) return A;
+  // The store PC reads scratch-off counts from SSCS every hour; say so if it stopped or the SSCS login stopped working.
+  try {
+    const sr = await kvJson(env, S, "sscsread", null);
+    if (sr && (!sr.ok || Date.now() - sr.at > 4 * 36e5)) A.push({ lvl: "warn", t: "Scratch-off counts aren't coming in from SSCS", d: !sr.ok && sr.err ? "The store PC says: " + sr.err + ". If the SSCS password changed, run Setup scratch-offs on that PC again." : "The store PC hasn't sent counts for " + Math.round((Date.now() - sr.at) / 36e5) + " hours. Check that the PC is on." });
+  } catch {}
   try {
     const today = nyToday();
     for (const L of await licDoc(env, S)) {
