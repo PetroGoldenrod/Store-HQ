@@ -1188,7 +1188,7 @@ async function ownerApi(req, env, path, url) {
   // ---- Void / no-sale clips: the store PC cuts ~25 s from the recorder around each one and uploads it (kept 30 days).
   if (path === "/api/pc-clipjobs" && req.method === "GET") {
     // Older camera scripts ran clips before updating themselves and got stopped by Windows at 10 minutes, so they never updated.
-    if ((+url.searchParams.get("v") || 0) < 6) return json({ items: [] });
+    if ((+url.searchParams.get("v") || 0) < 8) return json({ items: [] });
     const cams = await camsDoc(env, S); if (!cams || !(cams.channels || []).length) return json({ items: [] });
     const ch = cams.clipCh || (cams.channels.find(c => c.ok) || cams.channels[0]).ch;
     const ix = await clipIndex(env, S), out = [], today = ymdNY(new Date());
@@ -1263,6 +1263,7 @@ async function ownerApi(req, env, path, url) {
     const nm = url.searchParams.get("name"), site = S === "654287" ? "004" : "011", where = S === "654287" ? "Trail" : "Goldenrod";
     let body = null, fn = "";
     if (nm === "sscsread") { body = SSCSREAD_PS1; fn = "sscsread.ps1"; }
+    else if (nm === "camread") { body = CAMREAD_PS1; fn = "camread.ps1"; }
     else if (nm === "sscsread-setup") { body = "@echo off\r\nrem Store HQ: scratch-off counts straight from SSCS, no browser needed (" + where + "). Keep this file next to sscsread.ps1.\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dp0sscsread.ps1\" -Setup -Store " + S + " -Site " + site + "\r\n"; fn = "Setup scratch-offs.bat"; }
     if (!body) return json({ error: "unknown file" }, 404);
     return new Response(body, { headers: { "content-type": "application/octet-stream", "content-disposition": 'attachment; filename="' + fn + '"', "cache-control": "no-store" } });
