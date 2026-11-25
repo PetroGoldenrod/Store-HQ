@@ -1543,6 +1543,10 @@ async function ownerApi(req, env, path, url) {
     const rows = (m.rows || []).map(x => { const it = look.get(x[0]), rg = reg.get(x[0]) || reg.get(String(x[0]).replace(/^0+/, "")); return [x[0], (rg && rg[1]) || x[4] || (it ? it[1] : x[0]), String(x[1]), x[2], x[3], (rg && rg[3]) || (it ? Number(it[4]) || 0 : 0)]; });
     return json({ cur: m.cur, prev: m.prev, source: m.source || "", depts: m.depts || null, updated: r.updated, rows });
   }
+  if (path === "/api/movers/auto" && req.method === "POST") {
+    if (MGR) return json({ error: "Owner only" }, 403);
+    return json(await moversFromRegisters(env, S, nyToday()));
+  }
   if (path === "/api/movers" && req.method === "POST") {
     // Saves a fresh snapshot pulled from the SSCS website: { cur, prev, source, depts:{num:name}, rows:[[plu, dept, unitsNow, unitsBefore, name]] }.
     const b = await readBody(req, 2e6), str = (v, n) => String(v == null ? "" : v).slice(0, n);
@@ -1922,6 +1926,56 @@ async function homeAttention(env, S, MGR, st) {
   } catch {}
   return A;
 }
+function pluOf(upc) {
+  const u = String(upc || "").replace(/\D/g, "");
+  if (u.length < 12) return u.replace(/^0+/, "");
+  const p = u.slice(0, -1).slice(-11);
+  return /^0{6}/.test(p) ? p.replace(/^0+/, "") : p;
+}
+// Sales Movers from the registers' own item tallies (sent by the store PC every night): units in the last 14 days
+// (ending yesterday) vs the 14 before. A period with a missing day or two is scaled up to 14 days so the two stay comparable.
+// Only saved when each period has at least 10 days; otherwise the last snapshot stays.
+async function moversFromRegisters(env, S, today) {
+  const end = addDays(today, -1), cf = addDays(end, -13), pt = addDays(cf, -1), pf = addDays(pt, -13);
+  const rows = (await env.DB.prepare("SELECT k, data FROM store_kv WHERE store = ? AND k BETWEEN ? AND ?").bind(S, "items:" + pf, "items:" + end).all()).results || [];
+  const nCur = rows.filter(r => r.k.slice(6) >= cf).length, nPrev = rows.length - nCur;
+  if (nCur < 10 || nPrev < 10) return { skipped: true, nCur, nPrev };
+  const byName = new Map();
+  try { const rb = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("reg:" + S).first(); if (rb) for (const it of JSON.parse(rb.text).items || []) { const k = String(it[1] || "").toUpperCase().replace(/\s+/g, " ").trim(); if (k && k !== "UNKNOWN" && !byName.has(k)) byName.set(k, String(it[0])); } } catch {}
+  const acc = new Map(); let unmatched = 0, units = 0;
+  for (const r of rows) {
+    const cur = r.k.slice(6) >= cf; let d = {}; try { d = JSON.parse(r.data) || {}; } catch {}
+    for (const [desc, v] of Object.entries(d)) {
+      units += Number(v[0]) || 0;
+      const plu = (v[3] && String(v[3])) || byName.get(desc.toUpperCase().replace(/\s+/g, " ").trim());
+      if (!plu || !/^[0-9]{1,20}$/.test(plu)) { unmatched += Number(v[0]) || 0; continue; }
+      const o = acc.get(plu) || { dep: String(v[2] || ""), a: 0, b: 0, desc };
+      if (cur) o.a += Number(v[0]) || 0; else o.b += Number(v[0]) || 0;
+      if (cur || !o.desc) o.desc = desc; if (!o.dep && v[2]) o.dep = String(v[2]);
+      acc.set(plu, o);
+    }
+  }
+  // Older days (before item numbers were kept) are matched by name; if too many don't match, keep the last snapshot.
+  if (unmatched > units * 0.03) return { skipped: true, nCur, nPrev, unmatched: Math.round(unmatched), units: Math.round(units) };
+  const depts = {};
+  try { const vd = await env.DB.prepare("SELECT data FROM vs_day WHERE store = ? ORDER BY date DESC LIMIT 7").bind(S).all(); for (const x of vd.results || []) for (const t of (JSON.parse(x.data).depts || [])) if (t && t[0] != null && !depts[String(t[0])]) depts[String(t[0])] = String(t[1] || "").trim(); } catch {}
+  const lab = d => new Date(d + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" });
+  const out = [...acc.entries()].map(([plu, o]) => [plu, o.dep.slice(0, 6), Math.round(o.a * 14 / nCur), Math.round(o.b * 14 / nPrev), o.desc.slice(0, 60)]);
+  const gaps = (nCur < 14 ? " (" + nCur + " of 14 days, scaled)" : "") + (nPrev < 14 ? " · before: " + nPrev + " of 14 days, scaled" : "");
+  const doc = { cur: lab(cf) + " – " + lab(end), prev: lab(pf) + " – " + lab(pt), source: "Registers (store PC)" + gaps, depts, rows: out };
+  await kvPutJson(env, S, "movers", doc);
+  return { ok: true, rows: out.length, unmatched };
+}
+// Mondays at 6 AM (New York), once per store.
+async function moversWeekly(env) {
+  const now = new Date(), hour = +new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", hourCycle: "h23" }).format(now), today = nyToday();
+  if (new Date(today + "T12:00:00Z").getUTCDay() !== 1 || hour !== 6) return;
+  const done = await kvJson(env, "*", "moversauto", {});
+  if (done.last === today) return;
+  await kvPutJson(env, "*", "moversauto", { last: today });
+  const stores = new Set([DEF_STORE]); try { ((await env.DB.prepare("SELECT store FROM inv_store").all()).results || []).forEach(r => stores.add(r.store)); } catch {}
+  for (const S of stores) { try { await moversFromRegisters(env, S, today); } catch (e) { console.error("movers", S, e && e.message); } }
+}
 const TANK_EVERY_MIN = 120; // scheduled tank readings: every 2 hours (the store PC follows this number)
 async function promoList(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'promos'").bind(S).first(); try { return r ? JSON.parse(r.data) : []; } catch { return []; } }
 async function deptNames(env, S) { try { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'movers'").bind(S).first(); return r ? JSON.parse(r.data).depts || {} : {}; } catch { return {}; } }
@@ -2273,7 +2327,7 @@ const VL = (() => {
     while ((m = re.exec(body))) {
       const b = m[2], d = b.match(/<trlDept number="([^"]*)"(?:\s+type="([^"]*)")?[^>]*>/);
       L.push({ type: m[1], dept: d ? d[1] : "", deptType: d ? d[2] || "" : "", desc: unesc(tag(b, "trlDesc")), qty: num(tag(b, "trlQty")),
-        tot: num(tag(b, "trlLineTot")), sign: tag(b, "trlSign"), netVoid: /<trlNetVoid\s*\/?>/.test(b) });
+        tot: num(tag(b, "trlLineTot")), sign: tag(b, "trlSign"), netVoid: /<trlNetVoid\s*\/?>/.test(b), upc: tag(b, "trlUPC") });
     }
     return L;
   }
@@ -2282,14 +2336,15 @@ const VL = (() => {
     while ((m = re.exec(body))) P.push({ type: m[1], dup: /duplicate="true"/.test(m[2]), name: unesc(tag(m[3], "trpPaycode")).toUpperCase(), amt: num(tag(m[3], "trpAmt")) });
     return P;
   }
-  // Items sold that day (by register description): { desc: [qty, amount, dept] }. Used for promo results.
+  // Items sold that day (by register description): { desc: [qty, amount, dept, plu] }. Used for promo results and Sales Movers.
+  // plu is the 11-digit item number the back office uses (the scanned UPC without its check digit), or the short PLU for store items.
   function buildItems(log) {
     const acc = {}; if (!log) return acc;
     for (const t of log.trans) {
       if (t.suspended || !/^(sale|network sale)$/.test(t.type)) continue;
       for (const l of lines(t.body)) {
         if (!l.desc || l.type.startsWith("void") || l.netVoid || (l.sign || "").startsWith("-")) continue;
-        const a = acc[l.desc] || (acc[l.desc] = [0, 0, l.dept]); a[0] += l.qty || 1; a[1] = r2(a[1] + (l.tot || 0));
+        const a = acc[l.desc] || (acc[l.desc] = [0, 0, l.dept, pluOf(l.upc)]); a[0] += l.qty || 1; a[1] = r2(a[1] + (l.tot || 0));
       }
     }
     return acc;
@@ -2525,6 +2580,7 @@ export default {
     if (env.DB) ctx.waitUntil(invSendReady(env).catch(() => {}));
     if (env.DB) ctx.waitUntil(ensureSchema(env).then(() => dailyMailDue(env)).catch(() => {}));
     if (env.DB) ctx.waitUntil(lotteryReminder(env).catch(() => {}));
+    if (env.DB) ctx.waitUntil(moversWeekly(env).catch(() => {}));
     if (env.DB) ctx.waitUntil(licenseReminder(env).catch(() => {}));
   },
   async fetch(req, env, ctx) {
