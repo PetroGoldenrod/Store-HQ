@@ -16,7 +16,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 7
+$ScriptVersion = 8
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -249,11 +249,19 @@ function Get-FFmpeg {
     $exe = Get-ChildItem -Path $dir -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
     if (-not $exe) { throw "ffmpeg.exe not found in the download" }
     Copy-Item $exe.FullName $ff -Force
-    $v = & $ff -hide_banner -version 2>&1 | Select-Object -First 1
+    $v = ((FF-Run $ff "-hide_banner -version" 30) -split "`n")[0]
     Log ("FFmpeg ready: " + $v)
     return $ff
   } catch { Log ("FFmpeg download failed: " + $_.Exception.Message); return "" }
   finally { Remove-Item $zip -Force -ErrorAction SilentlyContinue; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+# Runs FFmpeg and returns what it printed. (Calling it directly makes PowerShell treat its normal output as an error.)
+function FF-Run($ff, [string]$arguments, [int]$waitSec = 60) {
+  $pi = New-Object Diagnostics.ProcessStartInfo; $pi.FileName = $ff; $pi.Arguments = $arguments; $pi.UseShellExecute = $false; $pi.CreateNoWindow = $true; $pi.RedirectStandardError = $true; $pi.RedirectStandardOutput = $true
+  $pr = [Diagnostics.Process]::Start($pi); $e = $pr.StandardError.ReadToEndAsync(); $o = $pr.StandardOutput.ReadToEndAsync()
+  if (-not $pr.WaitForExit($waitSec * 1000)) { try { $pr.Kill() } catch {} }
+  $t = ""; try { $t = [string]$o.Result + [string]$e.Result } catch {}
+  return $t
 }
 function Get-RtspPort($base, $cred) {
   $f = Join-Path $here "camread.rtsp"; if (Test-Path $f) { $p = (Get-Content $f -Raw).Trim(); if ($p -match '^\d+$') { return [int]$p } }
@@ -283,8 +291,8 @@ function Get-ClipRtsp($ff, $base, $ch, $date, $sec, [int]$before, [int]$after, $
     $err = ""; try { $err = [string]$errTask.Result } catch {}
     if ((Test-Path $raw) -and (Get-Item $raw).Length -gt 20000) {
       # iPhones play H.265 only when it's tagged hvc1, so check the codec and re-wrap when needed (no re-encoding).
-      $info = (& $ff -hide_banner -i $raw 2>&1 | Out-String)
-      if ($info -match 'Video: hevc') { & $ff -hide_banner -loglevel error -i $raw -c copy -tag:v hvc1 -movflags +faststart -y $outFile 2>&1 | Out-Null } else { Move-Item $raw $outFile -Force }
+      $info = FF-Run $ff ('-hide_banner -i "' + $raw + '"') 30
+      if ($info -match 'Video: hevc') { [void](FF-Run $ff ('-hide_banner -loglevel error -i "' + $raw + '" -c copy -tag:v hvc1 -movflags +faststart -y "' + $outFile + '"') 60) } else { Move-Item $raw $outFile -Force }
       Remove-Item $raw -Force -ErrorAction SilentlyContinue
       if ((Test-Path $outFile) -and (Get-Item $outFile).Length -gt 20000) { return @{ ok = $true; fmt = "mp4"; track = $track; mb = [Math]::Round((Get-Item $outFile).Length / 1MB, 1); secs = [Math]::Round($sw.Elapsed.TotalSeconds) } }
     }
