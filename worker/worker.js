@@ -904,6 +904,7 @@ async function ownerApi(req, env, path, url) {
     const readOk = Math.abs(dueT - num(T.due)) < 0.02 && Math.abs(dueX - num(X.due)) < 0.02 && Math.abs(num(T.due) + num(X.due) - num(inv.totalDue)) < 0.02;
     const pid = rid(16); await env.DB.prepare("INSERT INTO photos (id, created, b64) VALUES (?, ?, ?)").bind(pid, Date.now(), b.image).run();
     const SS = invStore(inv) || S;
+    if (MGR && SS !== S) return json({ error: "This report is for " + (SS === "655675" ? "Goldenrod Shell" : "Trail Shell") + ", not your store. Print the one for your store." }, 400);
     const k = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'lotinv'").bind(SS).first();
     let list = []; try { list = k ? JSON.parse(k.data) : []; } catch {}
     list = list.filter(x => x.weekFrom !== inv.weekFrom);
@@ -1824,6 +1825,16 @@ async function homeAttention(env, S, MGR, st) {
         if ((Number(t[3]) || 0) >= TANK_WATER) A.push({ lvl: "warn", t: "Water in " + t[0] + ": " + t[3] + " in", d: "Read " + when(good.at) + ".", tab: "store", sub: "fuel" });
       }
       if (now - good.at > 7 * 36e5) A.push({ lvl: "warn", t: "No tank reading since " + when(good.at), d: last && !last.ok && last.err ? String(last.err).slice(0, 160) : "Readings come every 2 hours from the store PC.", tab: "store", sub: "fuel" });
+    }
+  } catch {}
+  // Last week's lottery settlement (Mon–Sun), from Tuesday on, until someone uploads it.
+  try {
+    const today = nyToday(), dow = new Date(today + "T12:00:00Z").getUTCDay();
+    if (dow !== 1) {
+      const mon = addDays(today, -((dow + 6) % 7) - 7);
+      const rows = (await env.DB.prepare("SELECT store, data FROM store_kv WHERE k = 'lotinv'").all()).results || [];
+      const have = rows.some(r => { let l = []; try { l = JSON.parse(r.data) || []; } catch {} return l.some(x => x.weekFrom === mon && (invStore(x) || r.store) === S); });
+      if (!have) A.push({ lvl: "warn", t: "Weekly lottery settlement not uploaded", d: "Print last week's (" + new Date(mon + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" }) + " to " + new Date(addDays(mon, 6) + "T12:00:00Z").toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" }) + ") Weekly Settlement Report on the lottery machine and add a photo.", tab: "day", open: "invbox" });
     }
   } catch {}
   if (MGR) return A;
@@ -2967,18 +2978,18 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 <section id="v-day" hidden>
  <div class="bar"><button class="alt sm" id="prev" aria-label="Previous day">‹</button><input type="date" id="date"><button class="alt sm" id="next" aria-label="Next day">›</button><button class="alt sm" id="rf">Refresh</button></div>
  <div class="days" id="recent"></div>
- <details class="card" id="impbox"><summary style="cursor:pointer;font-weight:700">Import SSCS counts</summary>
-  <div class="mute" style="margin-top:8px">On the SSCS Lottery Counts page, pick the site and click your <b>SSCS pull</b> bookmark. When it says DONE, it copies the counts. Come back here and tap Import. If nothing happens, paste into the box first.</div>
-  <textarea id="impin" rows="3" placeholder="Paste here" style="width:100%;margin-top:8px;font:inherit;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink)"></textarea>
-  <button id="impgo" style="margin-top:8px">Import</button><div id="impmsg"></div>
- </details>
- <details class="card" id="invbox"><summary style="cursor:pointer;font-weight:700">Weekly lottery invoice</summary>
+ <details class="card" id="invbox"><summary style="cursor:pointer;font-weight:700">Weekly lottery settlement</summary>
   <div class="mute" style="margin-top:8px">Print the <b>Weekly Settlement Report</b> on the lottery machine and take a photo of it. The app checks it against what the registers rang that week.</div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
    <label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Take a photo<input type="file" id="invcam" accept="image/*" capture="environment" hidden></label>
    <label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Upload a photo<input type="file" id="invfile" accept="image/*" hidden></label>
   </div>
   <div id="invmsg" class="mute" style="margin-top:8px"></div><div id="invlist"></div>
+ </details>
+ <details class="card" id="impbox"><summary style="cursor:pointer;font-weight:700">Import SSCS counts</summary>
+  <div class="mute" style="margin-top:8px">On the SSCS Lottery Counts page, pick the site and click your <b>SSCS pull</b> bookmark. When it says DONE, it copies the counts. Come back here and tap Import. If nothing happens, paste into the box first.</div>
+  <textarea id="impin" rows="3" placeholder="Paste here" style="width:100%;margin-top:8px;font:inherit;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink)"></textarea>
+  <button id="impgo" style="margin-top:8px">Import</button><div id="impmsg"></div>
  </details>
  <div id="day"><div class="mute">Loading…</div></div>
 </section>
@@ -3086,7 +3097,7 @@ function loadInv(){api("/api/lotinv").then(function(j){var h="";(j.invoices||[])
   if((k.lines||[]).some(function(l){return !l.ok})){h+='<div class="mute" style="margin-top:6px">Money effect for the week: <b>'+(k.cashDiff>=0?"+":"−")+money(Math.abs(k.cashDiff))+'</b> (online sales minus winners paid, registers vs. invoice).</div>';
     if((k.notes||[]).length)h+='<div style="margin-top:6px"><b>Shifts that explain it:</b>'+k.notes.map(function(n){return '<div class="s">'+esc(fmtDay(n.date))+' '+esc(n.shift)+' · '+esc(n.line)+': '+(n.missing?'no lottery report':(n.diff>0?"+":"−")+money(Math.abs(n.diff))+(n.misrung?' (rung on the wrong key)':''))+'</div>'}).join("")+'</div>'}
   h+='<div class="mute" style="margin-top:6px">Scratch-offs: '+(v.scratch&&v.scratch.booksSettled||0)+' books settled ('+money(k.booksSettledAmt||0)+'). Scratch-offs sold that week: '+money(k.scratchSold||0)+'. Books settle when they sell out or time runs out, so these two only even out over several weeks.</div></div>'});
-  $("invlist").innerHTML=h||'<div class="mute" style="margin-top:8px">No invoices yet.</div>'}).catch(function(){})}
+  $("invlist").innerHTML=h||'<div class="mute" style="margin-top:8px">No weekly reports yet.</div>'}).catch(function(){})}
 $("invbox").addEventListener("toggle",function(){if(this.open)loadInv()});
 ["invfile","invcam"].forEach(function(id){$(id).addEventListener("change",function(){var inp=this,f=inp.files[0];if(!f)return;$("invmsg").textContent="Reading the report… (about 30 seconds)";
   invShrink(f).then(function(b){return api("/api/lotinv",{method:"POST",body:{image:b}})}).then(function(r){$("invmsg").textContent=r.otherStore?"Saved under "+(r.store==="655675"?"Goldenrod":"Trail")+" (the store named on the report). Switch to that store to see it.":"Saved.";inp.value="";loadInv()}).catch(function(e){inp.value="";$("invmsg").textContent=e.message||"Didn’t save, try again."})})});
@@ -3117,7 +3128,7 @@ function goTab(v){openView(v)}
 $("subnav").addEventListener("click",function(e){var b=e.target.closest("button");if(b)openView(CUR,b.dataset.sub)});
 $("setupBtn").addEventListener("click",function(e){e.stopPropagation();var b=$("setupBox");b.hidden=!b.hidden});document.addEventListener("click",function(){$("setupBox").hidden=true});$("menuStaff").addEventListener("click",function(){openView("cashiers");window.scrollTo(0,0)});$("menuLic").addEventListener("click",function(){openView("licenses");window.scrollTo(0,0)});$("menuPL").addEventListener("click",function(){openView("pl");window.scrollTo(0,0)});$("signout").addEventListener("click",function(){fetch("/api/logout",{method:"POST"}).then(function(){show(false)})});
 var PARTNER=false,MANAGER=false;
-function applyRole(){var pc=$("chkCard");if(pc)pc.hidden=MANAGER;$("menuLic").hidden=MANAGER;$("menuPL").hidden=MANAGER;["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl|licenses)$/.test(CUR)||(CUR==="store"&&(SUB.store==="cigs"||SUB.store==="cams"))))openView("home");else if(CUR==="store")openView("store")}
+function applyRole(){var pc=$("chkCard");if(pc)pc.hidden=MANAGER;$("impbox").hidden=MANAGER;$("menuLic").hidden=MANAGER;$("menuPL").hidden=MANAGER;["sales","pl"].forEach(function(v){var b=document.querySelector('.tabs button[data-v="'+v+'"]');if(b)b.hidden=MANAGER});if(MANAGER&&(/^(sales|pl|licenses)$/.test(CUR)||(CUR==="store"&&(SUB.store==="cigs"||SUB.store==="cams"))))openView("home");else if(CUR==="store")openView("store")}
 function loadStores(){fetch("/api/stores").then(function(r){return r.json()}).then(function(j){var L=j.stores||[];PARTNER=!!j.partner;MANAGER=!!j.manager;applyRole();if(location.hash==="#licenses"&&!MANAGER){try{history.replaceState(null,"",location.pathname)}catch(e){}openView("licenses")}if(location.hash==="#fuel"){try{history.replaceState(null,"",location.pathname)}catch(e){}openView("store","fuel")}if(PARTNER||!L.some(function(s){return s.store===STORE}))STORE=j.def;try{localStorage.setItem("store",STORE)}catch(e){}
   $("store").innerHTML=L.map(function(s){return '<option value="'+esc(s.store)+'"'+(s.store===STORE?" selected":"")+'>'+esc(s.name)+'</option>'}).join("");$("store").hidden=L.length<2}).catch(function(){})}
 $("store").addEventListener("change",function(){STORE=this.value;try{localStorage.setItem("store",STORE)}catch(e){}
@@ -3530,7 +3541,7 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
   h+='</div>';
   var AT=st.attn||[];AT.sort(function(a,b){return (a.lvl==="bad"?0:1)-(b.lvl==="bad"?0:1)});
   h+='<div class="sec">Needs attention'+(AT.length?' <span class="pill '+(AT.some(function(a){return a.lvl==="bad"})?'bad':'warn')+'">'+AT.length+'</span>':'')+'</div><div class="card chk attn">';
-  if(AT.length)AT.forEach(function(a){var at=a.href?'href="'+esc(a.href)+'"':a.date?'href="#" data-chkdate="'+esc(a.date)+'"':'href="#" data-tab="'+esc(a.tab||"home")+'"'+(a.sub?' data-sub="'+esc(a.sub)+'"':'');
+  if(AT.length)AT.forEach(function(a){var at=a.href?'href="'+esc(a.href)+'"':a.date?'href="#" data-chkdate="'+esc(a.date)+'"':'href="#" data-tab="'+esc(a.tab||"home")+'"'+(a.sub?' data-sub="'+esc(a.sub)+'"':'')+(a.open?' data-open="'+esc(a.open)+'"':'');
     h+='<a class="chkrow '+(a.lvl==="bad"?"bad":"warn")+'" '+at+'><i></i><b>'+esc(a.t)+'</b><span>'+esc(a.d||"")+'</span></a>'});
   else h+='<div class="chkrow"><i></i><b>All clear</b><span>Shifts, tanks'+(MANAGER?'':', cig prices')+' and the store PC look fine right now.</span></div>';
   h+='</div>';
@@ -3554,7 +3565,7 @@ function renderHome(j){if(j)HOME=j;j=HOME;if(!j)return;var onT=document.querySel
   $("home").innerHTML=h}
 $("home").addEventListener("click",function(e){var s=e.target.closest("[data-store]");if(s){STORE=s.dataset.store;try{localStorage.setItem("store",STORE)}catch(x){}$("store").value=STORE;renderHome();return}
   var c=e.target.closest("[data-chkdate]");if(c){e.preventDefault();$("date").value=c.dataset.chkdate;goTab("day");return}
-  var t=e.target.closest("[data-tab]");if(t){e.preventDefault();openView(t.dataset.tab,t.dataset.sub)}});
+  var t=e.target.closest("[data-tab]");if(t){e.preventDefault();openView(t.dataset.tab,t.dataset.sub);var o=t.dataset.open&&$(t.dataset.open);if(o){if(!o.open){o.open=true}setTimeout(function(){o.scrollIntoView({block:"start",behavior:"smooth"})},60)}}});
 /* ---------- sales (nightly Verifone upload) ---------- */
 var salesMonth=today().slice(0,7),SALES=null,salesPick=null;
 function monthAdd(m,n){var y=+m.slice(0,4),mo=+m.slice(5,7)-1+n;y+=Math.floor(mo/12);mo=((mo%12)+12)%12;return y+"-"+String(mo+1).padStart(2,"0")}
