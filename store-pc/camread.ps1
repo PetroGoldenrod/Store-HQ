@@ -377,7 +377,7 @@ function Ensure-CamTask {
 }
 function Update-Self {
   $stamp = Join-Path $here "camread.updcheck"
-  if ((Test-Path $stamp) -and ((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalHours -lt 20) { return }
+  if ((Test-Path $stamp) -and ((Get-Date) - (Get-Item $stamp).LastWriteTime).TotalHours -lt 3) { return }
   try {
     Set-Content -Path $stamp -Value (Get-Date -Format s)
     $u = Invoke-RestMethod -Method Get -Uri "$Url/api/pc-script?store=$Store&name=camread" -Headers $H -TimeoutSec 60
