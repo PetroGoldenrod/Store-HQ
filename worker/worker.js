@@ -1135,7 +1135,7 @@ async function ownerApi(req, env, path, url) {
   }
   // ---- Promo shelf labels (DYMO 30252, 1-1/8" x 3-1/2"). Logos are shared by both stores; saved labels are per store.
   if (path === "/api/labels" && req.method === "GET") {
-    return json({ logos: await kvJson(env, "*", "lbllogos", []), saved: await kvJson(env, S, "labels", []) });
+    return json({ logos: await kvJson(env, "*", "lbllogos", []), saved: await kvJson(env, S, "labels", []), queue: await kvJson(env, S, "lblq", []) });
   }
   if (path === "/api/labels/logo" && req.method === "POST") {
     const b = await readBody(req), name = String(b.name || "").trim().slice(0, 40), img = String(b.png || "");
@@ -1161,6 +1161,13 @@ async function ownerApi(req, env, path, url) {
     const r = /^lbl-/.test(id) ? await env.DB.prepare("SELECT b64 FROM photos WHERE id = ?").bind(id).first() : null;
     if (!r) return new Response("Not found", { status: 404 });
     return new Response(Uint8Array.from(atob(r.b64), c => c.charCodeAt(0)), { headers: { "content-type": "image/png", "cache-control": "private, max-age=86400" } });
+  }
+  // The print list is kept per store, so labels made on a phone print from the store PC.
+  if (path === "/api/labels/queue" && req.method === "POST") {
+    const b = await readBody(req), t = v => String(v || "").trim().slice(0, 40);
+    const q = (Array.isArray(b.queue) ? b.queue : []).slice(0, 100).map(x => ({ logo: String(x.logo || "").slice(0, 20), big: t(x.big), small: t(x.small) })).filter(x => x.big);
+    await kvPutJson(env, S, "lblq", q);
+    return json({ ok: true, n: q.length });
   }
   if (path === "/api/labels/save" && req.method === "POST") {
     const b = await readBody(req), t = v => String(v || "").trim().slice(0, 40);
@@ -3100,10 +3107,12 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
   <div id="lblMsg" style="margin-top:8px"></div></div>
  <div class="card"><h2>Print list <span id="lblQn" class="mute" style="font-weight:400"></span></h2><div id="lblQ"></div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button type="button" id="lblPrint" style="width:auto;margin:0">Print</button><button type="button" id="lblClear" class="alt" style="width:auto;margin:0">Clear list</button></div>
-  <div class="mute" style="margin-top:8px;font-size:13px">In the print window pick the DYMO printer, paper size <b>30252 Address</b>, margins <b>None</b>, scale <b>100</b>. At Trail (Twin Turbo) also pick the roll that has the 30252 labels.</div></div>
+  <div class="mute" style="margin-top:8px;font-size:13px">This list is shared for this store: add labels from your phone, then tap Print on the store PC. In the print window pick the DYMO printer, paper size <b>30252 Address</b>, margins <b>None</b>, scale <b>100</b>. At Trail (Twin Turbo) also pick the roll that has the 30252 labels.</div></div>
  <div class="card"><h2>Saved labels</h2><div class="mute">Tap one to add it to the print list.</div><div id="lblSaved" style="margin-top:8px"></div></div>
  <div class="card"><h2>Logos</h2><div class="mute">Add each brand's logo once and it's there for both stores. Use the logo from the vendor's promo material or a clear photo. It's turned black and white for the label printer.</div>
-  <div class="row" style="margin-top:10px"><div><label>Brand name</label><input id="lgName" placeholder="Coca-Cola" maxlength="40"></div><div style="display:flex;align-items:flex-end"><label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Add logo picture<input type="file" id="lgFile" accept="image/*" hidden></label></div></div>
+  <label style="display:block;margin-top:10px">Brand name</label><input id="lgName" placeholder="Coca-Cola" maxlength="40">
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Take a photo<input type="file" id="lgCam" accept="image/*" capture="environment" hidden></label><label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Choose a picture<input type="file" id="lgFile" accept="image/*" hidden></label></div>
+  <div class="mute" style="margin-top:6px;font-size:13px">Best is a screenshot or picture of just the logo on a white background. A photo of a can or box works too: fill the frame with the logo.</div>
   <div id="lgMsg" style="margin-top:8px"></div><div id="lgList" class="lblLogos" style="margin-top:10px"></div></div>
 </section>
 <section id="v-cams" hidden><div class="card"><h2>Cameras</h2><p class="sub" id="camsub">Loading…</p><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0 10px"><button type="button" id="camNow">Get fresh pictures</button><span class="mute" id="camMsg" style="flex:1;min-width:180px"></span></div><div id="camgrid" class="camgrid"></div></div></section>
@@ -3385,8 +3394,7 @@ function licSend(files){if(LIC.busy||!files.length)return;LIC.busy=true;var F=[]
   next()}
 ["liccam","licfile"].forEach(function(id){$(id).addEventListener("change",function(){var f=this.files;licSend(f);this.value=""})});
 var LB={logos:[],saved:[],q:[],logo:"",loaded:false};
-try{LB.q=JSON.parse(localStorage.getItem("lblq")||"[]")||[]}catch(e){LB.q=[]}
-function lbSaveQ(){try{localStorage.setItem("lblq",JSON.stringify(LB.q))}catch(e){}}
+function lbSaveQ(){api("/api/labels/queue",{method:"POST",body:{queue:LB.q}}).catch(function(e){lbMsg("lblMsg",false,"The print list didn't save: "+e.message)})}
 function lbImg(id){return "/api/labels/img?id="+encodeURIComponent(id)}
 function lbHTML(l){return '<div class="L"><div class="lo">'+(l.logo?'<img src="'+lbImg(l.logo)+'" alt="">':'')+'</div><div class="tx"><div class="bg">'+esc(l.big||"")+'</div>'+(l.small?'<div class="sm">'+esc(l.small)+'</div>':'')+'</div></div>'}
 function lbFit(root){[].slice.call(root.querySelectorAll(".L")).forEach(function(L){var t=L.querySelector(".tx");[[".bg",50,18],[".sm",19,11]].forEach(function(a){var e=L.querySelector(a[0]);if(!e)return;var f=a[1];e.style.fontSize=f+"px";while(f>a[2]&&e.scrollWidth>t.clientWidth){f--;e.style.fontSize=f+"px"}})})}
@@ -3398,7 +3406,7 @@ function lbName(id){var x=LB.logos.filter(function(y){return y.id===id})[0];retu
 function lbList(){$("lblQn").textContent=LB.q.length?"("+LB.q.length+")":"";
   $("lblQ").innerHTML=LB.q.length?LB.q.map(function(l,i){return '<div class="lq">'+lbHTML(l)+'<button type="button" class="alt sm" data-qdel="'+i+'">Remove</button></div>'}).join(""):'<div class="mute">Nothing to print yet.</div>';lbFit($("lblQ"));
   $("lblSaved").innerHTML=LB.saved.length?LB.saved.map(function(l){return '<div style="display:flex;align-items:center;gap:8px;margin:6px 0"><button type="button" class="alt" style="flex:1;margin:0;text-align:left" data-sadd="'+esc(l.id)+'"><b>'+esc(l.big)+'</b> · '+esc(l.small||"")+' <span class="mute">('+esc(lbName(l.logo))+')</span></button><button type="button" class="alt sm" style="width:auto;margin:0" data-sdel="'+esc(l.id)+'">Delete</button></div>'}).join(""):'<div class="mute">None saved yet.</div>'}
-function loadLbl(){if(!LB.wired)lbWire();api("/api/labels").then(function(j){LB.logos=j.logos||[];LB.saved=j.saved||[];lbLogos();lbList();lbPrev()}).catch(function(e){if(e.message!=="signin")$("lblMsg").innerHTML='<div class="msg err">'+esc(e.message)+'</div>'})}
+function loadLbl(){if(!LB.wired)lbWire();api("/api/labels").then(function(j){LB.logos=j.logos||[];LB.saved=j.saved||[];LB.q=j.queue||[];lbLogos();lbList();lbPrev()}).catch(function(e){if(e.message!=="signin")$("lblMsg").innerHTML='<div class="msg err">'+esc(e.message)+'</div>'})}
 function lbMsg(id,ok,t){$(id).innerHTML='<div class="msg '+(ok?"ok":"err")+'">'+esc(t)+'</div>'}
 function lbSaved(){return api("/api/labels/save",{method:"POST",body:{saved:LB.saved}})}
 function lbWire(){LB.wired=true;
@@ -3414,8 +3422,8 @@ function lbWire(){LB.wired=true;
     if(d){var keep=LB.saved;LB.saved=LB.saved.filter(function(x){return x.id!==d.dataset.sdel});lbSaved().then(lbList).catch(function(x){LB.saved=keep;lbMsg("lblMsg",false,x.message)})}});
   $("lgList").addEventListener("click",function(e){var b=e.target.closest("[data-lgdel]");if(!b)return;if(b.dataset.sure!=="1"){b.dataset.sure="1";b.textContent="?";b.title="Tap again to delete";return}
     api("/api/labels/logo-del",{method:"POST",body:{id:b.dataset.lgdel}}).then(function(){if(LB.logo===b.dataset.lgdel)LB.logo="";loadLbl()}).catch(function(x){lbMsg("lgMsg",false,x.message)})});
-  $("lgFile").addEventListener("change",function(){var f=this.files[0],inp=this,name=$("lgName").value.trim();if(!f)return;if(!name){lbMsg("lgMsg",false,"Type the brand name first, then pick the picture.");inp.value="";return}
-    lbMsg("lgMsg",true,"Adding…");lbLogoPng(f).then(function(png){return api("/api/labels/logo",{method:"POST",body:{name:name,png:png}})}).then(function(r){inp.value="";$("lgName").value="";LB.logo=r.id;lbMsg("lgMsg",true,"Added "+name+".");loadLbl()}).catch(function(x){inp.value="";lbMsg("lgMsg",false,x.message)})});
+  ["lgFile","lgCam"].forEach(function(fid){$(fid).addEventListener("change",function(){var f=this.files[0],inp=this,name=$("lgName").value.trim();if(!f)return;if(!name){lbMsg("lgMsg",false,"Type the brand name first, then pick the picture.");inp.value="";return}
+    lbMsg("lgMsg",true,"Adding…");lbLogoPng(f).then(function(png){return api("/api/labels/logo",{method:"POST",body:{name:name,png:png}})}).then(function(r){inp.value="";$("lgName").value="";LB.logo=r.id;lbMsg("lgMsg",true,"Added "+name+".");loadLbl()}).catch(function(x){inp.value="";lbMsg("lgMsg",false,x.message)})})});
   $("lblPrint").addEventListener("click",lbPrint)}
 // Black and white for the thermal printer, white edges trimmed, at most 400 px.
 function lbLogoPng(f){return new Promise(function(res,rej){var img=new Image(),u=URL.createObjectURL(f);img.onerror=function(){rej(new Error("Couldn't open that picture"))};img.onload=function(){
