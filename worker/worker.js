@@ -1133,6 +1133,41 @@ async function ownerApi(req, env, path, url) {
     await saveCamReq(env, S, q);
     return json({ ok: true, req: q });
   }
+  // ---- Promo shelf labels (DYMO 30252, 1-1/8" x 3-1/2"). Logos are shared by both stores; saved labels are per store.
+  if (path === "/api/labels" && req.method === "GET") {
+    return json({ logos: await kvJson(env, "*", "lbllogos", []), saved: await kvJson(env, S, "labels", []) });
+  }
+  if (path === "/api/labels/logo" && req.method === "POST") {
+    const b = await readBody(req), name = String(b.name || "").trim().slice(0, 40), img = String(b.png || "");
+    if (!name) return json({ error: "Type the brand name" }, 400);
+    if (!/^[A-Za-z0-9+/=]{500,}$/.test(img) || img.length > 6e5) return json({ error: "That picture didn't work. Try another one." }, 400);
+    const id = "lbl-" + rid(12), list = await kvJson(env, "*", "lbllogos", []);
+    if (list.length >= 150) return json({ error: "Too many logos saved. Delete some first." }, 400);
+    await env.DB.prepare("INSERT INTO photos (id, created, b64) VALUES (?, ?, ?)").bind(id, Date.now(), img).run();
+    list.push({ id, name }); list.sort((a, c2) => a.name.localeCompare(c2.name));
+    await kvPutJson(env, "*", "lbllogos", list);
+    return json({ ok: true, id });
+  }
+  if (path === "/api/labels/logo-del" && req.method === "POST") {
+    if (MGR) return json({ error: "Only the owner can delete logos" }, 403);
+    const b = await readBody(req), id = String(b.id || ""), list = await kvJson(env, "*", "lbllogos", []);
+    if (!list.some(x => x.id === id)) return json({ error: "Not found" }, 404);
+    await kvPutJson(env, "*", "lbllogos", list.filter(x => x.id !== id));
+    await env.DB.prepare("DELETE FROM photos WHERE id = ?").bind(id).run();
+    return json({ ok: true });
+  }
+  if (path === "/api/labels/img" && req.method === "GET") {
+    const id = String(url.searchParams.get("id") || "").replace(/[^a-z0-9-]/g, "");
+    const r = /^lbl-/.test(id) ? await env.DB.prepare("SELECT b64 FROM photos WHERE id = ?").bind(id).first() : null;
+    if (!r) return new Response("Not found", { status: 404 });
+    return new Response(Uint8Array.from(atob(r.b64), c => c.charCodeAt(0)), { headers: { "content-type": "image/png", "cache-control": "private, max-age=86400" } });
+  }
+  if (path === "/api/labels/save" && req.method === "POST") {
+    const b = await readBody(req), t = v => String(v || "").trim().slice(0, 40);
+    const items = (Array.isArray(b.saved) ? b.saved : []).slice(0, 200).map(x => ({ id: String(x.id || rid(8)).slice(0, 16), logo: String(x.logo || "").slice(0, 20), big: t(x.big), small: t(x.small) })).filter(x => x.big);
+    await kvPutJson(env, S, "labels", items);
+    return json({ ok: true });
+  }
   if (path === "/api/cams/img" && req.method === "GET") {
     const ch = String(url.searchParams.get("ch") || "").replace(/[^0-9A-Za-z]/g, "").slice(0, 8);
     const r = ch ? await env.DB.prepare("SELECT b64, created FROM photos WHERE id = ?").bind("cam-" + S + "-" + ch).first() : null;
@@ -1803,6 +1838,8 @@ async function licenseReminder(env) {
   }
   if (out.length) await pushAlert(env, out.length === 1 ? "License to renew" : out.length + " licenses to renew", out.join(" · "), "/#licenses", "owner");
 }
+async function kvJson(env, store, k, dflt) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = ?").bind(store, k).first(); try { return r ? JSON.parse(r.data) : dflt; } catch { return dflt; } }
+async function kvPutJson(env, store, k, v) { await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, ?, ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(store, k, JSON.stringify(v), Date.now()).run(); }
 async function homeAttention(env, S, MGR, st) {
   const A = [], now = Date.now(), when = t => new Date(t).toLocaleString("en-US", { timeZone: env.TIMEZONE || "America/New_York", weekday: "short", hour: "numeric", minute: "2-digit" });
   // Store PC and nightly upload
@@ -2968,6 +3005,9 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
 .tw td input{max-width:100%}
 .tw td .drops{justify-content:flex-end}
 }
+.lblLogos{display:flex;flex-wrap:wrap;gap:8px}.lblLogos .lg{width:84px;height:62px;border:1px solid var(--line);border-radius:10px;background:#fff;display:flex;align-items:center;justify-content:center;padding:6px;cursor:pointer;position:relative;color:#333;font-size:12px;text-align:center}.lblLogos .lg img{max-width:100%;max-height:100%}.lblLogos .lg.on{outline:3px solid var(--accent,#c98a2b);outline-offset:1px}.lblLogos .lg .x{position:absolute;top:-8px;right:-8px;width:22px;height:22px;border-radius:50%;background:var(--paper);border:1px solid var(--line);font-size:13px;line-height:20px;padding:0;margin:0;color:var(--ink)}.lblPrev{overflow:hidden;border-radius:6px}.lblPrev>div{transform-origin:0 0}
+.L{width:336px;height:108px;background:#fff;color:#000;display:flex;align-items:center;box-sizing:border-box;padding:6px 10px 6px 8px;font-family:Arial,Helvetica,sans-serif;box-shadow:0 0 0 1px #ddd}.L .lo{width:98px;height:92px;flex:none;display:flex;align-items:center;justify-content:center;margin-right:8px}.L .lo img{max-width:98px;max-height:92px}.L .tx{flex:1;min-width:0;text-align:center;display:flex;flex-direction:column;justify-content:center;height:100%}.L .bg{font-weight:900;font-size:50px;line-height:1;white-space:nowrap;letter-spacing:-.5px}.L .sm{font-weight:700;font-size:19px;line-height:1.1;white-space:nowrap;margin-top:6px}
+.lq{display:flex;align-items:center;gap:10px;margin:6px 0}.lq .L{transform:scale(.62);transform-origin:0 0;margin:0 -128px -41px 0}.lq button{width:auto;margin:0}
 </style></head><body><main>
 <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h1 style="margin:0">Store <span>HQ</span></h1><div style="display:flex;gap:8px;align-items:center"><select id="store" aria-label="Store" style="width:auto;font-weight:700" hidden></select><div style="position:relative"><button type="button" class="alt sm" id="setupBtn" aria-label="Menu" aria-haspopup="true" hidden>☰</button><div id="setupBox" hidden style="position:absolute;right:0;top:calc(100% + 6px);z-index:30;min-width:170px;background:var(--paper);border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.14);overflow:hidden"><button type="button" id="menuStaff" style="display:block;width:100%;margin:0;border:0;border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Cashiers</button><button type="button" id="menuLic" style="display:block;width:100%;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Licenses</button><button type="button" id="menuPL" style="display:block;width:100%;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Profit</button><button type="button" id="signout" style="display:block;width:100%;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;background:none;color:var(--ink);text-align:left;padding:14px 16px;font-weight:600">Log out</button></div></div></div></div>
 <section id="login" hidden><div class="card"><label for="pw">Password</label><input type="password" id="pw" autocomplete="current-password"><button id="lg" style="margin-top:12px;width:100%">Sign in</button><div id="lmsg"></div></div></section>
@@ -3051,6 +3091,21 @@ a.gsbtn{display:block;text-align:center;text-decoration:none;margin-top:8px;padd
  </div>
 </section>
 <section id="v-tanks" hidden><div id="tanksNow"></div></section>
+<section id="v-lbl" hidden>
+ <div class="card"><h2>Make a promo label</h2><div class="mute">Every label comes out the same: logo on the left, deal price big, single price underneath. For the DYMO 30252 labels (1-1/8" x 3-1/2").</div>
+  <label style="display:block;margin-top:12px">Logo</label><div id="lblLogos" class="lblLogos"></div>
+  <div class="row" style="margin-top:10px"><div><label>Deal price (big)</label><input id="lblBig" placeholder="2 for $5" maxlength="40"></div><div><label>Single price (underneath)</label><input id="lblSmall" placeholder="$2.99 each" maxlength="40"></div></div>
+  <label style="display:block;margin-top:12px">Preview</label><div class="lblPrev"><div id="lblPrev"></div></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"><button type="button" id="lblAdd" style="width:auto;margin:0">Add to print list</button><button type="button" id="lblKeep" class="alt" style="width:auto;margin:0">Save for next time</button></div>
+  <div id="lblMsg" style="margin-top:8px"></div></div>
+ <div class="card"><h2>Print list <span id="lblQn" class="mute" style="font-weight:400"></span></h2><div id="lblQ"></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button type="button" id="lblPrint" style="width:auto;margin:0">Print</button><button type="button" id="lblClear" class="alt" style="width:auto;margin:0">Clear list</button></div>
+  <div class="mute" style="margin-top:8px;font-size:13px">In the print window pick the DYMO printer, paper size <b>30252 Address</b>, margins <b>None</b>, scale <b>100</b>. At Trail (Twin Turbo) also pick the roll that has the 30252 labels.</div></div>
+ <div class="card"><h2>Saved labels</h2><div class="mute">Tap one to add it to the print list.</div><div id="lblSaved" style="margin-top:8px"></div></div>
+ <div class="card"><h2>Logos</h2><div class="mute">Add each brand's logo once and it's there for both stores. Use the logo from the vendor's promo material or a clear photo. It's turned black and white for the label printer.</div>
+  <div class="row" style="margin-top:10px"><div><label>Brand name</label><input id="lgName" placeholder="Coca-Cola" maxlength="40"></div><div style="display:flex;align-items:flex-end"><label class="alt" style="display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid var(--line);cursor:pointer">Add logo picture<input type="file" id="lgFile" accept="image/*" hidden></label></div></div>
+  <div id="lgMsg" style="margin-top:8px"></div><div id="lgList" class="lblLogos" style="margin-top:10px"></div></div>
+</section>
 <section id="v-cams" hidden><div class="card"><h2>Cameras</h2><p class="sub" id="camsub">Loading…</p><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0 10px"><button type="button" id="camNow">Get fresh pictures</button><span class="mute" id="camMsg" style="flex:1;min-width:180px"></span></div><div id="camgrid" class="camgrid"></div></div></section>
 <section id="v-gas" hidden>
  <div class="gasp">
@@ -3112,17 +3167,17 @@ function labelTables(){document.querySelectorAll(".tw table").forEach(function(t
 new MutationObserver(function(){if(labelTables.p)return;labelTables.p=requestAnimationFrame(function(){labelTables.p=0;labelTables()})}).observe(document.body,{childList:true,subtree:true});
 // Six tabs. Sales and Store have two views each; old names (staff, pay, movers, gas, cigs) still work for links.
 var VIEW={home:{s:["home"]},day:{s:["day"]},people:{s:["pay"]},cashiers:{s:["staff"]},licenses:{s:["lic"]},pl:{s:["pl"]},
-  sales:{sub:[["daily","Daily",["sales"]],["movers","Movers",["movers"]]]},store:{sub:[["fuel","Fuel",["tanks","gas"]],["cigs","Cig prices",["cigs"]],["cams","Cameras",["cams"]]]}};
+  sales:{sub:[["daily","Daily",["sales"]],["movers","Movers",["movers"]]]},store:{sub:[["fuel","Fuel",["tanks","gas"]],["cigs","Cig prices",["cigs"]],["cams","Cameras",["cams"]],["labels","Promo labels",["lbl"]]]}};
 var SUB={sales:"daily",store:"fuel"},CUR="home";
 var OLD={staff:["cashiers"],pay:["people"],movers:["sales","movers"],gas:["store","fuel"],cigs:["store","cigs"]};
 function curSections(){var V=VIEW[CUR];if(V.s)return V.s;var sb=V.sub.filter(function(x){return x[0]===SUB[CUR]})[0]||V.sub[0];return sb[2]}
-function loadView(){var sec=curSections();sec.forEach(function(k){({home:loadHome,day:loadDay,staff:loadStaff,lic:loadLic,pay:loadPay,sales:loadSales,movers:loadMV,pl:loadPL,cigs:loadCG,gas:loadGas,tanks:loadTanks,cams:loadCams})[k]()})}
+function loadView(){var sec=curSections();sec.forEach(function(k){({home:loadHome,day:loadDay,staff:loadStaff,lic:loadLic,pay:loadPay,sales:loadSales,movers:loadMV,pl:loadPL,cigs:loadCG,gas:loadGas,tanks:loadTanks,cams:loadCams,lbl:loadLbl})[k]()})}
 function openView(v,sub){if(OLD[v]){sub=OLD[v][1]||sub;v=OLD[v][0]}if(!VIEW[v])v="home";CUR=v;if(sub)SUB[v]=sub;
-  if(MANAGER&&v==="store")SUB.store="fuel";
+  if(MANAGER&&v==="store"&&SUB.store!=="labels")SUB.store="fuel";
   document.querySelectorAll(".tabs button").forEach(function(x){x.classList.toggle("on",x.dataset.v===v)});
   var V=VIEW[v],sn=$("subnav");
   if(V.sub){sn.hidden=false;sn.innerHTML=V.sub.filter(function(x){return !(MANAGER&&(x[0]==="cigs"||x[0]==="cams"))}).map(function(x){return '<button type="button" data-sub="'+x[0]+'" class="'+(SUB[v]===x[0]?"on":"")+'">'+x[1]+'</button>'}).join("");if(sn.children.length<2)sn.hidden=true}else{sn.hidden=true;sn.innerHTML=""}
-  var show=curSections();["home","day","staff","lic","pay","sales","pl","movers","cigs","tanks","gas","cams"].forEach(function(k){$("v-"+k).hidden=show.indexOf(k)<0});
+  var show=curSections();["home","day","staff","lic","pay","sales","pl","movers","cigs","tanks","gas","cams","lbl"].forEach(function(k){$("v-"+k).hidden=show.indexOf(k)<0});
   $("store").style.visibility=(v==="home"||PARTNER)?"hidden":"";loadView()}
 function goTab(v){openView(v)}
 $("subnav").addEventListener("click",function(e){var b=e.target.closest("button");if(b)openView(CUR,b.dataset.sub)});
@@ -3329,6 +3384,60 @@ function licSend(files){if(LIC.busy||!files.length)return;LIC.busy=true;var F=[]
     licB64(f).then(function(o){o.fileName=f.name||"";return api("/api/licenses/add",{method:"POST",body:o})}).then(function(j){if(!j.lic.expires)nodate++;next()}).catch(function(e){bad.push((f.name||"file")+": "+e.message);next()})}
   next()}
 ["liccam","licfile"].forEach(function(id){$(id).addEventListener("change",function(){var f=this.files;licSend(f);this.value=""})});
+var LB={logos:[],saved:[],q:[],logo:"",loaded:false};
+try{LB.q=JSON.parse(localStorage.getItem("lblq")||"[]")||[]}catch(e){LB.q=[]}
+function lbSaveQ(){try{localStorage.setItem("lblq",JSON.stringify(LB.q))}catch(e){}}
+function lbImg(id){return "/api/labels/img?id="+encodeURIComponent(id)}
+function lbHTML(l){return '<div class="L"><div class="lo">'+(l.logo?'<img src="'+lbImg(l.logo)+'" alt="">':'')+'</div><div class="tx"><div class="bg">'+esc(l.big||"")+'</div>'+(l.small?'<div class="sm">'+esc(l.small)+'</div>':'')+'</div></div>'}
+function lbFit(root){[].slice.call(root.querySelectorAll(".L")).forEach(function(L){var t=L.querySelector(".tx");[[".bg",50,18],[".sm",19,11]].forEach(function(a){var e=L.querySelector(a[0]);if(!e)return;var f=a[1];e.style.fontSize=f+"px";while(f>a[2]&&e.scrollWidth>t.clientWidth){f--;e.style.fontSize=f+"px"}})})}
+function lbCur(){return {logo:LB.logo,big:$("lblBig").value.trim(),small:$("lblSmall").value.trim()}}
+function lbPrev(){var w=$("lblPrev");w.innerHTML=lbHTML(lbCur());var k=Math.min(1.6,(w.parentNode.clientWidth||336)/336);w.style.transform="scale("+k+")";w.parentNode.style.height=Math.round(108*k)+"px";lbFit(w)}
+function lbLogos(){var h='<div class="lg'+(LB.logo===""?" on":"")+'" data-lg="">No logo</div>';LB.logos.forEach(function(x){h+='<div class="lg'+(LB.logo===x.id?" on":"")+'" data-lg="'+esc(x.id)+'" title="'+esc(x.name)+'"><img src="'+lbImg(x.id)+'" alt="'+esc(x.name)+'"></div>'});$("lblLogos").innerHTML=h;
+  $("lgList").innerHTML=LB.logos.length?LB.logos.map(function(x){return '<div class="lg" title="'+esc(x.name)+'"><img src="'+lbImg(x.id)+'" alt="'+esc(x.name)+'">'+(MANAGER?'':'<button type="button" class="x" data-lgdel="'+esc(x.id)+'" aria-label="Delete">×</button>')+'</div>'}).join(""):'<div class="mute">No logos yet.</div>'}
+function lbName(id){var x=LB.logos.filter(function(y){return y.id===id})[0];return x?x.name:"No logo"}
+function lbList(){$("lblQn").textContent=LB.q.length?"("+LB.q.length+")":"";
+  $("lblQ").innerHTML=LB.q.length?LB.q.map(function(l,i){return '<div class="lq">'+lbHTML(l)+'<button type="button" class="alt sm" data-qdel="'+i+'">Remove</button></div>'}).join(""):'<div class="mute">Nothing to print yet.</div>';lbFit($("lblQ"));
+  $("lblSaved").innerHTML=LB.saved.length?LB.saved.map(function(l){return '<div style="display:flex;align-items:center;gap:8px;margin:6px 0"><button type="button" class="alt" style="flex:1;margin:0;text-align:left" data-sadd="'+esc(l.id)+'"><b>'+esc(l.big)+'</b> · '+esc(l.small||"")+' <span class="mute">('+esc(lbName(l.logo))+')</span></button><button type="button" class="alt sm" style="width:auto;margin:0" data-sdel="'+esc(l.id)+'">Delete</button></div>'}).join(""):'<div class="mute">None saved yet.</div>'}
+function loadLbl(){if(!LB.wired)lbWire();api("/api/labels").then(function(j){LB.logos=j.logos||[];LB.saved=j.saved||[];lbLogos();lbList();lbPrev()}).catch(function(e){if(e.message!=="signin")$("lblMsg").innerHTML='<div class="msg err">'+esc(e.message)+'</div>'})}
+function lbMsg(id,ok,t){$(id).innerHTML='<div class="msg '+(ok?"ok":"err")+'">'+esc(t)+'</div>'}
+function lbSaved(){return api("/api/labels/save",{method:"POST",body:{saved:LB.saved}})}
+function lbWire(){LB.wired=true;
+  $("lblLogos").addEventListener("click",function(e){var g=e.target.closest("[data-lg]");if(!g)return;LB.logo=g.dataset.lg;lbLogos();lbPrev()});
+  ["lblBig","lblSmall"].forEach(function(id){$(id).addEventListener("input",lbPrev)});
+  window.addEventListener("resize",function(){if(!$("v-lbl").hidden)lbPrev()});
+  $("lblAdd").addEventListener("click",function(){var l=lbCur();if(!l.big){lbMsg("lblMsg",false,"Type the deal price first.");return}LB.q.push(l);lbSaveQ();lbList();lbMsg("lblMsg",true,"Added. "+LB.q.length+" on the print list.")});
+  $("lblKeep").addEventListener("click",function(){var l=lbCur();if(!l.big){lbMsg("lblMsg",false,"Type the deal price first.");return}l.id=String(Date.now());LB.saved.unshift(l);lbSaved().then(function(){lbList();lbMsg("lblMsg",true,"Saved. It's under Saved labels.")}).catch(function(e){LB.saved.shift();lbMsg("lblMsg",false,e.message)})});
+  $("lblQ").addEventListener("click",function(e){var b=e.target.closest("[data-qdel]");if(!b)return;LB.q.splice(+b.dataset.qdel,1);lbSaveQ();lbList()});
+  $("lblClear").addEventListener("click",function(){LB.q=[];lbSaveQ();lbList()});
+  $("lblSaved").addEventListener("click",function(e){var a=e.target.closest("[data-sadd]"),d=e.target.closest("[data-sdel]");
+    if(a){var l=LB.saved.filter(function(x){return x.id===a.dataset.sadd})[0];if(l){LB.q.push({logo:l.logo,big:l.big,small:l.small});lbSaveQ();lbList();lbMsg("lblMsg",true,"Added. "+LB.q.length+" on the print list.")}}
+    if(d){var keep=LB.saved;LB.saved=LB.saved.filter(function(x){return x.id!==d.dataset.sdel});lbSaved().then(lbList).catch(function(x){LB.saved=keep;lbMsg("lblMsg",false,x.message)})}});
+  $("lgList").addEventListener("click",function(e){var b=e.target.closest("[data-lgdel]");if(!b)return;if(b.dataset.sure!=="1"){b.dataset.sure="1";b.textContent="?";b.title="Tap again to delete";return}
+    api("/api/labels/logo-del",{method:"POST",body:{id:b.dataset.lgdel}}).then(function(){if(LB.logo===b.dataset.lgdel)LB.logo="";loadLbl()}).catch(function(x){lbMsg("lgMsg",false,x.message)})});
+  $("lgFile").addEventListener("change",function(){var f=this.files[0],inp=this,name=$("lgName").value.trim();if(!f)return;if(!name){lbMsg("lgMsg",false,"Type the brand name first, then pick the picture.");inp.value="";return}
+    lbMsg("lgMsg",true,"Adding…");lbLogoPng(f).then(function(png){return api("/api/labels/logo",{method:"POST",body:{name:name,png:png}})}).then(function(r){inp.value="";$("lgName").value="";LB.logo=r.id;lbMsg("lgMsg",true,"Added "+name+".");loadLbl()}).catch(function(x){inp.value="";lbMsg("lgMsg",false,x.message)})});
+  $("lblPrint").addEventListener("click",lbPrint)}
+// Black and white for the thermal printer, white edges trimmed, at most 400 px.
+function lbLogoPng(f){return new Promise(function(res,rej){var img=new Image(),u=URL.createObjectURL(f);img.onerror=function(){rej(new Error("Couldn't open that picture"))};img.onload=function(){
+  var k=Math.min(1,900/Math.max(img.width,img.height)),W=Math.max(1,Math.round(img.width*k)),H=Math.max(1,Math.round(img.height*k)),c=document.createElement("canvas");c.width=W;c.height=H;var x=c.getContext("2d");x.fillStyle="#fff";x.fillRect(0,0,W,H);x.drawImage(img,0,0,W,H);URL.revokeObjectURL(u);
+  var d=x.getImageData(0,0,W,H),p=d.data,minX=W,minY=H,maxX=-1,maxY=-1;
+  for(var y=0;y<H;y++)for(var i=0;i<W;i++){var o=(y*W+i)*4,g=0.299*p[o]+0.587*p[o+1]+0.114*p[o+2];g=g>235?255:Math.max(0,Math.min(255,(g-128)*1.25+128));p[o]=p[o+1]=p[o+2]=g;p[o+3]=255;if(g<250){if(i<minX)minX=i;if(i>maxX)maxX=i;if(y<minY)minY=y;if(y>maxY)maxY=y}}
+  x.putImageData(d,0,0);if(maxX<0){rej(new Error("That picture looks blank"));return}
+  var cw=maxX-minX+1,ch=maxY-minY+1,s2=Math.min(1,400/Math.max(cw,ch)),o2=document.createElement("canvas");o2.width=Math.max(1,Math.round(cw*s2));o2.height=Math.max(1,Math.round(ch*s2));o2.getContext("2d").drawImage(c,minX,minY,cw,ch,0,0,o2.width,o2.height);
+  res(o2.toDataURL("image/png").split(",")[1])};img.src=u})}
+function lbPrint(){if(!LB.q.length){lbMsg("lblMsg",false,"The print list is empty.");return}
+  var w=window.open("","lblprint","width=520,height=420");if(!w){lbMsg("lblMsg",false,"Your browser blocked the print window. Allow pop-ups for this site and try again.");return}
+  w.document.write("<p style='font-family:Arial'>Getting the labels ready…</p>");
+  // Logos go into the print window as pictures inside the page, so nothing has to load after it opens.
+  var ids=[],D={};LB.q.forEach(function(l){if(l.logo&&ids.indexOf(l.logo)<0)ids.push(l.logo)});
+  Promise.all(ids.map(function(id){return fetch(lbImg(id)).then(function(r){return r.ok?r.blob():null}).then(function(b){return b?new Promise(function(res){var fr=new FileReader();fr.onload=function(){D[id]=fr.result;res()};fr.onerror=function(){res()};fr.readAsDataURL(b)}):null}).catch(function(){})})).then(function(){
+    var css=[].slice.call(document.querySelectorAll("style")).map(function(x){return x.textContent}).join("").match(/[.]L[{ ][^]*?(?=[.]lq)/);
+    var body=LB.q.map(function(l){return '<div class="L"><div class="lo">'+(l.logo&&D[l.logo]?'<img src="'+D[l.logo]+'" alt="">':'')+'</div><div class="tx"><div class="bg">'+esc(l.big||"")+'</div>'+(l.small?'<div class="sm">'+esc(l.small)+'</div>':'')+'</div></div>'}).join("");
+    var html='<!doctype html><html><head><meta charset="utf-8"><title>Promo labels</title><style>@page{size:3.5in 1.125in;margin:0}html,body{margin:0;padding:0;background:#fff}'+(css?css[0]:"")+'.L{box-shadow:none;width:3.5in;height:1.125in;page-break-after:always;break-after:page;overflow:hidden}.L:last-child{page-break-after:auto;break-after:auto}</style></head><body>'+body+'</body></html>';
+    w.document.open();w.document.write(html);w.document.close();lbFit(w.document);
+    var done=false,go=function(){if(done)return;done=true;lbFit(w.document);setTimeout(function(){w.focus();w.print()},150)},imgs=[].slice.call(w.document.images),left=imgs.length;
+    setTimeout(go,3000);
+    if(!left)go();else imgs.forEach(function(im){if(im.complete){if(--left===0)go()}else{im.onload=im.onerror=function(){if(--left===0)go()}}})})}
 function loadKW(){api("/api/kkc-weeks").then(function(j){var W=(j.weeks||[]).slice().reverse(),h='<div class="tw"><table><thead><tr><th>Week</th><th class="r">Chicken sales</th><th class="r">Chicken invoices</th><th class="r">Food cost</th><th class="r">Left after food</th></tr></thead><tbody>';
   W.forEach(function(w){var pc=w.sales&&w.cost?Math.round(w.cost/w.sales*100):null,cur=w.to>=j.today;
     h+='<tr><td>'+esc(fmtShort(w.from))+' – '+esc(fmtShort(w.to))+(cur?' <span class="mute">(so far)</span>':'')+'</td><td class="r num">'+money(w.sales)+'</td><td class="r num">'+(w.invoices.length?money(w.cost)+'<div class="mute" style="font-size:.75rem">'+w.invoices.length+' invoice'+(w.invoices.length>1?"s":"")+'</div>':'<span class="mute">none entered</span>')+'</td><td class="r num">'+(pc==null?"—":'<span class="cgchip '+(pc<=50?"good":pc>=60?"bad":"")+'">'+pc+'%</span>')+'</td><td class="r num">'+(w.invoices.length?money(w.sales-w.cost):"—")+'</td></tr>'});
