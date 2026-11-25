@@ -16,7 +16,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 5
+$ScriptVersion = 6
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -177,7 +177,7 @@ if (-not $Recorder -or -not $cred) { Log "Not set up yet: run 'Setup cameras.bat
 # HTTP with Digest login over a plain socket. Needed because the recorder's download call is a GET that carries an XML body,
 # which .NET's web classes refuse to send. Writes the answer body to $outFile; returns @{ code; type }.
 function Md5Hex($t) { $m = [Security.Cryptography.MD5]::Create(); return ([BitConverter]::ToString($m.ComputeHash([Text.Encoding]::UTF8.GetBytes($t))) -replace "-", "").ToLower() }
-function RawHttp($hostPort, $method, $path, $body, $auth, $outFile) {
+function RawHttp($hostPort, $method, $path, $body, $auth, $outFile, [long]$cap = 0) {
   $hp = $hostPort.Split(':'); $h0 = $hp[0]; $port = if ($hp.Count -gt 1) { [int]$hp[1] } else { 80 }
   $cl = New-Object Net.Sockets.TcpClient; $cl.ReceiveTimeout = 60000; $cl.SendTimeout = 30000; $cl.Connect($h0, $port)
   try {
@@ -193,7 +193,7 @@ function RawHttp($hostPort, $method, $path, $body, $auth, $outFile) {
     $wa = if ($ht -match '(?im)^WWW-Authenticate:\s*Digest\s+([^\r\n]+)') { $matches[1] } else { "" }
     $chunked = $ht -match '(?im)^Transfer-Encoding:\s*chunked'
     $len = if ($ht -match '(?im)^Content-Length:\s*(\d+)') { [long]$matches[1] } else { -1 }
-    $fs = [IO.File]::Create($outFile)
+    $fs = [IO.File]::Create($outFile); $capped = $false
     try {
       $buf = New-Object byte[] 65536
       if ($chunked) {
@@ -201,13 +201,14 @@ function RawHttp($hostPort, $method, $path, $body, $auth, $outFile) {
           $line = ""; while ($true) { $b = $ns.ReadByte(); if ($b -lt 0) { break }; if ($b -eq 10) { break }; if ($b -ne 13) { $line += [char]$b } }
           $sz = [Convert]::ToInt64((($line -split ';')[0]).Trim(), 16); if ($sz -le 0) { break }
           $left = $sz; while ($left -gt 0) { $n = $ns.Read($buf, 0, [int][Math]::Min($buf.Length, $left)); if ($n -le 0) { break }; $fs.Write($buf, 0, $n); $left -= $n }
+          if ($cap -gt 0 -and $fs.Length -ge $cap) { $capped = $true; break }
           [void]$ns.ReadByte(); [void]$ns.ReadByte()
         }
       } else {
-        $left = $len; while ($left -ne 0) { $want = if ($left -lt 0) { $buf.Length } else { [int][Math]::Min($buf.Length, $left) }; $n = $ns.Read($buf, 0, $want); if ($n -le 0) { break }; $fs.Write($buf, 0, $n); if ($left -gt 0) { $left -= $n } }
+        $left = $len; while ($left -ne 0) { $want = if ($left -lt 0) { $buf.Length } else { [int][Math]::Min($buf.Length, $left) }; $n = $ns.Read($buf, 0, $want); if ($n -le 0) { break }; $fs.Write($buf, 0, $n); if ($left -gt 0) { $left -= $n }; if ($cap -gt 0 -and $fs.Length -ge $cap) { $capped = $true; break } }
       }
     } finally { $fs.Close() }
-    return @{ code = $code; type = $type; www = $wa }
+    return @{ code = $code; type = $type; www = $wa; capped = $capped; len = $len }
   } finally { $cl.Close() }
 }
 function DigestHeader($www, $method, $path, $cred) {
@@ -219,9 +220,9 @@ function DigestHeader($www, $method, $path, $cred) {
   $pw = $null
   return 'Digest username="' + $u + '", realm="' + $p["realm"] + '", nonce="' + $p["nonce"] + '", uri="' + $path + '", response="' + $resp + '"' + $q + $(if ($p["opaque"]) { ', opaque="' + $p["opaque"] + '"' } else { "" })
 }
-function AuthedRaw($hostPort, $method, $path, $body, $cred, $outFile) {
-  $r = RawHttp $hostPort $method $path $body $null $outFile
-  if ($r.code -eq 401 -and $r.www) { $r = RawHttp $hostPort $method $path $body (DigestHeader $r.www $method $path $cred) $outFile }
+function AuthedRaw($hostPort, $method, $path, $body, $cred, $outFile, [long]$cap = 0) {
+  $r = RawHttp $hostPort $method $path $body $null $outFile $cap
+  if ($r.code -eq 401 -and $r.www) { $r = RawHttp $hostPort $method $path $body (DigestHeader $r.www $method $path $cred) $outFile $cap }
   return $r
 }
 function RecPost($base, $path, $xml, $cred, [int]$timeout = 30) {
@@ -234,32 +235,41 @@ function RecPost($base, $path, $xml, $cred, [int]$timeout = 30) {
 function Get-Clip($base, $hostPort, $ch, $date, $sec, [int]$before, [int]$after, $cred, $outFile) {
   $t = [datetime]::ParseExact($date + " " + $sec, "yyyy-MM-dd HH:mm:ss", $null)
   $a = $t.AddSeconds(-$before); $b = $t.AddSeconds($after)
+  $last = ""
   foreach ($track in @(([int]$ch * 100 + 2), ([int]$ch * 100 + 1))) {
     $xml = '<?xml version="1.0" encoding="UTF-8"?><CMSearchDescription><searchID>' + [Guid]::NewGuid().ToString().ToUpper() + '</searchID><trackList><trackID>' + $track + '</trackID></trackList><timeSpanList><timeSpan><startTime>' + $a.ToString("yyyy-MM-ddTHH:mm:ssZ") + '</startTime><endTime>' + $b.ToString("yyyy-MM-ddTHH:mm:ssZ") + '</endTime></timeSpan></timeSpanList><maxResults>5</maxResults><searchResultPostion>0</searchResultPostion><metadataList><metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor></metadataList></CMSearchDescription>'
     try { $res = [xml](RecPost $base "/ISAPI/ContentMgmt/search" $xml $cred 30) } catch { continue }
     $uri = $res.SelectSingleNode("//*[local-name()='playbackURI']"); if (-not $uri) { continue }
     $pu = [string]$uri.InnerText
     $pu = $pu -replace 'starttime=[0-9TZ]+', ('starttime=' + $a.ToString("yyyyMMddTHHmmssZ")) -replace 'endtime=[0-9TZ]+', ('endtime=' + $b.ToString("yyyyMMddTHHmmssZ"))
+    # name= and size= make some recorders send the whole recording file; without them they cut by the times.
+    $pu = $pu -replace '&(amp;)?(name|size)=[^&]*', ''
+    $why = ""
     $dl = '<?xml version="1.0" encoding="UTF-8"?><downloadRequest><playbackURI>' + [Security.SecurityElement]::Escape($pu) + '</playbackURI></downloadRequest>'
-    $r = AuthedRaw $hostPort "GET" "/ISAPI/ContentMgmt/download" $dl $cred $outFile
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = AuthedRaw $hostPort "GET" "/ISAPI/ContentMgmt/download" $dl $cred $outFile 25MB
+    $mb = [Math]::Round((Get-Item $outFile).Length / 1MB, 1)
+    if ($r.capped) { $last = "The recorder sent more than 25 MB for a 25-second clip (whole recording, " + $(if ($r.len -gt 0) { [Math]::Round($r.len / 1MB) } else { "?" }) + " MB), track $track"; continue }
+    if ($r.code -ne 200) { $last = "Recorder answered " + $r.code + " to the download (track $track)"; continue }
     if ($r.code -eq 200 -and (Get-Item $outFile).Length -gt 20000) {
       $fsx = [IO.File]::OpenRead($outFile); $hb = New-Object byte[] 12; [void]$fsx.Read($hb, 0, 12); $fsx.Close()
       $fmt = if ([Text.Encoding]::ASCII.GetString($hb, 4, 4) -eq "ftyp") { "mp4" } else { "ps" }
-      return @{ ok = $true; fmt = $fmt; track = $track }
+      return @{ ok = $true; fmt = $fmt; track = $track; mb = $mb; secs = [Math]::Round($sw.Elapsed.TotalSeconds) }
     }
   }
-  return @{ ok = $false; err = "No recording found for that moment" }
+  return @{ ok = $false; err = $(if ($last) { $last } else { "No recording found for that moment" }) }
 }
 function Run-ClipJobs($jobs, $base, $hostPort, $cred) {
-  $done = 0
+  $done = 0; $clock = [Diagnostics.Stopwatch]::StartNew(); $n = 0
   foreach ($j in @($jobs.items)) {
+    if ($n -ge 2 -or $clock.Elapsed.TotalMinutes -gt 4) { break }; $n++
     $f = Join-Path $env:TEMP ("storehq-clip-" + $j.key + ".bin")
     try {
       $r = Get-Clip $base $hostPort $jobs.ch $j.date $j.sec ([int]$j.before) ([int]$j.after) $cred $f
       if ($r.ok) {
         Invoke-RestMethod -Method Post -Uri ("$Url/api/clip-upload?store=$Store&key=" + [Uri]::EscapeDataString($j.key) + "&fmt=" + $r.fmt) -Headers $H -ContentType "application/octet-stream" -InFile $f -TimeoutSec 180 | Out-Null
-        $done++
-      } else { Invoke-RestMethod -Method Post -Uri ("$Url/api/clip-upload?store=$Store&key=" + [Uri]::EscapeDataString($j.key) + "&err=" + [Uri]::EscapeDataString($r.err)) -Headers $H -TimeoutSec 30 | Out-Null }
+        $done++; Log ("Clip " + $j.key + ": " + $r.mb + " MB " + $r.fmt + " in " + $r.secs + " s, sent")
+      } else { Log ("Clip " + $j.key + ": " + $r.err); Invoke-RestMethod -Method Post -Uri ("$Url/api/clip-upload?store=$Store&key=" + [Uri]::EscapeDataString($j.key) + "&err=" + [Uri]::EscapeDataString($r.err.Substring(0, [Math]::Min(150, $r.err.Length)))) -Headers $H -TimeoutSec 30 | Out-Null }
     } catch { try { Invoke-RestMethod -Method Post -Uri ("$Url/api/clip-upload?store=$Store&key=" + [Uri]::EscapeDataString($j.key) + "&err=" + [Uri]::EscapeDataString(($_.Exception.Message).Substring(0, [Math]::Min(150, $_.Exception.Message.Length)))) -Headers $H -TimeoutSec 30 | Out-Null } catch {} }
     finally { Remove-Item $f -ErrorAction SilentlyContinue }
   }
@@ -314,8 +324,9 @@ foreach ($b in @("http://$Recorder", "https://$Recorder")) {
   try { $r = RecGet $b "/ISAPI/System/deviceInfo" $cred 15; $base = $b; $x = [xml]([Text.Encoding]::UTF8.GetString($r.bytes)); $model = [string]$x.DeviceInfo.model + " " + [string]$x.DeviceInfo.deviceName; break }
   catch { $m = $_.Exception.Message; if ($m -match '401') { $err = "The recorder refused the login (wrong username or password). Run Setup cameras again and type it again." } elseif (-not $err) { $err = "Couldn't reach the recorder at $b : $m" } }
 }
+if ($Poll) { Ensure-CamTask; Update-Self }
 if ($Poll -and $base -and $Jobs -and $Jobs.items -and @($Jobs.items).Count) { Run-ClipJobs $Jobs $base ($base -replace '^https?://', '') $cred }
-if ($Poll -and -not $ReqId) { Ensure-CamTask; Update-Self; exit 0 }
+if ($Poll -and -not $ReqId) { exit 0 }
 $chans = @(); $snaps = @()
 if ($base) {
   $err = ""

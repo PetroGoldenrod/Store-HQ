@@ -1184,6 +1184,8 @@ async function ownerApi(req, env, path, url) {
   }
   // ---- Void / no-sale clips: the store PC cuts ~25 s from the recorder around each one and uploads it (kept 30 days).
   if (path === "/api/pc-clipjobs" && req.method === "GET") {
+    // Older camera scripts ran clips before updating themselves and got stopped by Windows at 10 minutes, so they never updated.
+    if ((+url.searchParams.get("v") || 0) < 6) return json({ items: [] });
     const cams = await camsDoc(env, S); if (!cams || !(cams.channels || []).length) return json({ items: [] });
     const ch = cams.clipCh || (cams.channels.find(c => c.ok) || cams.channels[0]).ch;
     const ix = await clipIndex(env, S), out = [], today = ymdNY(new Date());
