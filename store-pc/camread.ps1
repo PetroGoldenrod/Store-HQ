@@ -16,7 +16,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 8
+$ScriptVersion = 9
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -292,9 +292,12 @@ function Get-ClipRtsp($ff, $base, $ch, $date, $sec, [int]$before, [int]$after, $
     if ((Test-Path $raw) -and (Get-Item $raw).Length -gt 20000) {
       # iPhones play H.265 only when it's tagged hvc1, so check the codec and re-wrap when needed (no re-encoding).
       $info = FF-Run $ff ('-hide_banner -i "' + $raw + '"') 30
-      if ($info -match 'Video: hevc') { [void](FF-Run $ff ('-hide_banner -loglevel error -i "' + $raw + '" -c copy -tag:v hvc1 -movflags +faststart -y "' + $outFile + '"') 60) } else { Move-Item $raw $outFile -Force }
+      # -f mp4: the clip file ends in .bin, so FFmpeg can't guess the format from the name.
+      $rerr = ""
+      if ($info -match 'Video: hevc') { $rerr = FF-Run $ff ('-hide_banner -loglevel error -i "' + $raw + '" -c copy -tag:v hvc1 -movflags +faststart -f mp4 -y "' + $outFile + '"') 60 } else { Move-Item $raw $outFile -Force }
       Remove-Item $raw -Force -ErrorAction SilentlyContinue
       if ((Test-Path $outFile) -and (Get-Item $outFile).Length -gt 20000) { return @{ ok = $true; fmt = "mp4"; track = $track; mb = [Math]::Round((Get-Item $outFile).Length / 1MB, 1); secs = [Math]::Round($sw.Elapsed.TotalSeconds) } }
+      if ($rerr) { $err = "re-wrap failed: " + $rerr }
     }
     $e2 = (($err -replace '[\r\n]+', ' ') -replace 'rtsp://[^ ]*', 'rtsp://...').Trim()
     $last = "FFmpeg got no video (track $track, RTSP port $port)" + $(if ($e2) { ": " + $e2.Substring(0, [Math]::Min(120, $e2.Length)) } else { "" })
