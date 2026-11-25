@@ -1251,6 +1251,13 @@ async function ownerApi(req, env, path, url) {
     return json({ read, every: TANK_EVERY_MIN });
   }
   // Owner downloads the store PC files (open in the store PC's Chrome, signed in as owner, save into the StoreHQ folder).
+  // A read-only copy of Sunray's invoice and vendor lists, sent by a helper chat, so Store HQ's sent invoices can be checked against it.
+  if (path === "/api/sunray-snapshot" && req.method === "POST") {
+    if (MGR) return json({ error: "Owner only" }, 403);
+    const b = await readBody(req, 4e6), part = String(b.part || "invoices").replace(/[^a-z0-9_-]/gi, "").slice(0, 30);
+    await kvPutJson(env, S, "sunray:" + part, { at: Date.now(), note: String(b.note || "").slice(0, 500), rows: Array.isArray(b.rows) ? b.rows.slice(0, 5000) : [] });
+    return json({ ok: true, part, rows: Array.isArray(b.rows) ? Math.min(5000, b.rows.length) : 0 });
+  }
   if (path === "/api/pc-file" && req.method === "GET") {
     if (MGR) return json({ error: "Owner only" }, 403);
     const nm = url.searchParams.get("name"), site = S === "654287" ? "004" : "011", where = S === "654287" ? "Trail" : "Goldenrod";
