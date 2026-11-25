@@ -9,6 +9,7 @@ import { connect } from "cloudflare:sockets";
 import TANKREAD_PS1 from "../store-pc/tankread.ps1";
 import VSUPLOAD_PS1 from "../store-pc/vsupload.ps1";
 import CAMREAD_PS1 from "../store-pc/camread.ps1";
+import SSCSREAD_PS1 from "../store-pc/sscsread.ps1";
 // Optional variables: MODEL (default claude-sonnet-5-5), FLAG_AMOUNT (default 3),
 //   HOURS_PER_SHIFT (default 8), PAY_WEEK_START (0=Sun..6=Sat, default 5 = Friday).
 
@@ -954,6 +955,8 @@ async function ownerApi(req, env, path, url) {
       placed.push(where.date + " S" + where.shift); added++;
     }
     for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+    // The store PC's own SSCS reader reports how it went (no browser needed).
+    if (b.v) await kvPutJson(env, S, "sscsread", { at: Date.now(), v: Number(b.v) || 0, ok: !b.pcErr, err: String(b.pcErr || "").slice(0, 200), n: added });
     return json({ ok: true, added, skipped, placed: [...new Set(placed)].sort() });
   }
   if (path === "/api/vfcash-import" && req.method === "POST") {
@@ -1247,10 +1250,20 @@ async function ownerApi(req, env, path, url) {
     await saveTankReq(env, S, cur);
     return json({ read, every: TANK_EVERY_MIN });
   }
+  // Owner downloads the store PC files (open in the store PC's Chrome, signed in as owner, save into the StoreHQ folder).
+  if (path === "/api/pc-file" && req.method === "GET") {
+    if (MGR) return json({ error: "Owner only" }, 403);
+    const nm = url.searchParams.get("name"), site = S === "654287" ? "004" : "011", where = S === "654287" ? "Trail" : "Goldenrod";
+    let body = null, fn = "";
+    if (nm === "sscsread") { body = SSCSREAD_PS1; fn = "sscsread.ps1"; }
+    else if (nm === "sscsread-setup") { body = "@echo off\r\nrem Store HQ: scratch-off counts straight from SSCS, no browser needed (" + where + "). Keep this file next to sscsread.ps1.\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dp0sscsread.ps1\" -Setup -Store " + S + " -Site " + site + "\r\n"; fn = "Setup scratch-offs.bat"; }
+    if (!body) return json({ error: "unknown file" }, 404);
+    return new Response(body, { headers: { "content-type": "application/octet-stream", "content-disposition": 'attachment; filename="' + fn + '"', "cache-control": "no-store" } });
+  }
   if (path === "/api/pc-script" && req.method === "GET") {
     // The newest store PC scripts (they update themselves). ?name=tankread for the tank reading script.
     // Served from the scripts bundled with this deploy (store-pc/*.ps1), so a git push is all it takes to update the PCs.
-    const nm0 = url.searchParams.get("name"), txt = nm0 === "tankread" ? TANKREAD_PS1 : nm0 === "camread" ? CAMREAD_PS1 : VSUPLOAD_PS1, vm = /\$ScriptVersion = (\d+)/.exec(txt);
+    const nm0 = url.searchParams.get("name"), txt = nm0 === "tankread" ? TANKREAD_PS1 : nm0 === "camread" ? CAMREAD_PS1 : nm0 === "sscsread" ? SSCSREAD_PS1 : VSUPLOAD_PS1, vm = /\$ScriptVersion = (\d+)/.exec(txt);
     if (vm) {
       const sha = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(txt)))].map(b => b.toString(16).padStart(2, "0")).join("");
       return json({ version: +vm[1], sha256: sha, script: txt });
