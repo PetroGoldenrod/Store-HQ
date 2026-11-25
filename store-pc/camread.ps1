@@ -16,7 +16,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 6
+$ScriptVersion = 7
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -231,8 +231,72 @@ function RecPost($base, $path, $xml, $cred, [int]$timeout = 30) {
   $bb = [Text.Encoding]::UTF8.GetBytes($xml); $req.ContentLength = $bb.Length; $st = $req.GetRequestStream(); $st.Write($bb, 0, $bb.Length); $st.Close()
   $resp = $req.GetResponse(); try { $sr = New-Object IO.StreamReader($resp.GetResponseStream()); return $sr.ReadToEnd() } finally { $resp.Close() }
 }
+# ---- FFmpeg (free video tool, official Windows build linked from ffmpeg.org; the owner OK'd it on Nov 25, 2026).
+# Downloaded once into this folder. It asks the recorder to play back just the seconds around a void (RTSP playback)
+# and saves them as a normal MP4 a phone can play. Nothing else uses it.
+function Get-FFmpeg {
+  $ff = Join-Path $here "ffmpeg.exe"; if (Test-Path $ff) { return $ff }
+  $mark = Join-Path $here "ffmpeg.try"
+  if ((Test-Path $mark) -and ((Get-Date) - (Get-Item $mark).LastWriteTime).TotalHours -lt 6) { return "" }
+  Set-Content -Path $mark -Value (Get-Date -Format s)
+  $zip = Join-Path $env:TEMP "storehq-ffmpeg.zip"; $dir = Join-Path $env:TEMP "storehq-ffmpeg"
+  try {
+    Log "Downloading FFmpeg (one time, about 100 MB) for the void clips..."
+    (New-Object Net.WebClient).DownloadFile("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip", $zip)
+    if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $dir)
+    $exe = Get-ChildItem -Path $dir -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+    if (-not $exe) { throw "ffmpeg.exe not found in the download" }
+    Copy-Item $exe.FullName $ff -Force
+    $v = & $ff -hide_banner -version 2>&1 | Select-Object -First 1
+    Log ("FFmpeg ready: " + $v)
+    return $ff
+  } catch { Log ("FFmpeg download failed: " + $_.Exception.Message); return "" }
+  finally { Remove-Item $zip -Force -ErrorAction SilentlyContinue; Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+function Get-RtspPort($base, $cred) {
+  $f = Join-Path $here "camread.rtsp"; if (Test-Path $f) { $p = (Get-Content $f -Raw).Trim(); if ($p -match '^\d+$') { return [int]$p } }
+  $port = 554
+  try {
+    $x = [xml]([Text.Encoding]::UTF8.GetString((RecGet $base "/ISAPI/Security/adminAccesses" $cred 15).bytes))
+    foreach ($n in $x.SelectNodes("//*[local-name()='AdminAccessProtocol']")) { if ([string]$n.SelectSingleNode("*[local-name()='protocol']").InnerText -match 'RTSP') { $port = [int]$n.SelectSingleNode("*[local-name()='portNo']").InnerText } }
+  } catch {}
+  Set-Content -Path $f -Value $port
+  return $port
+}
+function Get-ClipRtsp($ff, $base, $ch, $date, $sec, [int]$before, [int]$after, $cred, $outFile) {
+  $t = [datetime]::ParseExact($date + " " + $sec, "yyyy-MM-dd HH:mm:ss", $null)
+  $a = $t.AddSeconds(-$before); $b = $t.AddSeconds($after); $len = $before + $after
+  $hostOnly = (($base -replace '^https?://', '') -split ':')[0]; $port = Get-RtspPort $base $cred
+  $nc = $cred.GetNetworkCredential(); $auth = [Uri]::EscapeDataString($nc.UserName) + ":" + [Uri]::EscapeDataString($nc.Password) + "@"
+  $last = ""
+  foreach ($track in @(([int]$ch * 100 + 2), ([int]$ch * 100 + 1))) {
+    $raw = $outFile + ".raw.mp4"; Remove-Item $raw, $outFile -Force -ErrorAction SilentlyContinue
+    $url = "rtsp://" + $auth + $hostOnly + ":" + $port + "/Streaming/tracks/" + $track + "?starttime=" + $a.ToString("yyyyMMddTHHmmss") + "Z&endtime=" + $b.ToString("yyyyMMddTHHmmss") + "Z"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $pi = New-Object Diagnostics.ProcessStartInfo; $pi.FileName = $ff; $pi.UseShellExecute = $false; $pi.CreateNoWindow = $true; $pi.RedirectStandardError = $true
+    $pi.Arguments = '-hide_banner -loglevel error -rtsp_transport tcp -timeout 15000000 -i "' + $url + '" -t ' + $len + ' -an -c:v copy -movflags +faststart -y "' + $raw + '"'
+    $pr = [Diagnostics.Process]::Start($pi); $errTask = $pr.StandardError.ReadToEndAsync()
+    if (-not $pr.WaitForExit(($len + 60) * 1000)) { try { $pr.Kill() } catch {} }
+    $nc = $null; $pi.Arguments = ""
+    $err = ""; try { $err = [string]$errTask.Result } catch {}
+    if ((Test-Path $raw) -and (Get-Item $raw).Length -gt 20000) {
+      # iPhones play H.265 only when it's tagged hvc1, so check the codec and re-wrap when needed (no re-encoding).
+      $info = (& $ff -hide_banner -i $raw 2>&1 | Out-String)
+      if ($info -match 'Video: hevc') { & $ff -hide_banner -loglevel error -i $raw -c copy -tag:v hvc1 -movflags +faststart -y $outFile 2>&1 | Out-Null } else { Move-Item $raw $outFile -Force }
+      Remove-Item $raw -Force -ErrorAction SilentlyContinue
+      if ((Test-Path $outFile) -and (Get-Item $outFile).Length -gt 20000) { return @{ ok = $true; fmt = "mp4"; track = $track; mb = [Math]::Round((Get-Item $outFile).Length / 1MB, 1); secs = [Math]::Round($sw.Elapsed.TotalSeconds) } }
+    }
+    $e2 = (($err -replace '[\r\n]+', ' ') -replace 'rtsp://[^ ]*', 'rtsp://...').Trim()
+    $last = "FFmpeg got no video (track $track, RTSP port $port)" + $(if ($e2) { ": " + $e2.Substring(0, [Math]::Min(120, $e2.Length)) } else { "" })
+    Remove-Item $raw -Force -ErrorAction SilentlyContinue
+  }
+  return @{ ok = $false; err = $last }
+}
 # One clip: find the recording that covers the moment, then download just those seconds (sub-stream first, it's smaller).
 function Get-Clip($base, $hostPort, $ch, $date, $sec, [int]$before, [int]$after, $cred, $outFile) {
+  if ($script:FF) { $rr = Get-ClipRtsp $script:FF $base $ch $date $sec $before $after $cred $outFile; if ($rr.ok) { return $rr }; return $rr }
   $t = [datetime]::ParseExact($date + " " + $sec, "yyyy-MM-dd HH:mm:ss", $null)
   $a = $t.AddSeconds(-$before); $b = $t.AddSeconds($after)
   $last = ""
@@ -260,6 +324,7 @@ function Get-Clip($base, $hostPort, $ch, $date, $sec, [int]$before, [int]$after,
   return @{ ok = $false; err = $(if ($last) { $last } else { "No recording found for that moment" }) }
 }
 function Run-ClipJobs($jobs, $base, $hostPort, $cred) {
+  $script:FF = Get-FFmpeg
   $done = 0; $clock = [Diagnostics.Stopwatch]::StartNew(); $n = 0
   foreach ($j in @($jobs.items)) {
     if ($n -ge 2 -or $clock.Elapsed.TotalMinutes -gt 4) { break }; $n++
