@@ -1,7 +1,9 @@
 # Store HQ scratch-off counts
 # StoreHQ-sscsread
 # Reads the latest lottery shift counts (scratch-off tickets sold and sales $) from the SSCS website and sends them to
-# Store HQ, so no browser is needed. Read-only on SSCS: it only reads the Lottery Counts report. Runs quietly every hour.
+# Store HQ, so no browser is needed. Runs quietly every hour. Since v2 it also reads two Daily Book reports:
+# item sales for Sales Movers (Mondays) and last month's department gross profit for the P&L (early each month).
+# Read-only on SSCS: it only opens reports.
 #
 # First time, on the store PC (in the same folder as vsupload.ps1 and token.txt):
 #   double-click "Setup scratch-offs.bat"
@@ -15,7 +17,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 1
+$ScriptVersion = 2
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -101,7 +103,81 @@ function Pull-Counts($token, $user) {
   return @{ n = $out.Count; placed = @($res.placed); counts = $out }
 }
 
-function Register-SscsTask {
+# Daily Book reports (CDB.REPORTING): same login, report requests are POSTs with a JSON body.
+function Cdb-Post($token, $user, [string]$path, $obj) {
+  $req = [Net.HttpWebRequest]::Create("$Sscs/CDB.REPORTING/api/$path"); $req.Method = "POST"; $req.ContentType = "application/json"; $req.Accept = "application/json"; $req.Timeout = 180000
+  $req.Headers.Add("Authorization", "Bearer " + $token); $req.Headers.Add("sscs-user", $user); $req.Headers.Add("sscs-sites", $SiteFull)
+  $bb = [Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 5 -Compress)); $req.ContentLength = $bb.Length
+  $st = $req.GetRequestStream(); $st.Write($bb, 0, $bb.Length); $st.Close()
+  $resp = $req.GetResponse(); try { $sr = New-Object IO.StreamReader($resp.GetResponseStream()); $txt = $sr.ReadToEnd() } finally { $resp.Close() }
+  # Big reports: Windows PowerShell's ConvertFrom-Json stops at about 2 MB, so use the .NET reader with no size limit.
+  Add-Type -AssemblyName System.Web.Extensions
+  $ser = New-Object Web.Script.Serialization.JavaScriptSerializer; $ser.MaxJsonLength = [int]::MaxValue; $ser.RecursionLimit = 200
+  $j = $ser.DeserializeObject($txt); $txt = $null
+  if ($j -is [Collections.IDictionary] -and $j.ContainsKey("error")) { throw ("SSCS: " + [string]$j["error"]) }
+  return $j
+}
+function Cdb-Body([string]$from, [string]$to) {
+  $n = [int]$Site
+  return [ordered]@{ sites = $SiteFull; serialSites = @([ordered]@{ serial = [int]$Serial; site = $n; siteNumber = [string]$n }); from = $from + "T00:00:00"; to = $to + "T00:00:00"; departmentId = $null; subDepartmentId = $null; totalsOnly = $true; groupBySite = $true }
+}
+function Send-Pc($obj) { return Invoke-RestMethod -Method Post -Uri "$Url/api/pc-sscs?store=$Store" -Headers $H -ContentType "application/json" -Body ([Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 6 -Compress))) -TimeoutSec 120 }
+function Item-Map($j) {
+  $m = @{}
+  foreach ($d in @($j.details)) { foreach ($x in @($d.itemDetailTotals)) {
+    $id = [string]$x.id; if ($id -notmatch '^\d+$') { continue }
+    if (-not $m.ContainsKey($id)) { $dep = ""; if ([string]$x.department -match '\((\d+)\)\s*$') { $dep = $Matches[1] }; $m[$id] = @{ q = 0.0; dep = $dep; desc = ([string]$x.description).Trim() } }
+    $m[$id].q += [double]$x.qtySold
+  } }
+  return $m
+}
+function Marker($name) { $f = Join-Path $here ("sscsread." + $name); if (Test-Path $f) { return (Get-Content $f -Raw).Trim() }; return "" }
+function Set-Marker($name, $v) { Set-Content -Path (Join-Path $here ("sscsread." + $name)) -Value $v }
+
+# Once: can this login open the Daily Book reports? (Store HQ shows the answer; nothing else depends on it.)
+function Test-Cdb($token, $user) {
+  if ((Marker "cdbtest") -eq "ok") { return $true }
+  $y = (Get-Date).AddDays(-1).ToString("yyyy-MM-dd")
+  try { $g = Cdb-Post $token $user "dailybook/deptgrossprofit" (Cdb-Body $y $y); $n = @($g.details).Count; Send-Pc @{ kind = "test"; ok = $true; err = "" } | Out-Null; Set-Marker "cdbtest" "ok"; Log ("Daily Book reports open fine (" + $n + " rows)."); return $true }
+  catch { $m = $_.Exception.Message; Log ("Daily Book reports: " + $m); try { Send-Pc @{ kind = "test"; ok = $false; err = $m.Substring(0, [Math]::Min(200, $m.Length)) } | Out-Null } catch {}; Set-Marker "cdbtest" ("failed " + (Get-Date -Format s)); return $false }
+}
+# Mondays (or the first run after): items sold in the 14 days ending Sunday vs the 14 days before, for Sales Movers.
+function Pull-Movers($token, $user) {
+  $today = (Get-Date).Date; $back = ([int]$today.DayOfWeek + 6) % 7; $monday = $today.AddDays(-$back)
+  if ($back -eq 0 -and (Get-Date).Hour -lt 4) { $monday = $monday.AddDays(-7) }
+  $end = $monday.AddDays(-1); $tag = $end.ToString("yyyy-MM-dd")
+  if ((Marker "movers") -eq $tag) { return }
+  $cf = $end.AddDays(-13); $pt = $cf.AddDays(-1); $pf = $pt.AddDays(-13)
+  $A = Item-Map (Cdb-Post $token $user "dailybook/itemsalestotalsbyday" (Cdb-Body $cf.ToString("yyyy-MM-dd") $end.ToString("yyyy-MM-dd")))
+  $B = Item-Map (Cdb-Post $token $user "dailybook/itemsalestotalsbyday" (Cdb-Body $pf.ToString("yyyy-MM-dd") $pt.ToString("yyyy-MM-dd")))
+  $rows = New-Object System.Collections.ArrayList
+  foreach ($id in (@($A.Keys) + @($B.Keys) | Select-Object -Unique)) { $o = if ($A.ContainsKey($id)) { $A[$id] } else { $B[$id] }; $qa = if ($A.ContainsKey($id)) { [Math]::Round($A[$id].q) } else { 0 }; $qb = if ($B.ContainsKey($id)) { [Math]::Round($B[$id].q) } else { 0 }; [void]$rows.Add(@($id, $o.dep, $qa, $qb, $o.desc)) }
+  $depts = @{}; try { foreach ($d in @(Sscs-Get $token $user "/CDB.REPORTING/api/lookups/departments/$Serial")) { $depts[[string]$d.categoryID] = ([string]$d.desc).Trim() } } catch {}
+  $lab = { param($d) $d.ToString("MMM d", [Globalization.CultureInfo]::InvariantCulture) }
+  $r = Send-Pc @{ kind = "movers"; cur = (& $lab $cf) + " - " + (& $lab $end); prev = (& $lab $pf) + " - " + (& $lab $pt); depts = $depts; rows = @($rows) }
+  Set-Marker "movers" $tag; Log ("Sales Movers sent: " + $rows.Count + " items (" + (& $lab $cf) + " - " + (& $lab $end) + ").")
+}
+# From the 1st of each month (after 4 AM): last month's department sales and cost, plus items selling at a loss or with no cost.
+function Pull-Pnl($token, $user) {
+  $now = Get-Date; if ($now.Day -eq 1 -and $now.Hour -lt 4) { return }
+  $first = (Get-Date -Year $now.Year -Month $now.Month -Day 1).Date.AddMonths(-1); $last = $first.AddMonths(1).AddDays(-1); $tag = $first.ToString("yyyy-MM")
+  if ((Marker "pnl") -eq $tag) { return }
+  $b = Cdb-Body $first.ToString("yyyy-MM-dd") $last.ToString("yyyy-MM-dd")
+  $g = Cdb-Post $token $user "dailybook/deptgrossprofit" $b
+  $depts = @(); foreach ($x in @($g.details)) { if ($x.isTotalsRow -or (-not $x.periodSales -and -not $x.periodCost)) { continue }; $depts += ,@([int]$x.departmentId, ([string]$x.name).Trim(), [Math]::Round([double]$x.periodSales, 2), [Math]::Round([double]$x.periodCost, 2)) }
+  $it = Cdb-Post $token $user "dailybook/itemsalestotalsbyday" $b
+  $items = New-Object System.Collections.ArrayList
+  foreach ($d in @($it.details)) { foreach ($x in @($d.itemDetailTotals)) {
+    if ([string]$x.id -notmatch '^\d+$' -or [double]$x.sales -le 0) { continue }
+    $dep = 0; if ([string]$x.department -match '\((\d+)\)\s*$') { $dep = [int]$Matches[1] }; if (@(27, 34, 79) -contains $dep) { continue }
+    if ([double]$x.grossProfit -lt 0 -or [double]$x.marginPercentage -ge 99.5) { [void]$items.Add(@([string]$x.id, ([string]$x.description).Trim(), [Math]::Round([double]$x.sales, 2), [Math]::Round([double]$x.grossProfit, 2), $(if ([double]$x.grossProfit -lt 0) { "loss" } else { "no cost" }))) }
+  } }
+  $top = @($items | Sort-Object { - [double]$_[2] } | Select-Object -First 15)
+  $r = Send-Pc @{ kind = "pnl"; month = $tag; depts = $depts; items = $top; itemCount = $items.Count }
+  Set-Marker "pnl" $tag; Log ("P&L " + $tag + " sent: " + $depts.Count + " departments" + $(if ($r.saved) { ", saved" } else { " (" + $r.why + ")" }))
+}
+
+function Register-SscsTask {function Register-SscsTask {
   $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
   $ws = Join-Path $env:WINDIR "System32\wscript.exe"
   $cmd = '"' + $ps + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Site ' + $Site + ' -Poll'
@@ -177,6 +253,11 @@ for ($try = 1; $try -le 2; $try++) {
     try { Invoke-RestMethod -Method Post -Uri "$Url/api/sscs-import?store=$Store" -Headers $H -ContentType "application/json" -Body (@{ counts = @(); pcErr = $m.Substring(0, [Math]::Min(200, $m.Length)); v = $ScriptVersion } | ConvertTo-Json -Compress) -TimeoutSec 30 | Out-Null } catch {}
     break
   }
+}
+# Daily Book reports (each step on its own, so one failing doesn't stop the others).
+if ($r.ok -and (Test-Cdb $r.token $user)) {
+  try { Pull-Movers $r.token $user } catch { Log ("Sales Movers failed: " + $_.Exception.Message) }
+  try { Pull-Pnl $r.token $user } catch { Log ("P&L failed: " + $_.Exception.Message) }
 }
 Update-Self
 exit 0

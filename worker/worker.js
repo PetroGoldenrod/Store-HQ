@@ -940,6 +940,36 @@ async function ownerApi(req, env, path, url) {
     else await env.DB.prepare("INSERT INTO drops (close_id, amounts) VALUES (?, ?) ON CONFLICT(close_id) DO UPDATE SET amounts = excluded.amounts").bind(b.closeId, JSON.stringify(amounts)).run();
     return json({ ok: true });
   }
+  if (path === "/api/pc-sscs" && req.method === "POST") {
+    // The store PC's SSCS reader (sscsread v2+) sends report data it read with its own SSCS login, so no browser is needed:
+    //  {kind:"test", ok, err}  whether its login can open the Daily Book reports
+    //  {kind:"movers", cur, prev, source, depts, rows}  the 14-day vs 14-day item sales for Sales Movers
+    //  {kind:"pnl", month, depts:[[id,name,sales,cost]], items, itemCount}  last month's department gross profit for the P&L
+    const b = await readBody(req, 3e6), kind = String(b.kind || "");
+    const st = await kvJson(env, S, "sscsread", {});
+    if (kind === "test") { st.cdb = { ok: !!b.ok, err: String(b.err || "").slice(0, 200), at: Date.now() }; await kvPutJson(env, S, "sscsread", st); return json({ ok: true }); }
+    if (kind === "movers") {
+      if (!Array.isArray(b.rows) || !b.rows.length || b.rows.length > 20000) return json({ error: "rows" }, 400);
+      const str = (v, n) => String(v == null ? "" : v).slice(0, n), u = v => { const n = Math.round(Number(v)); return isFinite(n) ? Math.max(-99999, Math.min(999999, n)) : 0; };
+      const rows = b.rows.filter(x => Array.isArray(x) && /^[0-9]{1,20}$/.test(String(x[0]))).map(x => [String(x[0]), str(x[1], 6), u(x[2]), u(x[3]), str(x[4], 60).trim()]);
+      const depts = {}; if (b.depts && typeof b.depts === "object") for (const k of Object.keys(b.depts).slice(0, 500)) if (/^[0-9]{1,6}$/.test(k)) depts[k] = str(b.depts[k], 40).trim();
+      await kvPutJson(env, S, "movers", { cur: str(b.cur, 40), prev: str(b.prev, 40), source: "SSCS item sales (store PC)", depts, rows });
+      st.movers = { at: Date.now(), cur: str(b.cur, 40), rows: rows.length }; await kvPutJson(env, S, "sscsread", st);
+      return json({ ok: true, rows: rows.length });
+    }
+    if (kind === "pnl") {
+      const m = String(b.month || ""); if (!/^\d{4}-\d{2}$/.test(m) || !Array.isArray(b.depts)) return json({ error: "bad" }, 400);
+      const depts = b.depts.slice(0, 400).filter(x => Array.isArray(x)).map(x => [Number(x[0]) || 0, String(x[1] || "").slice(0, 40), r2(Number(x[2]) || 0), r2(Number(x[3]) || 0)]);
+      const items = (Array.isArray(b.items) ? b.items : []).slice(0, 15).map(x => [String(x[0]).slice(0, 20), String(x[1] || "").slice(0, 60), r2(Number(x[2]) || 0), r2(Number(x[3]) || 0), String(x[4] || "").slice(0, 10)]);
+      await kvPutJson(env, S, "sscspnl:" + m, { at: Date.now(), depts, items, itemCount: Number(b.itemCount) || 0 });
+      const res = await pnlFromSscs(env, S, m);
+      // Other stores' cost is estimated from the main store's department cost %, so redo them once the main store's month arrives.
+      if (S === DEF_STORE) { try { for (const r of ((await env.DB.prepare("SELECT store FROM store_kv WHERE k = ? AND store != ?").bind("sscspnl:" + m, S).all()).results || [])) await pnlFromSscs(env, r.store, m); } catch {} }
+      st.pnl = { at: Date.now(), month: m, saved: !!res.saved, why: res.why || "" }; await kvPutJson(env, S, "sscsread", st);
+      return json(Object.assign({ ok: true }, res));
+    }
+    return json({ error: "kind" }, 400);
+  }
   if (path === "/api/sscs-import" && req.method === "POST") {
     const b = await readBody(req, 5e5);
     const list = Array.isArray(b.counts) ? b.counts.slice(0, 500) : [];
@@ -2002,7 +2032,36 @@ async function moversWeekly(env) {
   if (done.last === today) return;
   await kvPutJson(env, "*", "moversauto", { last: today });
   const stores = new Set([DEF_STORE]); try { ((await env.DB.prepare("SELECT store FROM inv_store").all()).results || []).forEach(r => stores.add(r.store)); } catch {}
-  for (const S of stores) { try { await moversFromRegisters(env, S, today); } catch (e) { console.error("movers", S, e && e.message); } }
+  // A store whose PC already sent this week's SSCS item sales (complete, by item number) keeps that one.
+  for (const S of stores) { try { const sr = await kvJson(env, S, "sscsread", {}); if (sr.movers && Date.now() - sr.movers.at < 3 * 864e5) continue; await moversFromRegisters(env, S, today); } catch (e) { console.error("movers", S, e && e.message); } }
+}
+// Last month's merchandise sales and cost for the P&L, from the SSCS department gross profit the store PC read.
+// Lottery (online 27, scratch-offs 34) is left out. Stores other than the main one have incomplete invoices in Sunray, so their
+// cost is estimated with the main store's cost % for the same department (their own % where that's missing or odd).
+// Never overwrites numbers the owner typed in (source not "pulled from ...").
+async function pnlFromSscs(env, S, m) {
+  const mine = await kvJson(env, S, "sscspnl:" + m, null); if (!mine) return { why: "no data" };
+  const LOT = [27, 34]; let sales = 0, own = 0, est = 0;
+  const main = S === DEF_STORE ? null : await kvJson(env, DEF_STORE, "sscspnl:" + m, null);
+  const G = {}; if (main) for (const d of main.depts) G[d[0]] = d;
+  for (const d of mine.depts) {
+    if (LOT.includes(d[0]) || !d[2]) continue;
+    sales += d[2]; own += d[3];
+    if (S === DEF_STORE) { est += d[3]; continue; }
+    const g = G[d[0]], r = g && g[2] > 0 ? g[3] / g[2] : null;
+    est += d[2] * (r !== null && r > 0.05 && r <= 1 ? r : d[3] / d[2]);
+  }
+  const cur = await env.DB.prepare("SELECT data FROM pnl WHERE store = ? AND kind = 'gross' AND id = ?").bind(S, m).first();
+  const old = cur ? JSON.parse(cur.data) : null;
+  if (old && !/^pulled from/i.test(old.source || "")) return { why: "kept the numbers you typed in", sales: r2(sales), cost: r2(est) };
+  const source = S === DEF_STORE ? "pulled from SSCS by the store PC" : main ? "pulled from SSCS by the store PC (cost estimated from Goldenrod's department cost %)" : "pulled from SSCS by the store PC (own cost; Goldenrod's month not in yet)";
+  const now = Date.now();
+  await env.DB.prepare("INSERT INTO pnl (store, kind, id, month, data, updated) VALUES (?, 'gross', ?, ?, ?, ?) ON CONFLICT(store, kind, id) DO UPDATE SET data = excluded.data, updated = excluded.updated")
+    .bind(S, m, m, JSON.stringify({ sales: r2(sales), cost: r2(est), food: old ? old.food || 0 : 0, fuel: old ? old.fuel || 0 : 0, updated: new Date(now).toISOString(), source }), now).run();
+  const ck = await env.DB.prepare("SELECT data FROM pnl WHERE store = ? AND kind = 'check' AND id = ?").bind(S, m).first();
+  const done = Object.assign(ck ? JSON.parse(ck.data) : {}, { sgp: true, ie: true, item: true });
+  await env.DB.prepare("INSERT INTO pnl (store, kind, id, month, data, updated) VALUES (?, 'check', ?, ?, ?, ?) ON CONFLICT(store, kind, id) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, m, m, JSON.stringify(done), now).run();
+  return { saved: true, sales: r2(sales), cost: r2(est), ownCost: r2(own) };
 }
 const TANK_EVERY_MIN = 120; // scheduled tank readings: every 2 hours (the store PC follows this number)
 async function promoList(env, S) { const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'promos'").bind(S).first(); try { return r ? JSON.parse(r.data) : []; } catch { return []; } }
@@ -2694,7 +2753,7 @@ export default {
       if (pStore) { owner = true; req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.set("x-store", pStore); h.set("x-partner", pStore); if (mgr) h.set("x-role", "manager"); else h.delete("x-role"); return h; })() }); url.searchParams.set("store", pStore); }
       else if (req.headers.get("x-role")) { req = new Request(req, { headers: (() => { const h = new Headers(req.headers); h.delete("x-role"); return h; })() }); }
       // Nightly pulls: may call ONLY /api/sscs-import and /api/voids-import, with the secret in the x-import-token header.
-      const importOk = (path === "/api/sscs-import" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/pc-tankreq" || path === "/api/pc-camreq" || path === "/api/cam-upload" || path === "/api/pc-clipjobs" || path === "/api/clip-upload" || path === "/api/reg-plu" || path === "/api/pc-regsend" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script" || path === "/api/pc-regsend" || path === "/api/pc-tankreq" || path === "/api/pc-camreq" || path === "/api/pc-clipjobs") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
+      const importOk = (path === "/api/sscs-import" || path === "/api/pc-sscs" || path === "/api/voids-import" || path === "/api/vfcash-import" || path === "/api/vs-upload" || path === "/api/vs-log" || path === "/api/pc-status" || path === "/api/tank-read" || path === "/api/pc-tankreq" || path === "/api/pc-camreq" || path === "/api/cam-upload" || path === "/api/pc-clipjobs" || path === "/api/clip-upload" || path === "/api/reg-plu" || path === "/api/pc-regsend" || path === "/api/pc-script" || path === "/api/inv/outbox" || path === "/api/inv/sent") && (req.method === "POST" || path === "/api/inv/outbox" || path === "/api/pc-script" || path === "/api/pc-regsend" || path === "/api/pc-tankreq" || path === "/api/pc-camreq" || path === "/api/pc-clipjobs") && !!env.SSCS_TOKEN && !!req.headers.get("x-import-token") &&
         safeEqual(await hmac("cmp", req.headers.get("x-import-token")), await hmac("cmp", env.SSCS_TOKEN));
       m = /^\/photo\/([a-z0-9]+)$/.exec(path);
       if (m) {
