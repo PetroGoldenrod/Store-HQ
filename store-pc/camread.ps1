@@ -16,7 +16,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 9
+$ScriptVersion = 10
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -50,7 +50,9 @@ $ReqId = ""; $Jobs = $null
 if ($Poll) {
   try { $q = Invoke-RestMethod -Uri "$Url/api/pc-camreq?store=$Store&v=$ScriptVersion" -Headers $H -TimeoutSec 30; if ($q.snap) { $ReqId = [string]$q.snap } } catch {}
   try { $Jobs = Invoke-RestMethod -Uri "$Url/api/pc-clipjobs?store=$Store&v=$ScriptVersion" -Headers $H -TimeoutSec 30 } catch {}
-  if (-not $ReqId -and -not ($Jobs -and $Jobs.items -and @($Jobs.items).Count)) { exit 0 }
+  # Nothing to do: stop here, unless the 3-hour update check is due (it runs further down).
+  $updStamp = Join-Path $here "camread.updcheck"; $updDue = -not (Test-Path $updStamp) -or ((Get-Date) - (Get-Item $updStamp).LastWriteTime).TotalHours -ge 3
+  if (-not $ReqId -and -not ($Jobs -and $Jobs.items -and @($Jobs.items).Count) -and -not $updDue) { exit 0 }
 }
 
 function Get-Cred {
