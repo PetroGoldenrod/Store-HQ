@@ -1993,6 +1993,7 @@ function pluOf(upc) {
 // Sales Movers from the registers' own item tallies (sent by the store PC every night): units in the last 14 days
 // (ending yesterday) vs the 14 before. A period with a missing day or two is scaled up to 14 days so the two stay comparable.
 // Only saved when each period has at least 10 days; otherwise the last snapshot stays.
+const NON_ITEM_DEPTS = new Set(["27", "34", "51", "82", "88", "9998", "9999"]);
 async function moversFromRegisters(env, S, today) {
   const end = addDays(today, -1), cf = addDays(end, -13), pt = addDays(cf, -1), pf = addDays(pt, -13);
   const rows = (await env.DB.prepare("SELECT k, data FROM store_kv WHERE store = ? AND k BETWEEN ? AND ?").bind(S, "items:" + pf, "items:" + end).all()).results || [];
@@ -2004,6 +2005,9 @@ async function moversFromRegisters(env, S, today) {
   for (const r of rows) {
     const cur = r.k.slice(6) >= cf; let d = {}; try { d = JSON.parse(r.data) || {}; } catch {}
     for (const [desc, v] of Object.entries(d)) {
+      // Fuel (gallons by pump), prepay, lottery, network fees and other no-item lines aren't items: leave them out entirely.
+      const dep = String(v[2] || "");
+      if (NON_ITEM_DEPTS.has(dep) || /^(80\d\d|99\d\d)$/.test(dep) || /\b(CR|CA) #\d+$|^PREPAY\b/i.test(desc)) continue;
       units += Number(v[0]) || 0;
       const plu = (v[3] && String(v[3])) || byName.get(desc.toUpperCase().replace(/\s+/g, " ").trim());
       if (!plu || !/^[0-9]{1,20}$/.test(plu)) { unmatched += Number(v[0]) || 0; continue; }
