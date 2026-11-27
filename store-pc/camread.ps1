@@ -16,7 +16,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 10
+$ScriptVersion = 11
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -281,7 +281,8 @@ function Get-ClipRtsp($ff, $base, $ch, $date, $sec, [int]$before, [int]$after, $
   $hostOnly = (($base -replace '^https?://', '') -split ':')[0]; $port = Get-RtspPort $base $cred
   $nc = $cred.GetNetworkCredential(); $auth = [Uri]::EscapeDataString($nc.UserName) + ":" + [Uri]::EscapeDataString($nc.Password) + "@"
   $last = ""
-  foreach ($track in @(([int]$ch * 100 + 2), ([int]$ch * 100 + 1))) {
+  # Main stream first (full resolution, so the owner can zoom in on one register); the small sub-stream if that fails or is too big to upload.
+  foreach ($track in @(([int]$ch * 100 + 1), ([int]$ch * 100 + 2))) {
     $raw = $outFile + ".raw.mp4"; Remove-Item $raw, $outFile -Force -ErrorAction SilentlyContinue
     $url = "rtsp://" + $auth + $hostOnly + ":" + $port + "/Streaming/tracks/" + $track + "?starttime=" + $a.ToString("yyyyMMddTHHmmss") + "Z&endtime=" + $b.ToString("yyyyMMddTHHmmss") + "Z"
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -298,7 +299,7 @@ function Get-ClipRtsp($ff, $base, $ch, $date, $sec, [int]$before, [int]$after, $
       $rerr = ""
       if ($info -match 'Video: hevc') { $rerr = FF-Run $ff ('-hide_banner -loglevel error -i "' + $raw + '" -c copy -tag:v hvc1 -movflags +faststart -f mp4 -y "' + $outFile + '"') 60 } else { Move-Item $raw $outFile -Force }
       Remove-Item $raw -Force -ErrorAction SilentlyContinue
-      if ((Test-Path $outFile) -and (Get-Item $outFile).Length -gt 20000) { return @{ ok = $true; fmt = "mp4"; track = $track; mb = [Math]::Round((Get-Item $outFile).Length / 1MB, 1); secs = [Math]::Round($sw.Elapsed.TotalSeconds) } }
+      if ((Test-Path $outFile) -and (Get-Item $outFile).Length -gt 20000 -and (Get-Item $outFile).Length -lt 22MB) { return @{ ok = $true; fmt = "mp4"; track = $track; mb = [Math]::Round((Get-Item $outFile).Length / 1MB, 1); secs = [Math]::Round($sw.Elapsed.TotalSeconds) } }
       if ($rerr) { $err = "re-wrap failed: " + $rerr }
     }
     $e2 = (($err -replace '[\r\n]+', ' ') -replace 'rtsp://[^ ]*', 'rtsp://...').Trim()
