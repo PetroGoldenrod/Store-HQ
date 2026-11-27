@@ -371,7 +371,7 @@ async function lotPairCheck(env, S, id) {
   const d = lotFixYear(JSON.parse(row.data), row.date), pd = d.online && d.online.printDate, tm = lotKey("time", d.online && d.online.time);
   if (!pd || !tm) return null;
   const sibs = ((await env.DB.prepare("SELECT id, date, data, photos FROM closes WHERE store = ? AND kind = 'lottery' AND id != ? AND date BETWEEN ? AND ?").bind(S, id, addDays(row.date, -1), addDays(row.date, 1)).all()).results || [])
-    .filter(r => { try { const o = lotFixYear(JSON.parse(r.data), r.date).online || {}; return o.printDate === pd && lotKey("time", o.time) === tm; } catch { return false; } });
+    .filter(r => { try { const o = lotFixYear(JSON.parse(r.data), r.date).online || {}; return o.printDate === pd && lotKey("time", o.time) === tm && (o.forDate || "") === (d.online.forDate || ""); } catch { return false; } });
   if (!sibs.length) return { pair: false };
   const sib = sibs[0], sd = lotFixYear(JSON.parse(sib.data), sib.date), diff = lotDiff(d, sd);
   if (!diff.length) return { pair: true, same: true };
