@@ -303,10 +303,22 @@ function lotKey(k, v) {
   if (k === "printDate") return String(v || "");
   const n = num(v); return n === null ? (LOT_ZERO.has(k) ? "0.00" : "") : Math.abs(n).toFixed(2);
 }
+// The year is printed as two small digits and is sometimes read a year off (2025 for 2026): use the shift's year when the day matches.
+function lotFixYear(d, date) {
+  for (const part of ["online", "scratch"]) for (const k of ["printDate", "forDate"]) {
+    const x = d && d[part] && d[part][k]; if (!validDate(x) || x.slice(0, 4) === date.slice(0, 4)) continue;
+    for (const y of [date.slice(0, 4), String(+date.slice(0, 4) - 1), String(+date.slice(0, 4) + 1)]) { const t = y + x.slice(4); if (validDate(t) && Math.abs(Date.parse(t) - Date.parse(date)) <= 3 * 86400e3) { d[part][k] = t; break; } }
+  }
+  return d;
+}
 function lotFieldName(f) { const [part, k] = f.split("."); return (part === "online" ? "online " : "scratch-off ") + (LOT_NAMES[k] || k); }
 function lotDiff(a, b) {
   const out = [];
-  for (const part of ["online", "scratch"]) for (const k of LOT_FIELDS[part]) if (lotKey(k, ((a || {})[part] || {})[k]) !== lotKey(k, ((b || {})[part] || {})[k])) out.push(part + "." + k);
+  for (const part of ["online", "scratch"]) for (const k of LOT_FIELDS[part]) {
+    const x = ((a || {})[part] || {})[k], y = ((b || {})[part] || {})[k];
+    if (x === undefined || y === undefined) continue; // older readings didn't have every line
+    if (lotKey(k, x) !== lotKey(k, y)) out.push(part + "." + k);
+  }
   return out;
 }
 // Per-line majority over several readings of the same printout. A line is settled when at least two readings agree and no other value has as many.
@@ -314,8 +326,9 @@ function lotVote(list) {
   const out = JSON.parse(JSON.stringify(list[0])), unsure = [];
   for (const part of ["online", "scratch"]) for (const k of LOT_FIELDS[part]) {
     const c = new Map();
-    list.forEach(d => { const v = ((d || {})[part] || {})[k], key = lotKey(k, v); if (!c.has(key)) c.set(key, { n: 0, v }); c.get(key).n++; });
+    list.forEach(d => { const v = ((d || {})[part] || {})[k], key = lotKey(k, v); if (v === undefined) return; if (!c.has(key)) c.set(key, { n: 0, v }); c.get(key).n++; });
     const top = [...c.values()].sort((x, y) => y.n - x.n);
+    if (!top.length) continue;
     if (top[0].n >= 2 && !(top[1] && top[1].n === top[0].n)) out[part][k] = top[0].v; else unsure.push(part + "." + k);
   }
   return { data: out, unsure };
@@ -355,12 +368,12 @@ async function readLottery(env, images) {
 async function lotPairCheck(env, S, id) {
   const row = await env.DB.prepare("SELECT id, date, data, photos FROM closes WHERE id = ? AND kind = 'lottery'").bind(id).first();
   if (!row) return null;
-  const d = JSON.parse(row.data), pd = d.online && d.online.printDate, tm = lotKey("time", d.online && d.online.time);
+  const d = lotFixYear(JSON.parse(row.data), row.date), pd = d.online && d.online.printDate, tm = lotKey("time", d.online && d.online.time);
   if (!pd || !tm) return null;
   const sibs = ((await env.DB.prepare("SELECT id, date, data, photos FROM closes WHERE store = ? AND kind = 'lottery' AND id != ? AND date BETWEEN ? AND ?").bind(S, id, addDays(row.date, -1), addDays(row.date, 1)).all()).results || [])
-    .filter(r => { try { const o = JSON.parse(r.data).online || {}; return o.printDate === pd && lotKey("time", o.time) === tm; } catch { return false; } });
+    .filter(r => { try { const o = lotFixYear(JSON.parse(r.data), r.date).online || {}; return o.printDate === pd && lotKey("time", o.time) === tm; } catch { return false; } });
   if (!sibs.length) return { pair: false };
-  const sib = sibs[0], sd = JSON.parse(sib.data), diff = lotDiff(d, sd);
+  const sib = sibs[0], sd = lotFixYear(JSON.parse(sib.data), sib.date), diff = lotDiff(d, sd);
   if (!diff.length) return { pair: true, same: true };
   const photo = async r => { const pid = (JSON.parse(r.photos || "[]"))[0]; const ph = pid && await env.DB.prepare("SELECT b64 FROM photos WHERE id = ?").bind(pid).first(); return ph && ph.b64; };
   const hint = "Another reading of this same printout disagreed on: " + diff.map(lotFieldName).join(", ") + ". Read those lines especially carefully, matching each label to the dollar amount on its own printed line.";
@@ -688,6 +701,7 @@ async function handleSubmit(req, env, token, ctx) {
       stage = ["start", "end", "prev"].includes(b.stage) ? b.stage : "end";
       if (b.lotShift && covers(b.shift).includes(Number(b.lotShift))) shift = String(b.lotShift);
       ({ data, problems } = await readLottery(env, images));
+      lotFixYear(data, b.date);
       problems = problems.map(w => "Lottery photo: " + w);
     } else return json({ ok: false, error: "Unknown report." }, 400);
   } catch (e) {
