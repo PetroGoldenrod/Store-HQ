@@ -2043,7 +2043,13 @@ async function costFromRegisters(env, S, month) {
   // Price book costs: the main store's (kept current from its invoices). Another store's own price book is only a fallback,
   // because its invoices aren't all entered in Sunray yet, so its costs may be old.
   const z = c => String(c || "").replace(/\D/g, "").replace(/^0+/, "");
-  const cost = new Map(), put = (u, c, d, src) => { if (!u || !(c > 0 && c < 500)) return; const o = cost.get(u); if (!o || d >= o.d) cost.set(u, { c, d, src }); };
+  // A newer cost replaces an older one, unless it's off by more than 3x from what that item cost before: that's usually a typo or a
+  // case/single mix-up on the invoice, so it's set aside (listed in "suspect") and the next good invoice fixes it.
+  const cost = new Map(), suspect = [], put = (u, c, d, src) => {
+    if (!u || !(c > 0 && c < 500)) return; const o = cost.get(u);
+    if (o && d >= o.d && src !== "pb" && (c > o.c * 3 || c < o.c / 3)) { suspect.push([u, Math.round(o.c * 100) / 100, Math.round(c * 100) / 100, d, src]); return; }
+    if (!o || d >= o.d) cost.set(u, { c, d, src });
+  };
   const loadPb = async (store, asFallback) => { try { const r = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("pb:" + store).first(); if (!r) return ""; const pb = JSON.parse(r.text); for (const it of pb.items || []) put(z(it[0]), Number(it[3]), asFallback ? "0000" : (pb.exported || "0001"), "pb"); return pb.exported || ""; } catch { return ""; } };
   if (S !== DEF_STORE) await loadPb(S, true);
   const pbDate = await loadPb(DEF_STORE, false);
@@ -2083,7 +2089,7 @@ async function costFromRegisters(env, S, month) {
   const r2_ = x => Math.round(x * 100) / 100;
   // Cost for sales without a known cost: use the cost % of the costed sales in the same department.
   let est = 0; for (const D of Object.values(deps)) { const unc = D.s - D.cs; if (unc > 0 && D.cs > 0) est += unc * (D.c / D.cs); }
-  const doc = { month, days: days.length, at: Date.now(), pbDate, invLines: inv, cmItems: cm, sales: r2_(sales), kkc: r2_(kkc), cogsKnown: r2_(cogs), cogsEst: r2_(cogs + est), coveredPct: sales ? Math.round(costed / sales * 1000) / 10 : 0,
+  const doc = { month, days: days.length, at: Date.now(), pbDate, invLines: inv, cmItems: cm, suspect: suspect.slice(-30), sales: r2_(sales), kkc: r2_(kkc), cogsKnown: r2_(cogs), cogsEst: r2_(cogs + est), coveredPct: sales ? Math.round(costed / sales * 1000) / 10 : 0,
     missing: [...missing.entries()].sort((a, b) => b[1][1] - a[1][1]).slice(0, 25).map(([k, v]) => [k, Math.round(v[0]), r2_(v[1])]) };
   await kvPutJson(env, S, "regcost:" + month, doc);
   return doc;
@@ -2272,7 +2278,7 @@ async function invSendReady(env) {
   const rows = (await env.DB.prepare("SELECT id, store, data, file_text, send_error, created FROM inv_job WHERE status = 'ready' AND created > ? ORDER BY created LIMIT 6").bind(now - 3 * 864e5).all()).results || [];
   if (!rows.length) return { sent: 0, failed: 0 };
   const stores = {}; ((await env.DB.prepare("SELECT store, data FROM inv_store").all()).results || []).forEach(r => (stores[r.store] = JSON.parse(r.data)));
-  let sent = 0, failed = 0;
+  let sent = 0, failed = 0; const sentStores = new Set();
   for (const j of rows) {
     const c = await env.DB.prepare("UPDATE inv_job SET status = 'sending', updated = ? WHERE id = ? AND status = 'ready'").bind(Date.now(), j.id).run();
     if (!c.meta || c.meta.changes !== 1) continue;
@@ -2285,11 +2291,14 @@ async function invSendReady(env) {
         fileName: d.fileName, fileText: j.file_text });
       await env.DB.prepare("UPDATE inv_job SET status = 'sent', sent_at = ?, send_error = NULL, updated = ? WHERE id = ?").bind(Date.now(), Date.now(), j.id).run();
       sent++;
+      sentStores.add(j.store);
     } catch (e) {
       await env.DB.prepare("UPDATE inv_job SET status = 'ready', send_error = ?, updated = ? WHERE id = ?").bind(String(e && e.message || e).slice(0, 300), Date.now(), j.id).run();
       failed++;
     }
   }
+  // New invoice costs count right away in this month's cost of goods (not just at the next morning's run).
+  for (const st of sentStores) { try { await costFromRegisters(env, st, nyToday().slice(0, 7)); } catch {} }
   return { sent, failed };
 }
 const SALES_EXTRA_SQL = "CREATE TABLE IF NOT EXISTS sales_extra (store TEXT NOT NULL, date TEXT NOT NULL, p REAL, v REAL, PRIMARY KEY (store, date))";
