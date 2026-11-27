@@ -2056,6 +2056,9 @@ async function costFromRegisters(env, S, month) {
       }
     }
   } catch {}
+  // Core-Mark (their invoices go straight to Sunray): per-unit costs saved weekly by the Core-Mark check, {upc: [unitCost, "YYYY-MM-DD"]}.
+  let cm = 0;
+  try { const cmc = await kvJson(env, S, "cmcost", {}); for (const [u, v] of Object.entries(cmc)) { const c = Number(v && v[0]); if (c > 0 && c < 500 && (!pbDate || String(v[1] || "") >= pbDate)) { cost.set(z(u), { c, src: "cm" }); cm++; } } } catch {}
   const byName = new Map();
   try { const rb = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("reg:" + S).first(); if (rb) for (const it of JSON.parse(rb.text).items || []) { const k = String(it[1] || "").toUpperCase().replace(/\s+/g, " ").trim(); if (k && k !== "UNKNOWN" && !byName.has(k)) byName.set(k, String(it[0])); } } catch {}
   const days = (await env.DB.prepare("SELECT k, data FROM store_kv WHERE store = ? AND k BETWEEN ? AND ?").bind(S, "items:" + month + "-01", "items:" + month + "-31").all()).results || [];
@@ -2076,7 +2079,7 @@ async function costFromRegisters(env, S, month) {
   const r2_ = x => Math.round(x * 100) / 100;
   // Cost for sales without a known cost: use the cost % of the costed sales in the same department.
   let est = 0; for (const D of Object.values(deps)) { const unc = D.s - D.cs; if (unc > 0 && D.cs > 0) est += unc * (D.c / D.cs); }
-  const doc = { month, days: days.length, at: Date.now(), pbDate, invLines: inv, sales: r2_(sales), kkc: r2_(kkc), cogsKnown: r2_(cogs), cogsEst: r2_(cogs + est), coveredPct: sales ? Math.round(costed / sales * 1000) / 10 : 0,
+  const doc = { month, days: days.length, at: Date.now(), pbDate, invLines: inv, cmItems: cm, sales: r2_(sales), kkc: r2_(kkc), cogsKnown: r2_(cogs), cogsEst: r2_(cogs + est), coveredPct: sales ? Math.round(costed / sales * 1000) / 10 : 0,
     missing: [...missing.entries()].sort((a, b) => b[1][1] - a[1][1]).slice(0, 25).map(([k, v]) => [k, Math.round(v[0]), r2_(v[1])]) };
   await kvPutJson(env, S, "regcost:" + month, doc);
   return doc;
