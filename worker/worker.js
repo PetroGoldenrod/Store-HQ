@@ -1596,6 +1596,11 @@ async function ownerApi(req, env, path, url) {
     const rows = (m.rows || []).map(x => { const it = look.get(x[0]), rg = reg.get(x[0]) || reg.get(String(x[0]).replace(/^0+/, "")); return [x[0], (rg && rg[1]) || x[4] || (it ? it[1] : x[0]), String(x[1]), x[2], x[3], (rg && rg[3]) || (it ? Number(it[4]) || 0 : 0)]; });
     return json({ cur: m.cur, prev: m.prev, source: m.source || "", depts: m.depts || null, updated: r.updated, rows });
   }
+  if (path === "/api/regcost" && req.method === "GET") {
+    if (MGR) return json({ error: "Owner only" }, 403);
+    const m = String(url.searchParams.get("month") || nyToday().slice(0, 7)); if (!/^\d{4}-\d{2}$/.test(m)) return json({ error: "month" }, 400);
+    return json(await costFromRegisters(env, S, m));
+  }
   if (path === "/api/movers/auto" && req.method === "POST") {
     if (MGR) return json({ error: "Owner only" }, 403);
     return json(await moversFromRegisters(env, S, nyToday()));
@@ -2027,6 +2032,64 @@ async function moversFromRegisters(env, S, today) {
   const doc = { cur: lab(cf) + " – " + lab(end), prev: lab(pf) + " – " + lab(pt), source: "Registers (store PC)" + gaps, depts, rows: out };
   await kvPutJson(env, S, "movers", doc);
   return { ok: true, rows: out.length, unmatched };
+}
+// Cost of goods from the registers, no SSCS needed: units sold (register item tallies) x each item's cost.
+// Each item's cost is the newest of: the Sunray price book cost (inv_blob pb:<store>) or the unit cost on an invoice sent through the
+// Invoice Desk after that export (case cost / units per case). Fuel, prepay, lottery, fees are left out; KKC (dept 79) counts as sales with
+// $0 cost here, like the SSCS numbers (chicken is food cost). Saved as store_kv <store> 'regcost:YYYY-MM' to compare with the SSCS pull.
+const RC_SKIP = new Set(["27", "34", "51", "82", "88", "9998", "9999"]);
+async function costFromRegisters(env, S, month) {
+  const z = c => String(c || "").replace(/\D/g, "").replace(/^0+/, "");
+  const cost = new Map(); let pbDate = "";
+  try { const r = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("pb:" + S).first(); if (r) { const pb = JSON.parse(r.text); pbDate = pb.exported || ""; for (const it of pb.items || []) { const c = Number(it[3]); if (c > 0 && c < 500) cost.set(z(it[0]), { c, src: "pb" }); } } } catch {}
+  let inv = 0;
+  try {
+    const rows = (await env.DB.prepare("SELECT created, file_text FROM inv_job WHERE store = ? AND status NOT LIKE '%del%' AND file_text IS NOT NULL ORDER BY created").bind(S).all()).results || [];
+    for (const r of rows) {
+      const lines = String(r.file_text).split(/\r?\n/), a = lines[0] || "";
+      const md = a.slice(17, 23), d = md.length === 6 ? "20" + md.slice(4, 6) + "-" + md.slice(0, 2) + "-" + md.slice(2, 4) : "";
+      if (pbDate && d && d < pbDate) continue;
+      for (const l of lines) {
+        if (l[0] !== "B") continue;
+        const upc = z(l.slice(1, 12)), cc = Number(l.slice(43, 49)) / 100, units = Number(l.slice(51, 57));
+        if (upc && cc > 0 && units > 0) { cost.set(upc, { c: cc / units, src: "inv" }); inv++; }
+      }
+    }
+  } catch {}
+  const byName = new Map();
+  try { const rb = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("reg:" + S).first(); if (rb) for (const it of JSON.parse(rb.text).items || []) { const k = String(it[1] || "").toUpperCase().replace(/\s+/g, " ").trim(); if (k && k !== "UNKNOWN" && !byName.has(k)) byName.set(k, String(it[0])); } } catch {}
+  const days = (await env.DB.prepare("SELECT k, data FROM store_kv WHERE store = ? AND k BETWEEN ? AND ?").bind(S, "items:" + month + "-01", "items:" + month + "-31").all()).results || [];
+  let sales = 0, costed = 0, cogs = 0, kkc = 0; const missing = new Map(), deps = {};
+  for (const r of days) {
+    let d = {}; try { d = JSON.parse(r.data) || {}; } catch {}
+    for (const [desc, v] of Object.entries(d)) {
+      const dep = String(v[2] || ""), q = Number(v[0]) || 0, amt = Number(v[1]) || 0;
+      if (RC_SKIP.has(dep) || /^(80\d\d|99\d\d)$/.test(dep) || /\b(CR|CA) #\d+$|^PREPAY\b/i.test(desc)) continue;
+      sales += amt; const D = (deps[dep] = deps[dep] || { s: 0, c: 0, cs: 0 }); D.s += amt;
+      if (dep === "79") { kkc += amt; costed += amt; D.cs += amt; continue; }
+      const plu = z((v[3] && String(v[3])) || byName.get(desc.toUpperCase().replace(/\s+/g, " ").trim()));
+      const it = plu ? cost.get(plu) : null;
+      if (it) { cogs += q * it.c; costed += amt; D.c += q * it.c; D.cs += amt; }
+      else { const m = missing.get(desc) || [0, 0]; m[0] += q; m[1] += amt; missing.set(desc, m); }
+    }
+  }
+  const r2_ = x => Math.round(x * 100) / 100;
+  // Cost for sales without a known cost: use the cost % of the costed sales in the same department.
+  let est = 0; for (const D of Object.values(deps)) { const unc = D.s - D.cs; if (unc > 0 && D.cs > 0) est += unc * (D.c / D.cs); }
+  const doc = { month, days: days.length, at: Date.now(), pbDate, invLines: inv, sales: r2_(sales), kkc: r2_(kkc), cogsKnown: r2_(cogs), cogsEst: r2_(cogs + est), coveredPct: sales ? Math.round(costed / sales * 1000) / 10 : 0,
+    missing: [...missing.entries()].sort((a, b) => b[1][1] - a[1][1]).slice(0, 25).map(([k, v]) => [k, Math.round(v[0]), r2_(v[1])]) };
+  await kvPutJson(env, S, "regcost:" + month, doc);
+  return doc;
+}
+// Once a day (after 5 AM New York): this month and last month, for each store.
+async function regCostDaily(env) {
+  const hour = +new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", hourCycle: "h23" }).format(new Date()), today = nyToday();
+  if (hour < 5) return;
+  const done = await kvJson(env, "*", "regcostrun", {}); if (done.last === today) return;
+  await kvPutJson(env, "*", "regcostrun", { last: today });
+  const m0 = today.slice(0, 7), d = new Date(today + "T12:00:00Z"); d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() - 1); const m1 = d.toISOString().slice(0, 7);
+  const stores = new Set([DEF_STORE]); try { ((await env.DB.prepare("SELECT store FROM inv_store").all()).results || []).forEach(r => stores.add(r.store)); } catch {}
+  for (const S of stores) for (const m of [m1, m0]) { try { await costFromRegisters(env, S, m); } catch (e) { console.error("regcost", S, m, e && e.message); } }
 }
 // Mondays at 6 AM (New York), once per store.
 async function moversWeekly(env) {
@@ -2672,6 +2735,7 @@ export default {
     if (env.DB) ctx.waitUntil(ensureSchema(env).then(() => dailyMailDue(env)).catch(() => {}));
     if (env.DB) ctx.waitUntil(lotteryReminder(env).catch(() => {}));
     if (env.DB) ctx.waitUntil(moversWeekly(env).catch(() => {}));
+    if (env.DB) ctx.waitUntil(regCostDaily(env).catch(() => {}));
     if (env.DB) ctx.waitUntil(licenseReminder(env).catch(() => {}));
   },
   async fetch(req, env, ctx) {
