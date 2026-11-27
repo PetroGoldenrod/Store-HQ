@@ -17,7 +17,7 @@ param(
   [switch]$Setup,
   [switch]$Poll
 )
-$ScriptVersion = 2
+$ScriptVersion = 3
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -137,6 +137,8 @@ function Set-Marker($name, $v) { Set-Content -Path (Join-Path $here ("sscsread."
 # Once: can this login open the Daily Book reports? (Store HQ shows the answer; nothing else depends on it.)
 function Test-Cdb($token, $user) {
   if ((Marker "cdbtest") -eq "ok") { return $true }
+  # SSCS turned this login away (401): don't ask again every hour; try once a week.
+  $tf = Join-Path $here "sscsread.cdbtest"; if ((Test-Path $tf) -and ((Get-Date) - (Get-Item $tf).LastWriteTime).TotalDays -lt 7) { return $false }
   $y = (Get-Date).AddDays(-1).ToString("yyyy-MM-dd")
   try { $g = Cdb-Post $token $user "dailybook/deptgrossprofit" (Cdb-Body $y $y); $n = @($g.details).Count; Send-Pc @{ kind = "test"; ok = $true; err = "" } | Out-Null; Set-Marker "cdbtest" "ok"; Log ("Daily Book reports open fine (" + $n + " rows)."); return $true }
   catch { $m = $_.Exception.Message; Log ("Daily Book reports: " + $m); try { Send-Pc @{ kind = "test"; ok = $false; err = $m.Substring(0, [Math]::Min(200, $m.Length)) } | Out-Null } catch {}; Set-Marker "cdbtest" ("failed " + (Get-Date -Format s)); return $false }
