@@ -177,7 +177,7 @@ function Pull-Pnl($token, $user) {
   Set-Marker "pnl" $tag; Log ("P&L " + $tag + " sent: " + $depts.Count + " departments" + $(if ($r.saved) { ", saved" } else { " (" + $r.why + ")" }))
 }
 
-function Register-SscsTask {function Register-SscsTask {
+function Register-SscsTask {
   $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
   $ws = Join-Path $env:WINDIR "System32\wscript.exe"
   $cmd = '"' + $ps + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Store ' + $Store + ' -Site ' + $Site + ' -Poll'
