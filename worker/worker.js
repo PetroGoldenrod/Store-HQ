@@ -309,6 +309,8 @@ function validateLottery(l) {
   if (!p.length) {
     ["netSales", "pays"].forEach(k => { if (num(l.online[k]) === null) l.online[k] = k === "pays" ? 0 : null; });
     if (num(l.scratch.pays) === null) l.scratch.pays = 0;
+    // Neither store gives online lotto discounts, so a "discount" with no pays is the pays line read one row off (Nov 25: $11.50).
+    if ((num(l.online.discounts) || 0) > 0 && !(num(l.online.pays) > 0)) { l.online.pays = num(l.online.discounts); l.online.discounts = 0; }
     if (num(l.online.netSales) === null) p.push("the online lotto net sales could not be read");
     l.online.pays = Math.abs(l.online.pays); l.scratch.pays = Math.abs(l.scratch.pays);
     if (!lotMathOk(l.online)) p.push("the online lotto numbers don't add up (net sales, pays and cash balance)");
