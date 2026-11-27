@@ -2039,26 +2039,30 @@ async function moversFromRegisters(env, S, today) {
 // $0 cost here, like the SSCS numbers (chicken is food cost). Saved as store_kv <store> 'regcost:YYYY-MM' to compare with the SSCS pull.
 const RC_SKIP = new Set(["27", "34", "51", "82", "88", "9998", "9999"]);
 async function costFromRegisters(env, S, month) {
+  // Both stores buy from the same vendors at the same prices, so every store's invoices count; the newest cost per item wins.
+  // Price book costs: the main store's (kept current from its invoices). Another store's own price book is only a fallback,
+  // because its invoices aren't all entered in Sunray yet, so its costs may be old.
   const z = c => String(c || "").replace(/\D/g, "").replace(/^0+/, "");
-  const cost = new Map(); let pbDate = "";
-  try { const r = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("pb:" + S).first(); if (r) { const pb = JSON.parse(r.text); pbDate = pb.exported || ""; for (const it of pb.items || []) { const c = Number(it[3]); if (c > 0 && c < 500) cost.set(z(it[0]), { c, src: "pb" }); } } } catch {}
+  const cost = new Map(), put = (u, c, d, src) => { if (!u || !(c > 0 && c < 500)) return; const o = cost.get(u); if (!o || d >= o.d) cost.set(u, { c, d, src }); };
+  const loadPb = async (store, asFallback) => { try { const r = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("pb:" + store).first(); if (!r) return ""; const pb = JSON.parse(r.text); for (const it of pb.items || []) put(z(it[0]), Number(it[3]), asFallback ? "0000" : (pb.exported || "0001"), "pb"); return pb.exported || ""; } catch { return ""; } };
+  if (S !== DEF_STORE) await loadPb(S, true);
+  const pbDate = await loadPb(DEF_STORE, false);
   let inv = 0;
   try {
-    const rows = (await env.DB.prepare("SELECT created, file_text FROM inv_job WHERE store = ? AND status NOT LIKE '%del%' AND file_text IS NOT NULL ORDER BY created").bind(S).all()).results || [];
+    const rows = (await env.DB.prepare("SELECT created, file_text FROM inv_job WHERE status NOT LIKE '%del%' AND file_text IS NOT NULL ORDER BY created").all()).results || [];
     for (const r of rows) {
       const lines = String(r.file_text).split(/\r?\n/), a = lines[0] || "";
-      const md = a.slice(17, 23), d = md.length === 6 ? "20" + md.slice(4, 6) + "-" + md.slice(0, 2) + "-" + md.slice(2, 4) : "";
-      if (pbDate && d && d < pbDate) continue;
+      const md = a.slice(17, 23), d = md.length === 6 ? "20" + md.slice(4, 6) + "-" + md.slice(0, 2) + "-" + md.slice(2, 4) : new Date(r.created).toISOString().slice(0, 10);
       for (const l of lines) {
         if (l[0] !== "B") continue;
-        const upc = z(l.slice(1, 12)), cc = Number(l.slice(43, 49)) / 100, units = Number(l.slice(51, 57));
-        if (upc && cc > 0 && units > 0) { cost.set(upc, { c: cc / units, src: "inv" }); inv++; }
+        const cc = Number(l.slice(43, 49)) / 100, units = Number(l.slice(51, 57));
+        if (cc > 0 && units > 0) { put(z(l.slice(1, 12)), cc / units, d, "inv"); inv++; }
       }
     }
   } catch {}
   // Core-Mark (their invoices go straight to Sunray): per-unit costs saved weekly by the Core-Mark check, {upc: [unitCost, "YYYY-MM-DD"]}.
   let cm = 0;
-  try { const cmc = await kvJson(env, S, "cmcost", {}); for (const [u, v] of Object.entries(cmc)) { const c = Number(v && v[0]); if (c > 0 && c < 500 && (!pbDate || String(v[1] || "") >= pbDate)) { cost.set(z(u), { c, src: "cm" }); cm++; } } } catch {}
+  try { const cmc = await kvJson(env, DEF_STORE, "cmcost", {}); for (const [u, v] of Object.entries(cmc)) { put(z(u), Number(v && v[0]), String(v && v[1] || "0001"), "cm"); cm++; } } catch {}
   const byName = new Map();
   try { const rb = await env.DB.prepare("SELECT text FROM inv_blob WHERE key = ?").bind("reg:" + S).first(); if (rb) for (const it of JSON.parse(rb.text).items || []) { const k = String(it[1] || "").toUpperCase().replace(/\s+/g, " ").trim(); if (k && k !== "UNKNOWN" && !byName.has(k)) byName.set(k, String(it[0])); } } catch {}
   const days = (await env.DB.prepare("SELECT k, data FROM store_kv WHERE store = ? AND k BETWEEN ? AND ?").bind(S, "items:" + month + "-01", "items:" + month + "-31").all()).results || [];
