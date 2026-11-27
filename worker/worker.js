@@ -294,14 +294,97 @@ function scratchMathOk(x) {
   if (nt !== null) return Math.abs(st + un - Math.abs(pr) - Math.abs(c) - Math.abs(pa) - Math.abs(cc) + adj - nt) < 0.011 || Math.abs(st + un + pr + c - Math.abs(pa) + cc + adj - nt) < 0.011;
   return Math.abs(Math.abs(c) - 0.06 * (st + un - Math.abs(pr))) < 0.02;
 }
-async function readLottery(env, images) {
-  let data = await askClaude(env, PROMPT_LOT, images), problems = validateLottery(data);
-  if (problems.length) {
-    const why = problems.some(x => /scratch-off/.test(x) && /add up|reads \$0/.test(x)) ? "A first attempt read the scratch-off receipt one line off, so its numbers did not add up. The dollar column is printed a line off from the labels: take the dollar amounts in order from the top (BOOKS SETTLED, BOOKS UNSTLD, PARTIAL RETURN, SALES COMM, PAYS, CASHING COMM), then ADJUSTMENTS and NET TOTAL, and read again." : problems.some(x => /add up/.test(x)) ? "A first attempt read the online receipt one line off, so the numbers did not add up. Line up each label with the dollar amount on its own printed line and read again." : "A first attempt said a receipt was missing or unreadable. Look again at the whole photo; both receipts are normally there and all-zero receipts are valid.";
-    const again = await askClaude(env, PROMPT_LOT + "\n" + why, images);
-    const p2 = validateLottery(again); if (!p2.length) { data = again; problems = []; }
+// Lottery photos are read at least twice and a number is only taken when two readings agree on it.
+const LOT_FIELDS = { online: ["printDate", "time", "grossSales", "cancels", "netSales", "discounts", "pays", "couponPays", "cashBalance"], scratch: ["booksSettledAmt", "booksUnsettledAmt", "partialReturn", "salesComm", "pays", "paysCount", "cashingComm", "adjustments", "netTotal", "booksActivated"] };
+const LOT_ZERO = new Set(["cancels", "discounts", "couponPays", "pays", "booksUnsettledAmt", "partialReturn", "paysCount", "cashingComm", "adjustments", "booksActivated"]);
+const LOT_NAMES = { grossSales: "GROSS SALES", cancels: "CANCELS", netSales: "NET SALES", discounts: "DISCOUNTS", pays: "PAYS", couponPays: "COUPON PAYS", cashBalance: "CASH BALANCE", booksSettledAmt: "BOOKS SETTLED", booksUnsettledAmt: "BOOKS UNSTLD", partialReturn: "PARTIAL RETURN", salesComm: "SALES COMM", paysCount: "PAYS count", cashingComm: "CASHING COMM", adjustments: "ADJUSTMENTS", netTotal: "NET TOTAL", booksActivated: "BOOKS ACTIVATED", printDate: "printed date", time: "printed time" };
+function lotKey(k, v) {
+  if (k === "time") { const m = /^(\d{1,2}):(\d{2})/.exec(String(v || "")); return m ? String(+m[1]).padStart(2, "0") + ":" + m[2] : ""; }
+  if (k === "printDate") return String(v || "");
+  const n = num(v); return n === null ? (LOT_ZERO.has(k) ? "0.00" : "") : Math.abs(n).toFixed(2);
+}
+function lotFieldName(f) { const [part, k] = f.split("."); return (part === "online" ? "online " : "scratch-off ") + (LOT_NAMES[k] || k); }
+function lotDiff(a, b) {
+  const out = [];
+  for (const part of ["online", "scratch"]) for (const k of LOT_FIELDS[part]) if (lotKey(k, ((a || {})[part] || {})[k]) !== lotKey(k, ((b || {})[part] || {})[k])) out.push(part + "." + k);
+  return out;
+}
+// Per-line majority over several readings of the same printout. A line is settled when at least two readings agree and no other value has as many.
+function lotVote(list) {
+  const out = JSON.parse(JSON.stringify(list[0])), unsure = [];
+  for (const part of ["online", "scratch"]) for (const k of LOT_FIELDS[part]) {
+    const c = new Map();
+    list.forEach(d => { const v = ((d || {})[part] || {})[k], key = lotKey(k, v); if (!c.has(key)) c.set(key, { n: 0, v }); c.get(key).n++; });
+    const top = [...c.values()].sort((x, y) => y.n - x.n);
+    if (top[0].n >= 2 && !(top[1] && top[1].n === top[0].n)) out[part][k] = top[0].v; else unsure.push(part + "." + k);
   }
-  return { data, problems };
+  return { data: out, unsure };
+}
+async function lotRead(env, prompt, images) {
+  try { const d = await askClaude(env, prompt, images); return { d, p: validateLottery(d) }; } catch (e) { return { e }; }
+}
+function lotHint(problems) {
+  return problems.some(x => /scratch-off/.test(x) && /add up|reads \$0/.test(x)) ? "A first attempt read the scratch-off receipt one line off, so its numbers did not add up. The dollar column is printed a line off from the labels: take the dollar amounts in order from the top (BOOKS SETTLED, BOOKS UNSTLD, PARTIAL RETURN, SALES COMM, PAYS, CASHING COMM), then ADJUSTMENTS and NET TOTAL, and read again." : problems.some(x => /add up/.test(x)) ? "A first attempt read the online receipt one line off, so the numbers did not add up. Line up each label with the dollar amount on its own printed line and read again." : problems.length ? "A first attempt said a receipt was missing or unreadable. Look again at the whole photo; both receipts are normally there and all-zero receipts are valid." : "";
+}
+async function readLottery(env, images) {
+  const reads = await Promise.all([lotRead(env, PROMPT_LOT, images), lotRead(env, PROMPT_LOT, images)]);
+  if (!reads.some(r => r.d)) throw reads[0].e;
+  let good = reads.filter(r => r.d && !r.p.length);
+  if (good.length === 2 && !lotDiff(good[0].d, good[1].d).length) { good[0].d.verify = { reads: 2, agreed: true }; return { data: good[0].d, problems: [] }; }
+  // A third reading, told which lines the first two disagreed on or why they failed.
+  const withData = reads.filter(r => r.d), diff = withData.length === 2 ? lotDiff(withData[0].d, withData[1].d) : [];
+  const failed = reads.filter(r => r.d && r.p.length).flatMap(r => r.p);
+  const hint = [lotHint(failed), diff.length ? "Two earlier readings of this photo disagreed on: " + diff.map(lotFieldName).join(", ") + ". Read those lines especially carefully, matching each label to the dollar amount on its own printed line." : ""].filter(Boolean).join("\n");
+  const third = await lotRead(env, PROMPT_LOT + "\n" + hint, images);
+  if (third.d) reads.push(third);
+  good = reads.filter(r => r.d && !r.p.length);
+  const n = reads.filter(r => r.d).length;
+  if (good.length >= 2) {
+    const v = lotVote(good.map(r => r.d)), p = validateLottery(v.data);
+    if (!v.unsure.length && !p.length) { v.data.verify = { reads: n, agreed: true }; return { data: v.data, problems: [] }; }
+    if (v.unsure.length) return { data: v.data, problems: ["the " + v.unsure.map(lotFieldName).join(", ") + " line" + (v.unsure.length > 1 ? "s" : "") + " didn't read the same twice. Retake the photo flat, close up, with no glare or shadow"] };
+    return { data: v.data, problems: p };
+  }
+  // Only one reading passed every math check: keep it (the next shift's photo of the same printout double-checks it).
+  if (good.length === 1) { good[0].d.verify = { reads: n, agreed: false }; return { data: good[0].d, problems: [] }; }
+  const best = reads.filter(r => r.d).sort((x, y) => x.p.length - y.p.length)[0];
+  return { data: best.d, problems: best.p };
+}
+// The printout photographed at the end of one shift is the same one photographed at the start of the next.
+// When the two saved readings differ, both photos are read again and every line goes to the majority of the four readings.
+async function lotPairCheck(env, S, id) {
+  const row = await env.DB.prepare("SELECT id, date, data, photos FROM closes WHERE id = ? AND kind = 'lottery'").bind(id).first();
+  if (!row) return null;
+  const d = JSON.parse(row.data), pd = d.online && d.online.printDate, tm = lotKey("time", d.online && d.online.time);
+  if (!pd || !tm) return null;
+  const sibs = ((await env.DB.prepare("SELECT id, date, data, photos FROM closes WHERE store = ? AND kind = 'lottery' AND id != ? AND date BETWEEN ? AND ?").bind(S, id, addDays(row.date, -1), addDays(row.date, 1)).all()).results || [])
+    .filter(r => { try { const o = JSON.parse(r.data).online || {}; return o.printDate === pd && lotKey("time", o.time) === tm; } catch { return false; } });
+  if (!sibs.length) return { pair: false };
+  const sib = sibs[0], sd = JSON.parse(sib.data), diff = lotDiff(d, sd);
+  if (!diff.length) return { pair: true, same: true };
+  const photo = async r => { const pid = (JSON.parse(r.photos || "[]"))[0]; const ph = pid && await env.DB.prepare("SELECT b64 FROM photos WHERE id = ?").bind(pid).first(); return ph && ph.b64; };
+  const hint = "Another reading of this same printout disagreed on: " + diff.map(lotFieldName).join(", ") + ". Read those lines especially carefully, matching each label to the dollar amount on its own printed line.";
+  const [pa, pb] = await Promise.all([photo(row), photo(sib)]);
+  const fresh = await Promise.all([pa, pb].filter(Boolean).map(b64 => lotRead(env, PROMPT_LOT + "\n" + hint, [b64])));
+  const all = [d, sd].concat(fresh.filter(r => r.d && !r.p.length).map(r => r.d)).filter(x => !validateLottery(x).length);
+  const v = all.length >= 2 ? lotVote(all) : null, ok = v && !v.unsure.length && !validateLottery(v.data).length;
+  const entry = { at: Date.now(), ids: [row.id, sib.id], date: row.date, printed: pd + " " + tm, diff, fixed: !!ok, unsure: v ? v.unsure : diff };
+  if (ok) {
+    const changed = [];
+    for (const [r, old] of [[row, d], [sib, sd]]) {
+      const nd = JSON.parse(JSON.stringify(old)); nd.online = v.data.online; nd.scratch = v.data.scratch; nd.verify = { ...(old.verify || {}), pair: sib.id === r.id ? row.id : sib.id, pairFixed: Date.now() };
+      const ch = lotDiff(old, nd); if (ch.length) { changed.push({ id: r.id, lines: ch.map(f => [f, ((old[f.split(".")[0]] || {})[f.split(".")[1]]), nd[f.split(".")[0]][f.split(".")[1]]]) }); }
+      await env.DB.prepare("UPDATE closes SET data = ? WHERE id = ?").bind(JSON.stringify(nd), r.id).run();
+    }
+    entry.changed = changed;
+  }
+  try {
+    const cur = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'lotfixes'").bind(S).first();
+    let list = []; try { list = cur ? JSON.parse(cur.data) : []; } catch {}
+    list.push(entry); list = list.slice(-200);
+    await env.DB.prepare("INSERT INTO store_kv (store, k, data, updated) VALUES (?, 'lotfixes', ?, ?) ON CONFLICT(store, k) DO UPDATE SET data = excluded.data, updated = excluded.updated").bind(S, JSON.stringify(list), Date.now()).run();
+  } catch (e) { console.error("lotfixes log", e && e.message); }
+  return entry;
 }
 function validateLottery(l) {
   if (!l) return ["the photo could not be read"];
@@ -558,7 +641,7 @@ function b64ToBytes(b64) {
 }
 function okImage(b64) { return typeof b64 === "string" && b64.length > 1000 && b64.length < 9e6 && /^[A-Za-z0-9+/=]+$/.test(b64.slice(0, 200)); }
 
-async function handleSubmit(req, env, token) {
+async function handleSubmit(req, env, token, ctx) {
   const st = await staffByToken(env, token);
   if (!st || !st.active) return json({ ok: false, error: "This link is turned off. Ask the owner for a new one." }, 403);
   let b; try { b = await readBody(req); } catch { return json({ ok: false, error: "The photos are too large. Try again." }, 413); }
@@ -645,6 +728,7 @@ async function handleSubmit(req, env, token) {
   stmts.push(env.DB.prepare("INSERT INTO closes (id, created, date, shift, staff_id, staff_name, kind, stage, data, photos, store) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
     .bind(id, now, b.date, shift, st.id, st.name, b.kind, stage, JSON.stringify(data), JSON.stringify(ids), st.store || DEF_STORE));
   await env.DB.batch(stmts);
+  if (b.kind === "lottery") { const job = lotPairCheck(env, st.store || DEF_STORE, id).catch(e => console.error("lot pair", e && e.message)); if (ctx) ctx.waitUntil(job); else await job; }
   return json({ ok: true });
 }
 
@@ -865,7 +949,18 @@ async function ownerApi(req, env, path, url) {
     const res = await readLottery(env, [ph.b64]);
     if (res.problems.length) return json({ ok: false, problems: res.problems });
     await env.DB.prepare("UPDATE closes SET kind = 'lottery', data = ? WHERE id = ?").bind(JSON.stringify(res.data), r.id).run();
+    await lotPairCheck(env, S, r.id).catch(() => {});
     return json({ ok: true });
+  }
+  if (path === "/api/lotpairs" && req.method === "POST") {
+    // Check one lottery reading against the other photo of the same printout (or list the ids for a date range).
+    const b = await readBody(req, 1e4);
+    if (b.from && validDate(b.from)) return json({ ids: ((await env.DB.prepare("SELECT id FROM closes WHERE store = ? AND kind = 'lottery' AND date BETWEEN ? AND ? ORDER BY date, created").bind(S, b.from, validDate(b.to) ? b.to : b.from).all()).results || []).map(r => r.id) });
+    return json({ ok: true, result: await lotPairCheck(env, S, String(b.id || "")) });
+  }
+  if (path === "/api/lotfixes" && req.method === "GET") {
+    const r = await env.DB.prepare("SELECT data FROM store_kv WHERE store = ? AND k = 'lotfixes'").bind(S).first();
+    return json({ fixes: r ? JSON.parse(r.data).slice(-50).reverse() : [] });
   }
   if (path === "/api/relot" && req.method === "POST") {
     // Re-read saved lottery photos for a date (fixes readings made before the math check).
@@ -2818,7 +2913,7 @@ export default {
           const co = (await env.DB.prepare("SELECT id, name FROM staff WHERE store = ? AND active = 1 AND id != ? ORDER BY name").bind(st.store || DEF_STORE, st.id).all()).results || [];
           return json({ name: st.name, coworkers: co, myHours: st.hours > 0 ? Number(st.hours) : null, normalHours: cfg(env).hours });
         }
-        if (req.method === "POST") return handleSubmit(req, env, m[1]);
+        if (req.method === "POST") return handleSubmit(req, env, m[1], ctx);
       }
       if (path === "/api/login" && req.method === "POST") {
         if (!env.OWNER_PASSWORD) return json({ error: "Set the OWNER_PASSWORD secret in Cloudflare first." }, 500);
