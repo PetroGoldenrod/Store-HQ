@@ -2158,6 +2158,7 @@ async function moversFromRegisters(env, S, today) {
 // Invoice Desk after that export (case cost / units per case). Fuel, prepay, lottery, fees are left out; KKC (dept 79) counts as sales with
 // $0 cost here, like the SSCS numbers (chicken is food cost). Saved as store_kv <store> 'regcost:YYYY-MM' to compare with the SSCS pull.
 const RC_SKIP = new Set(["27", "34", "51", "82", "88", "9998", "9999"]);
+const RC_FOOD_EXP = new Set(["29"]);
 async function costFromRegisters(env, S, month) {
   // Both stores buy from the same vendors at the same prices, so every store's invoices count; the newest cost per item wins.
   // Price book costs: the main store's (kept current from its invoices). Another store's own price book is only a fallback,
@@ -2208,7 +2209,9 @@ async function costFromRegisters(env, S, month) {
   }
   const r2_ = x => Math.round(x * 100) / 100;
   // Cost for sales without a known cost: use the cost % of the costed sales in the same department.
-  let est = 0; for (const D of Object.values(deps)) { const unc = D.s - D.cs; if (unc > 0 && D.cs > 0) est += unc * (D.c / D.cs); }
+  // Except grill food (dept 29: hot dogs, "Single/2 Items Grill"): its cost is entered in Sunray as the expFOODSERVICE (3002) expense,
+  // which the P&L subtracts as food cost, so estimating it here would count it twice. Like SSCS, it stays at $0 here.
+  let est = 0; for (const [dep, D] of Object.entries(deps)) { if (RC_FOOD_EXP.has(dep)) continue; const unc = D.s - D.cs; if (unc > 0 && D.cs > 0) est += unc * (D.c / D.cs); }
   const doc = { month, days: days.length, at: Date.now(), pbDate, invLines: inv, cmItems: cm, suspect: suspect.slice(-30), sales: r2_(sales), kkc: r2_(kkc), cogsKnown: r2_(cogs), cogsEst: r2_(cogs + est), coveredPct: sales ? Math.round(costed / sales * 1000) / 10 : 0,
     missing: [...missing.entries()].sort((a, b) => b[1][1] - a[1][1]).slice(0, 25).map(([k, v]) => [k, Math.round(v[0]), r2_(v[1])]) };
   await kvPutJson(env, S, "regcost:" + month, doc);
